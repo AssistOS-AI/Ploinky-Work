@@ -4,9 +4,26 @@
   "private": true,
   "description": "Ploinky Workers: phased LLM tasks through one CLI and local model proxy.",
   "type": "module",
-  "engines": {"node": ">=22.13"},
-  "bin": {"pworker": "./bin/pworker.mjs"},
-  "exports": {".": "./lib/pworker/task.mjs", "./client": "./lib/client.mjs", "./server": "./lib/server.mjs"},
-  "scripts": {"start": "node bin/pworker.mjs", "serve": "node bin/pworker.mjs serve", "test": "node --import ./test/home.mjs --test test/*.test.mjs"},
+  "engines": {
+    "node": ">=22.13"
+  },
+  "bin": {
+    "pworker": "./bin/pworker.mjs"
+  },
+  "exports": {
+    ".": "./lib/pworker/task.mjs",
+    "./client": "./lib/client.mjs",
+    "./server": "./lib/server.mjs",
+    "./admin": "./lib/pworker/admin.mjs",
+    "./config": "./lib/config.mjs",
+    "./prompted": "./lib/prompted.mjs",
+    "./http-fetch": "./lib/http-fetch.mjs",
+    "./settings": "./lib/settings.mjs"
+  },
+  "scripts": {
+    "start": "node bin/pworker.mjs",
+    "serve": "node bin/pworker.mjs serve",
+    "test": "node --import ./test/home.mjs --test test/*.test.mjs"
+  },
   "dependencies": {}
 }

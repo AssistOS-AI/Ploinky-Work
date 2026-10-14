@@ -16,6 +16,7 @@ import { resolveUpstream } from '../lib/settings.mjs';
 import { HELP } from '../lib/pworker/help.mjs';
 import { liveServer, readServerRecord } from '../lib/server.mjs';
 import { fileURLToPath } from 'node:url';
+import { readUserConfig as adminReadUserConfig, saveUserConfig as adminSaveUserConfig, saveModelLimits as adminSaveModelLimits, proxyPid, startProxy as adminStartProxy, stopProxy as adminStopProxy, restartProxy as adminRestartProxy } from '../lib/pworker/admin.mjs';
 import { readRecords, summarize, formatSummary, parseSince } from '../lib/metrics.mjs';
 
 const args = process.argv.slice(2);
@@ -68,27 +69,14 @@ function printStats({ since = option('since', '24h'), provider = option('provide
   if (asJson) json(summary); else process.stdout.write(formatSummary(summary, { limits }));
 }
 
-function readUserConfig() { return JSON.parse(fs.readFileSync(configFile, 'utf8')); }
-function saveUserConfig(c) { fs.writeFileSync(configFile, JSON.stringify(c, null, 2) + '\n', { mode: 0o600 }); }
+const readUserConfig = () => adminReadUserConfig();
+const saveUserConfig = (c) => adminSaveUserConfig(c);
 // The proxy of this home: its recorded process exists and answers /health on the recorded port (lib/server.mjs). No process-name
-// matching, so it works with npm link, other launchers and on every platform.
-async function runningPid() { return (await liveServer(home))?.pid ?? null; }
-async function startProxy() {
-  if (await runningPid()) return;
-  const log = fs.openSync(path.join(home, 'logs', 'pworker.log'), 'a');
-  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'serve'], { detached: true, stdio: ['ignore', log, log] });
-  child.unref(); fs.closeSync(log);
-  for (let i = 0; i < 40; i++) { await sleep(250); if (await runningPid()) return; }
-  throw new Error(`The proxy did not start. See ${path.join(home, 'logs', 'pworker.log')}`);
-}
-async function stopProxy() {
-  const pid = await runningPid();
-  if (!pid) return false;
-  process.kill(pid, 'SIGTERM');
-  for (let i = 0; i < 40; i++) { await sleep(100); if (!readServerRecord(home) || !(await runningPid())) return true; }
-  return false;
-}
-async function restartProxy() { if (await runningPid()) { await stopProxy(); await startProxy(); } }
+// matching, so it works with npm link, other launchers and on every platform. The process control lives in lib/pworker/admin.mjs.
+const runningPid = () => proxyPid();
+const startProxy = () => adminStartProxy();
+const stopProxy = () => adminStopProxy();
+const restartProxy = () => adminRestartProxy();
 
 function publicJob(job) {
   if (!job) return null;
@@ -148,14 +136,7 @@ function saveProvider(name, spec, key) {
   saveUserConfig(c);
   if (key) fs.writeFileSync(path.join(home, 'keys', spec.envFile ?? `${name}.env`), `${spec.keyVar}=${JSON.stringify(key)}\n`, { mode: 0o600 });
 }
-function saveModelLimits(model) {
-  if(!Number.isSafeInteger(model.contextLength)||!Number.isSafeInteger(model.maxOutputTokens)||model.contextLength<1||model.maxOutputTokens<1)return;
-  const config=JSON.parse(fs.readFileSync(configFile,'utf8'));
-  config.providers??={};const provider=config.providers[model.provider]??={};provider.modelLimits??={};
-  provider.modelLimits[model.id]={...model.modelLimits,contextTokens:model.contextLength,maxOutputTokens:model.maxOutputTokens,
-    source:model.modelLimits?.source??'provider model catalog',verifiedAt:model.modelLimits?.verifiedAt??new Date().toISOString().slice(0,10)};
-  fs.writeFileSync(configFile,JSON.stringify(config,null,2)+'\n',{mode:0o600});
-}
+const saveModelLimits = (model) => adminSaveModelLimits(model);
 
 function setTier(tier, entries, batch) {
   const c = readUserConfig();
