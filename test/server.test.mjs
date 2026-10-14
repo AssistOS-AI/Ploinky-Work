@@ -79,3 +79,29 @@ test('one proxy per home: a second serve for the same home refuses and clients f
     assert.equal(client.url,`http://127.0.0.1:${record.port}`);
   }finally{await first.close();fs.rmSync(home,{recursive:true,force:true});}
 });
+
+test('a task submitted over HTTP sends its model calls with the submitter\'s purpose, run and priority; without them, pworker:tasks',async()=>{
+  const http=await import('node:http');
+  const seen=[];
+  const up=http.createServer((req,res)=>{let b='';req.on('data',c=>b+=c);req.on('end',()=>{seen.push(req.headers);res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({choices:[{message:{content:'ok'},finish_reason:'stop'}],usage:{prompt_tokens:1,completion_tokens:1}}));});});
+  await new Promise(r=>up.listen(0,'127.0.0.1',r));
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'pworker-task-tags-'));
+  const config={dataDir:path.join(root,'data'),taskHome:root,defaultUpstream:'stub',upstreams:{stub:{baseUrl:`http://127.0.0.1:${up.address().port}`,noKey:true,formats:{openai:'/v1/chat/completions'}}},
+    tiers:{small:[{upstream:'stub',model:'M'}]},policy:{allowedPurposes:['test:*','pworker:*'],untaggedDailyMax:100}};
+  const server=await createPworkerServer({config,env:{}});
+  const address=await server.listen(0);
+  const url=`http://127.0.0.1:${address.port}`;
+  try{
+    const task={begin:{tier:'small',template:'Say ok.',code:'this.end(result)'}};
+    const tagged=createPworkerClient({url,purpose:'test:caller',run:'run-42',priority:'background',autostart:false});
+    const done=await tagged.task(task,{pollSeconds:1});
+    assert.equal(done.status,'finished',done.error);assert.equal(done.result.value,'ok');
+    const plain=await fetch(url+'/v1/tasks',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({task,input:{}})}).then(r=>r.json());
+    assert.equal((await tagged.waitOp(plain.id,{pollSeconds:1})).status,'finished');
+    const log=fs.readdirSync(config.dataDir).filter(f=>f.startsWith('requests-')).flatMap(f=>fs.readFileSync(path.join(config.dataDir,f),'utf8').split('\n').filter(Boolean).map(l=>JSON.parse(l)));
+    const upstream=log.filter(r=>r.endpoint==='/v1/chat/completions'||r.tier==='small');
+    assert.ok(upstream.some(r=>r.purpose==='test:caller'&&r.run==='run-42'),JSON.stringify(upstream.map(r=>[r.purpose,r.run])));
+    assert.ok(upstream.some(r=>r.purpose==='pworker:tasks'),'a task without tags keeps the server purpose');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root,'jobs',done.id+'.json'),'utf8')).tags.run,'run-42','the tags are kept with the task for a recovery');
+  }finally{await server.close();up.close();fs.rmSync(root,{recursive:true,force:true});}
+});
