@@ -98,7 +98,7 @@ test('a snapshot stopped before it starts runs no query; an unstopped slow snaps
     stopped.abort();
     let spawned = 0;
     const execFileImpl = () => { spawned += 1; throw new Error('no query may start'); };
-    await assert.rejects(readSnapshot({ dataDir, signal: stopped.signal, execFileImpl }), { name: 'AbortError' });
+    await assert.rejects(readSnapshot({ dataDir, signal: stopped.signal, execFileImpl, nvidiaSmi: HOST.nvidiaSmi }), { name: 'AbortError' });
     assert.equal(spawned, 0, 'no query was started');
     // Positive control: a signal that is never aborted changes nothing; the snapshot waits for slow queries.
     const gpu = await readGpu({ nvidiaSmi: fixture.smi, env: {}, signal: new AbortController().signal });

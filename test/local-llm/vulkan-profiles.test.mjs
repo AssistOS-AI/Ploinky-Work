@@ -285,7 +285,7 @@ test('runner env: exact keys, Mesa cache outside /data, no LD_LIBRARY_PATH or GG
     for (const [flag, value] of [['--device', 'Vulkan0'], ['-ngl', '999'], ['--flash-attn', 'auto'], ['-ctk', 'f16'], ['-ctv', 'f16'], ['-b', '512'], ['-ub', '512'], ['--cache-ram', '256']]) assert.equal(args[args.indexOf(flag) + 1], value, flag);
 });
 test('compat: old agent readGpu with an attached render node commits cpu absent', async () => {
-    const result = await readGpu({ execFileImpl: probe().execFileImpl, env: { PLOINKY_GPU_STATUS: 'attached' } });
+    const result = await readGpu({ execFileImpl: probe().execFileImpl, nvidiaSmi: HOST.nvidiaSmi, env: { PLOINKY_GPU_STATUS: 'attached' } });
     const decision = decideProfile({ snapshot: { gpu: result } });
     assert.equal(decision.profile, 'cpu'); assert.equal(decision.cause, 'absent');
 });

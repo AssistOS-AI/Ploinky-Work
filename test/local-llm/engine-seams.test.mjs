@@ -596,6 +596,13 @@ test('the install check takes its lock from its arguments and never from a defau
     const unknown = await runInstallCheck(['nothing', '--lock', lockFile]);
     assert.equal(unknown.code, 1);
     assert.equal(unknown.report.error, 'not_installable');
+    // A host's image lock is the lock when none is named (the check run inside the image); no host, no lock.
+    const host = defineHost({ ...BARE, imageRunnerLockFile: lockFile });
+    const viaHost = await runInstallCheck(['open', '--validate-only'], { host });
+    assert.equal(viaHost.code, 0);
+    assert.equal(viaHost.report.ok, true);
+    assert.equal((await runInstallCheck(['open', '--validate-only'])).report.error, 'missing_file');
+    assert.equal((await runInstallCheck(['open', '--validate-only'], { host: defineHost(BARE) })).report.error, 'missing_file');
 });
 
 test('the seed catalog the controller loads is the host\'s file', async (t) => {
