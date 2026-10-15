@@ -155,6 +155,37 @@ test('a platform given to the download binder decides which descriptor path is t
     }
 });
 
+test('below an untrusted root the file is reached through the platform\'s openat path, with real descriptors, and a wrong answer rejects it', async (t) => {
+    const { openBound, walkShared } = await import('../../lib/local-llm/controller/workspaceReuse.mjs');
+    const root = tempDir(t, 'local-llm-openat-');
+    fs.mkdirSync(path.join(root, 'sub'));
+    fs.writeFileSync(path.join(root, 'sub', 'm.gguf'), 'hello');
+    // A platform with no /proc: it learns each descriptor's path from the opens it sees, which is what the kernel link would say.
+    const pathOf = new Map();
+    const named = [];
+    const track = async (file, flags, mode) => {
+        const handle = await fs.promises.open(file, flags, mode);
+        pathOf.set(handle.fd, path.resolve(file));
+        return handle;
+    };
+    const fsApi = { ...fs, promises: { ...fs.promises, open: track } };
+    const platform = { ...linuxPlatform(),
+        openedPathOf: async (api, fd) => pathOf.get(fd),
+        openatPath: (fd, name) => { named.push(name); return path.join(pathOf.get(fd), name); } };
+    const found = await walkShared(fsApi, [root], [5], undefined, { platform });
+    const [candidate] = found.get(5);
+    assert.equal(candidate.anchor.platform, platform);
+    const opened = await openBound(fsApi, candidate.anchor, candidate.path);
+    assert.ok(opened.handle, JSON.stringify(opened));
+    assert.deepEqual(named, ['sub', 'm.gguf'], 'each name was looked up through the platform\'s openat path');
+    assert.equal((await opened.handle.readFile()).toString(), 'hello');
+    await opened.handle.close();
+    // A platform that says the descriptor points somewhere else makes the file unusable.
+    const lying = { ...platform, openedPathOf: async () => path.join(root, 'elsewhere') };
+    const [other] = (await walkShared(fsApi, [root], [5], undefined, { platform: lying })).get(5);
+    assert.ok((await openBound(fsApi, other.anchor, other.path)).rejected);
+});
+
 test('startRunnerProcess marks the runner through the platform and signals its group only through killImpl', async () => {
     const child = Object.assign(new EventEmitter(), { pid: 4321, stdout: new EventEmitter(), stderr: new EventEmitter(), kill() {} });
     const marks = [];
