@@ -148,3 +148,6 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# Engine test fixtures include a runner log sample
+!test/local-llm/fixtures/**/*.log
