@@ -46,11 +46,12 @@ const ENOENT = () => Object.assign(new Error('absent'), { code: 'ENOENT' });
 // ---------------------------------------------------------------- the contract and the identity default
 
 test('limits: the default is the identity of every hook, and the value is frozen', () => {
-    assert.deepEqual(LIMIT_HOOKS, ['capCores', 'decorateSnapshot', 'memoryPool', 'refuseProfile', 'admit', 'effective',
+    assert.deepEqual(LIMIT_HOOKS, ['capCores', 'observeSnapshot', 'decorateSnapshot', 'memoryPool', 'refuseProfile', 'admit', 'effective',
         'refuseResourceRequest', 'overview', 'runnerEnvironment', 'guardSample', 'guardBreach', 'vllmQualification']);
     assert.ok(Object.isFrozen(IDENTITY_LIMITS));
     assert.equal(IDENTITY_LIMITS.capCores(7, { fsApi: {} }), 7);
     const snapshot = { gpu: {}, memory: { totalBytes: 1 } };
+    assert.equal(IDENTITY_LIMITS.observeSnapshot({ fsApi: {}, env: {} }), null);
     assert.equal(IDENTITY_LIMITS.decorateSnapshot({ snapshot, fsApi: {}, env: {} }), snapshot);
     assert.equal(IDENTITY_LIMITS.memoryPool({ totalBytes: 1, availableBytes: 1 }, snapshot, { amount: String }), null);
     assert.equal(IDENTITY_LIMITS.refuseProfile({ stage: 'admission', profile: 'apu', snapshot, refuse: () => 'x' }), null);
@@ -181,6 +182,56 @@ test('decorateSnapshot: a key the plug-in assigns to an existing property keeps 
     const { limits } = recording({ decorateSnapshot: ({ snapshot }) => { snapshot.gpu = { available: false }; snapshot.late = null; return snapshot; } });
     const snapshot = await readSnapshot({ dataDir: '/tmp', fsApi: cpuFs(), env: {}, limits, statfs: async () => ({ bsize: 1, blocks: 1, bavail: 1 }) });
     assert.deepEqual(Object.keys(snapshot), ['at', 'gpu', 'memory', 'disk', 'cpus', 'cores', 'late']);
+});
+
+test('observeSnapshot: the engine calls it after the disk read and before the memory read and the core count, and hands the result to decorateSnapshot', async () => {
+    const events = [];
+    const env = { MARK: '2' };
+    const base = cpuFs();
+    const fsApi = {
+        readFileSync(file, ...rest) { events.push(`read:${file}`); return base.readFileSync(file, ...rest); },
+        readdirSync(...args) { return base.readdirSync(...args); },
+    };
+    const observation = { token: 'observed' };
+    const { limits, calls } = recording({
+        observeSnapshot: () => { events.push('observeSnapshot'); return observation; },
+        capCores: (count) => { events.push('capCores'); return count; },
+        decorateSnapshot: ({ snapshot }) => { events.push('decorateSnapshot'); return snapshot; },
+    });
+    const statfs = async () => { events.push('statfs'); return { bsize: 4096, blocks: 100, bavail: 50 }; };
+    await readSnapshot({ dataDir: '/tmp', fsApi, env, statfs, limits });
+    assert.deepEqual(calls.filter((call) => call.name === 'observeSnapshot').map((call) => Object.keys(call.args[0]).sort()), [['env', 'fsApi']]);
+    const [{ fsApi: givenFs, env: givenEnv }] = calls.find((call) => call.name === 'observeSnapshot').args;
+    assert.equal(givenFs, fsApi);
+    assert.equal(givenEnv, env);
+    assert.equal(calls.find((call) => call.name === 'decorateSnapshot').args[0].observation, observation);
+    const at = (event) => events.indexOf(event);
+    assert.ok(at('statfs') >= 0 && at('statfs') < at('observeSnapshot'), 'the disk read comes first');
+    assert.ok(at('observeSnapshot') >= 0 && at('observeSnapshot') < at('read:/proc/meminfo'), 'observeSnapshot comes before the memory read');
+    assert.ok(at('observeSnapshot') < at('capCores'), 'observeSnapshot comes before the core count is capped');
+    assert.equal(events.filter((event) => event === 'observeSnapshot').length, 1);
+    assert.equal(events.at(-1), 'decorateSnapshot', 'decorateSnapshot comes last');
+    // Under the identity default nothing is observed and the decorator receives null.
+    const plain = recording();
+    await readSnapshot({ dataDir: '/tmp', fsApi: cpuFs(), env, statfs, limits: plain.limits });
+    assert.equal(plain.calls.find((call) => call.name === 'decorateSnapshot').args[0].observation, null);
+});
+
+test('observeSnapshot: a memory read that throws still leaves the observation made, and decorateSnapshot is not called', async () => {
+    const events = [];
+    const base = cpuFs();
+    const fsApi = {
+        readFileSync(file, ...rest) {
+            if (file === '/proc/meminfo') { events.push('meminfo-throws'); throw Object.assign(new Error('meminfo unreadable'), { code: 'EIO' }); }
+            return base.readFileSync(file, ...rest);
+        },
+        readdirSync(...args) { return base.readdirSync(...args); },
+    };
+    const { limits, calls } = recording({ observeSnapshot: () => { events.push('observeSnapshot'); return { observed: true }; } });
+    await assert.rejects(readSnapshot({ dataDir: '/tmp', fsApi, env: {}, limits, statfs: async () => ({ bsize: 1, blocks: 1, bavail: 1 }) }), /meminfo unreadable/);
+    assert.deepEqual(events, ['observeSnapshot', 'meminfo-throws']);
+    assert.equal(calls.filter((call) => call.name === 'observeSnapshot').length, 1);
+    assert.equal(calls.filter((call) => call.name === 'decorateSnapshot').length, 0);
 });
 
 // ---------------------------------------------------------------- admit, refuseProfile, effective
