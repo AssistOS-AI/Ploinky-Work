@@ -13,10 +13,12 @@ This specification is the coding-style authority for `lib/local-llm` and `test/l
 
 ### Language and runtime
 
-- **Node.js 22.13 or newer, ES modules** (`.mjs`). The package declares `engines.node >= 22.13`; the engine uses only what that version has, and a feature added later is checked at run time and refused cleanly where it is missing (`zlib.createZstdDecompress`, DS004).
-- **No dependencies.** The package declares none, so the engine runs on Node alone.
-- **No Python and no shell scripts** in the engine. Runners that are Python programs are installed on demand from a lock (DS004).
-- **Four-space indentation, single quotes, semicolons**, as the moved files have. New files in the subtree follow the file next to them.
+| Rule | Detail |
+| --- | --- |
+| Runtime | Node.js 22.13 or newer, ES modules (`.mjs`). The package declares `engines.node >= 22.13`. The engine was written for Node 24 and its tests have run on Node 25.8 only. A search of `lib/local-llm` for the built-ins added after 22.13 that are likely to appear (`Promise.try`, `RegExp.escape`, `Error.isError`, `Iterator` helpers, `fs.glob`, `URLPattern`, `import.meta.main`, `Float16Array`, set methods, `Symbol.dispose`) found none; the one dependence on a later version is zlib's zstd, added in Node 22.15 and checked at run time (DS004). The search is not a proof for the whole interface of Node |
+| Dependencies | None. The package declares none, so the engine runs on Node alone |
+| Other languages | No Python and no shell scripts in the engine. Runners that are Python programs are installed on demand from a lock (DS004) |
+| Formatting | Four-space indentation, single quotes and semicolons, as the moved files have. New files in the subtree follow the file next to them |
 
 ### Layout
 
@@ -40,14 +42,16 @@ docs/specs/            these specifications
 
 ### Conventions
 
-- **Validate at the boundary and fail closed.** Inputs have strict schemas; runner parameters are validated against the runner's schema for the hardware profile; identifiers use restrictive patterns (ids `[a-z0-9][a-z0-9._-]{1,63}`, request ids `[A-Za-z0-9_-]{8,128}`), which keeps path traversal and injection out of argv, file paths and registry entries. A value that cannot be read (a GPU's memory, `/proc/meminfo`) means "unknown" and refuses, never a default.
-- **No shell between input and a process.** Runners and helpers are spawned with an argv array, never through a shell, and get a minimal environment (DS003).
-- **Errors carry a code.** Engine errors are `LocalLlmError` with a stable `code` (for example `admission_incompatible`, `runner_unavailable`, `zstd_unsupported`, `invalid_host`) and a message that says what to do.
-- **Nothing unpinned at run time.** Downloads are pinned by commit, size and sha256 (models, DS002) or by URL, size and sha256 (runners, DS004).
-- **No per-runner branches** in the controller: a runner is an adapter plus data.
-- **Nothing host-specific in the engine.** A path, a sentence or a limit that depends on the host is an input (DS007), and the neutrality test enforces it (DS000).
-- **No hidden default paths.** The engine never reads a file relative to its own location (DS007).
-- **English** for all documentation, specifications and comments. Comments say why, not what.
+| Rule | Detail |
+| --- | --- |
+| Validate at the boundary and fail closed | Inputs have strict schemas; runner parameters are validated against the runner's schema for the hardware profile; identifiers use restrictive patterns (ids `[a-z0-9][a-z0-9._-]{1,63}`, request ids `[A-Za-z0-9_-]{8,128}`), which keeps path traversal and injection out of argv, file paths and registry entries. A value that cannot be read (a GPU's memory, `/proc/meminfo`) means "unknown" and refuses, never a default. |
+| No shell between input and a process | Runners and helpers are spawned with an argv array, never through a shell, and get a minimal environment (DS003). |
+| Errors carry a code | Engine errors are `LocalLlmError` with a stable `code` (for example `admission_incompatible`, `runner_unavailable`, `zstd_unsupported`, `invalid_host`) and a message that says what to do. |
+| Nothing unpinned at run time | Downloads are pinned by commit, size and sha256 (models, DS002) or by URL, size and sha256 (runners, DS004). |
+| No per-runner branches | The controller has none: a runner is an adapter plus data |
+| Nothing host-specific in the engine | A path, a sentence or a limit that depends on the host is an input (DS007), and the neutrality test enforces it (DS000). |
+| No hidden default paths | The engine never reads a file relative to its own location (DS007). |
+| English | All documentation, specifications and comments are in English. Comments say why, not what |
 
 ### JSON
 
@@ -60,10 +64,6 @@ Tests use `node:test` and `node:assert/strict` with no external framework, one f
 ### File size
 
 Prefer splitting a module that grows past about 800 lines by concern. `controller/deployments.mjs` is the known exception: it is the controller's single command queue.
-
-### Git policy
-
-Commits carry no co-author trailer and no tool or assistant attribution; commit metadata identifies the human author only.
 
 ### Rationale
 

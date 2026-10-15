@@ -149,7 +149,7 @@ A hook that throws propagates, except `guardSample`, whose throw the engine coun
 | `killImpl` | The signal function of a runner stop (`process.kill` by default). A test passes a recording fake. `startRunnerProcess` also takes `platform` |
 | Hardware reaper | `createHardwareQueryReaper()` keeps the queries a stop killed but that have not exited. One reaper belongs to one controller; `readGpu` and `readSnapshot` take it as `reaper` and the drain waits on it |
 | Missing files | `loadSeedCatalog(file)`, `loadRunnerLock(file)` and `loadRunnerLocks({ image, agent })` refuse an undefined argument with `missing_file`; null means "none"; an `ENOENT` on a given path is an empty lock |
-| `.tar.zst` | Refused with `zstd_unsupported` where `zlib.createZstdDecompress` is missing (DS004) |
+| `.tar.zst` | `installRunner` and a Run that must rebuild a runnable copy are refused with `zstd_unsupported` where `zlib.createZstdDecompress` is missing, before any state is written or any byte is fetched (DS004) |
 
 ### Rationale
 
