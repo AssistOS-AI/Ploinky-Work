@@ -19,6 +19,7 @@ import { hasRenderNode, parseListDevices, readVulkanGpu, vulkanAllIcdFiles, vulk
 import { runnerSummary } from '../../lib/local-llm/runners/index.mjs';
 import { HOST, HOST_VULKAN, PLOINKY_MESSAGES, getRunner, RUNNERS } from './fixtures/host.mjs';
 import { cpuFs, VULKAN_KEYS } from './fixtures/sharedFixtures.mjs';
+import { MEMORY_CAP_LIMITS } from './fixtures/limits.mjs';
 
 const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
@@ -56,9 +57,9 @@ async function gpu(driver = 'venus') {
     return readVulkanGpu({ contract, execFileImpl: probe(driver === 'radv' ? { summary: fixture('radv-summary.txt'), devices: fixture('radv-devices.txt') } : {}).execFileImpl });
 }
 function roomy(gpu) { return { gpu, memory: { totalBytes: 6 * GIB, availableBytes: 5 * GIB }, disk: { freeBytes: 100 * GIB } }; }
-async function verdict(profile, { model = small, params = {}, snap = null, gpuBudget = { state: 'absent' } } = {}) {
+async function verdict(profile, { model = small, params = {}, snap = null, limits = undefined } = {}) {
     return admit({ runner, model, source: model.sources.gguf, params: runner.normalizeParams(params, { model, profile }),
-        snapshot: snap || roomy(await gpu(profile === 'vulkan' ? 'radv' : 'venus')), profile, gpuBudget, messages: PLOINKY_MESSAGES });
+        snapshot: snap || roomy(await gpu(profile === 'vulkan' ? 'radv' : 'venus')), profile, limits, messages: PLOINKY_MESSAGES });
 }
 
 test('contract: valid; missing; wrong version; traversal; relative; server path mismatch', () => {
@@ -160,7 +161,7 @@ test('decide: arm64 capability contract does not block vulkan or venus', async (
 });
 test('admission: llama.cpp, ik_llama.cpp, llama.cpp-cpu, ollama, vllm, tabbyapi, lmstudio are incompatible on vulkan and venus', async () => {
     for (const profile of ['vulkan', 'venus']) for (const definition of Object.values(RUNNERS).filter((item) => item !== runner)) {
-        const result = admit({ runner: definition, model: small, source: small.sources.gguf, params: {}, snapshot: roomy(await gpu(profile === 'vulkan' ? 'radv' : 'venus')), profile, gpuBudget: { state: 'absent' } });
+        const result = admit({ runner: definition, model: small, source: small.sources.gguf, params: {}, snapshot: roomy(await gpu(profile === 'vulkan' ? 'radv' : 'venus')), profile });
         assert.equal(result.status, 'incompatible', definition.id); assert.match(result.reason, /use llama.cpp \(Vulkan build\)/);
     }
 });
@@ -171,7 +172,7 @@ test('venus: qwen3-4b is refused by the cap; qwen2.5-0.5b is admitted; free belo
     assert.equal((await verdict('venus', { snap: roomy({ ...device, freeBytes: 0 }) })).status, 'insufficient-now');
     const snap = roomy(device); snap.memory = { totalBytes: 2 * GIB, availableBytes: 2 * GIB };
     assert.equal((await verdict('venus', { snap })).status, 'incompatible');
-    assert.equal((await verdict('venus', { snap: { ...roomy(device), cgroupMemory: { maxBytes: 2 * GIB, currentBytes: 0 } } })).status, 'incompatible');
+    assert.equal((await verdict('venus', { snap: { ...roomy(device), cgroupMemory: { maxBytes: 2 * GIB, currentBytes: 0 } }, limits: MEMORY_CAP_LIMITS })).status, 'incompatible');
 });
 test('venus: ctxSize 131072 with parallel 4 on qwen2.5-0.5b is refused by the cap, not by normalization', async () => {
     const result = await verdict('venus', { params: { ctxSize: 131072, parallel: 4 } });
@@ -215,7 +216,7 @@ function controllerHarness(t, { driver = 'venus', defaultReader = null, imageCon
             handles.push(handle); return handle;
         },
         fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({}) }), pollMs: 1,
-        readMemory: () => memory, readPressure: () => 0, readBudget: () => null, unifiedGuardMs: 5,
+        readMemory: () => memory, readPressure: () => 0, unifiedGuardMs: 5,
     });
     t.after(async () => { await controller.drain(); fs.rmSync(dataDir, { recursive: true, force: true }); });
     return { controller, handles, dataDir, memory, setSnapshot(value) { snaps = value; } };

@@ -10,6 +10,7 @@ import { defaultThreads, physicalCoreCount } from '../../lib/local-llm/controlle
 import { loadSeedCatalog } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
 import { RUNNERS, getRunner } from './fixtures/host.mjs';
+import { MEMORY_CAP_LIMITS } from './fixtures/limits.mjs';
 
 const ikLlamaCppRunner = RUNNERS['ik_llama.cpp'];
 const llamaCppCpuRunner = RUNNERS['llama.cpp-cpu'];
@@ -538,11 +539,11 @@ const OLLAMA_MODEL = Object.freeze({ id: 'qwen', displayName: 'Qwen 0.5B', seed:
 const CPU_DECISION = Object.freeze({ cause: 'absent', reason: 'No GPU is attached to this agent: GPU not applied to this Box yet' });
 
 function admitOllamaOnCpu({ size, model = OLLAMA_MODEL, params, memory = { totalBytes: M1_TOTAL, availableBytes: M1_AVAILABLE }, cgroupMemory = null,
-    disk = { freeBytes: 100 * GIB }, remainingDownloadBytes = 0 }) {
+    disk = { freeBytes: 100 * GIB }, remainingDownloadBytes = 0, limits = undefined }) {
     const source = { type: 'ollama', tag: 'qwen2.5:0.5b', ...(size === undefined ? {} : { size }) };
     return admit({
         runner: ollamaRunner, model, source, params: params ?? ollamaRunner.normalizeParams({}, { model, profile: 'cpu' }),
-        snapshot: { gpu: { available: false, state: 'absent' }, memory, cgroupMemory, disk }, profile: 'cpu', decision: CPU_DECISION, remainingDownloadBytes,
+        snapshot: { gpu: { available: false, state: 'absent' }, memory, cgroupMemory, disk }, profile: 'cpu', decision: CPU_DECISION, remainingDownloadBytes, limits,
     });
 }
 
@@ -581,8 +582,8 @@ test('Ollama on the cpu profile is admitted from its pinned size, and refused wh
     assert.equal(never.status, 'incompatible');
     assert.match(never.reason, /which must keep 1\.50 GiB for the host\. Reduce the context or pick a smaller model\./);
     assert.equal(admitOllamaOnCpu({ size: 13793441244 }).status, 'incompatible');
-    // A container memory limit caps the pool, and says so.
-    const capped = admitOllamaOnCpu({ size: 1000 * MIB, cgroupMemory: { maxBytes: 2 * GIB, currentBytes: 0 } });
+    // A container memory limit caps the pool, and says so (through the limits' memoryPool hook).
+    const capped = admitOllamaOnCpu({ size: 1000 * MIB, cgroupMemory: { maxBytes: 2 * GIB, currentBytes: 0 }, limits: MEMORY_CAP_LIMITS });
     assert.equal(capped.status, 'incompatible');
     assert.equal(capped.estimate.poolBytes, 2 * GIB);
     assert.ok(capped.warnings.some((warning) => /container memory limit of 2\.00 GiB applies/.test(warning)));

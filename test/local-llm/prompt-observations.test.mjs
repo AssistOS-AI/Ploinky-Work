@@ -101,7 +101,7 @@ function controllerHarness(t, { profile = 'cpu', health = 503, holdModels = fals
         env: { PATH: '/usr/bin' }, fileExists: () => true, installer: { installable: () => false }, detectRunner: () => ({ installed: true }),
         snapshot: async () => ({ memory, disk: { freeBytes: 1e12 }, gpu: profile === 'cpu' ? { available: false, state: 'absent' }
             : { available: true, backend: 'vulkan', driver: 'venus', memoryModel: 'venus', name: 'fixture', totalBytes: 8 * 2 ** 30, freeBytes: 8 * 2 ** 30, icdFile: VULKAN_KEYS.vulkan_icd_venus } }),
-        readMemory: () => memory, readPressure: () => ({ some: { avg10: 0 }, full: { avg10: 0 } }), readBudget: () => ({ state: 'absent' }),
+        readMemory: () => memory, readPressure: () => ({ some: { avg10: 0 }, full: { avg10: 0 } }),
         inspect: async () => ({ state: 'complete', bytes: 491400032, total: 491400032 }),
         download: async () => { const target = files ? files(weight, dataDir)[downloads % 3] : weight; downloads++; return { status: 'complete', path: target, bytesTransferred: 0 }; },
         dropCache: (file) => { drops++; return drop(file); }, pollMs: 2, stopGraceMs: 20,

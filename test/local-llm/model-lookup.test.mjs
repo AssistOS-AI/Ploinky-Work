@@ -767,7 +767,7 @@ const ARM64_CONTRACT = Object.freeze({ architecture: 'arm64', llama_cpp: 'b11159
 const cpuSnapshot = () => ({
     gpu: { available: false, state: 'absent', reason: 'No GPU is attached to this agent: GPU not applied to this Box yet' },
     memory: { totalBytes: 6036128 * 1024, availableBytes: 3122576 * 1024 },
-    cgroupMemory: null, disk: { freeBytes: 100_000 * MIB, totalBytes: 400_000 * MIB }, cpus: 4, cores: 4,
+    disk: { freeBytes: 100_000 * MIB, totalBytes: 400_000 * MIB }, cpus: 4, cores: 4,
 });
 
 function deferred() {
