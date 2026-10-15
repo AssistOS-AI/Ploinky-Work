@@ -10,11 +10,12 @@ import test from 'node:test';
 
 import { admissionResult, admit, admitOllama, admitVllm } from '../../lib/local-llm/controller/admission.mjs';
 import { loadSeedCatalog, validateModel } from '../../lib/local-llm/controller/catalog.mjs';
-import { cpuDefaultThreads, performanceCoreCount, physicalCoreCount, readSnapshot } from '../../lib/local-llm/controller/hardware.mjs';
+import { cpuDefaultThreads, defaultThreads, performanceCoreCount, physicalCoreCount, readSnapshot } from '../../lib/local-llm/controller/hardware.mjs';
 import { admitApuLlamaServer } from '../../lib/local-llm/controller/profiles.mjs';
 import { LocalLlmError } from '../../lib/local-llm/errors.mjs';
 import { IDENTITY_LIMITS, LIMIT_HOOKS, defineLimits } from '../../lib/local-llm/limits.mjs';
 import { createRunners } from '../../lib/local-llm/runners/index.mjs';
+import { createStateStore } from '../../lib/local-llm/controller/stateStore.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
 import { HOST, PLOINKY_MESSAGES, RUNNERS, createController, getRunner } from './fixtures/host.mjs';
 import { cpuFs } from './fixtures/sharedFixtures.mjs';
@@ -112,18 +113,41 @@ test('capCores: performanceCoreCount calls it with the performance class size, a
     assert.equal(even.calls.length, 0);
 });
 
-test('capCores: createRunners gives the limits to the llama-server and LM Studio thread defaults', () => {
-    const seen = [];
-    const { limits } = recording({ capCores: (count, { fsApi }) => { seen.push(fsApi); return 1; } });
+const launchOf = (runner, profile = 'dedicated') => runner.buildLaunch({ artifactPath: '/m/q.gguf', params: {}, port: 18080, apiKey: 'k'.repeat(43),
+    model: { id: 'm', displayName: 'M' }, runnerDir: '/x/run/llama.cpp/b1', profile });
+const threadsOf = ({ args }) => args[args.indexOf('--threads') + 1];
+
+test('capCores: createRunners gives the limits to the thread defaults of llama.cpp, ik_llama.cpp and the Vulkan and CPU builds', () => {
+    const { limits, calls } = recording({ capCores: () => 40 });
     const runners = createRunners({ host: HOST, messages: PLOINKY_MESSAGES, limits });
-    const launch = (runner) => runner.buildLaunch({ artifactPath: '/m/q.gguf', params: {}, port: 18080, apiKey: 'k'.repeat(43),
-        model: { id: 'm', displayName: 'M' }, runnerDir: '/x/run/llama.cpp/b1', profile: 'dedicated' });
-    const threads = (args) => args[args.indexOf('--threads') + 1];
-    const capped = threads(launch(runners['llama.cpp']).args);
-    const bare = threads(launch(RUNNERS['llama.cpp']).args);
-    assert.equal(capped, '1');
-    assert.notEqual(bare, undefined);
-    assert.ok(seen.length >= 1);
+    const physical = String(defaultThreads(physicalCoreCount()));
+    for (const id of ['llama.cpp', 'ik_llama.cpp']) {
+        assert.equal(threadsOf(launchOf(runners[id])), '38', `${id} with the capped 40 cores`);
+        assert.equal(threadsOf(launchOf(RUNNERS[id])), physical, `${id} with the physical cores`);
+    }
+    assert.ok(calls.every((call) => call.name === 'capCores'));
+    assert.ok(calls.length >= 2);
+});
+
+test('capCores: the performance class of the unified and CPU thread defaults is capped by the hook too', (t) => {
+    // Four CPUs, two of them a higher-capacity class: the reader the runner uses is the real one, so the facts are mocked.
+    const facts = (file) => {
+        if (file === '/proc/self/status') return 'Cpus_allowed_list:\t0-3\n';
+        const match = /cpu(\d)\/cpu_capacity$/.exec(file);
+        if (match) return String([1024, 1024, 700, 700][Number(match[1])]);
+        return null;
+    };
+    const read = fs.readFileSync;
+    t.mock.method(fs, 'readFileSync', (file, ...args) => {
+        const text = facts(String(file));
+        if (text !== null) return text;
+        return read(file, ...args);
+    });
+    const { limits, calls } = recording({ capCores: (count) => count + 30 });
+    const runners = createRunners({ host: HOST, messages: PLOINKY_MESSAGES, limits });
+    assert.equal(threadsOf(launchOf(runners['llama.cpp'], 'unified')), '32', 'the 2 performance cores, capped to 32');
+    assert.equal(threadsOf(launchOf(RUNNERS['llama.cpp'], 'unified')), '2', 'the 2 performance cores');
+    assert.equal(calls.filter((call) => call.args[0] === 2).length >= 1, true);
 });
 
 // ---------------------------------------------------------------- decorateSnapshot
@@ -539,4 +563,91 @@ test('the controller hands its limits to the snapshot reader and the hardware re
     t.after(() => own.drain());
     await own.overview();
     assert.equal(readers[0].limits, probe.limits);
+});
+
+// ---------------------------------------------------------------- the dedicated guard (cadence and headroom off the APU)
+
+const DEDICATED_SNAPSHOT = Object.freeze({
+    gpu: { available: true, name: 'Test GPU', totalBytes: 6144 * MIB, usedBytes: 144 * MIB, freeBytes: 6000 * MIB, processes: [] },
+    memory: { totalBytes: 31 * GIB, availableBytes: 24 * GIB },
+    disk: { freeBytes: 300 * GIB, totalBytes: 500 * GIB },
+});
+
+// A GGUF runner whose admission records a RAM floor, so the dedicated profile starts the memory guard.
+const FLOORED_RUNNER = Object.freeze({
+    id: 'floored', displayName: 'Floored runner', weightFormat: 'gguf', pinnedVersion: 'v1', supported: true, executable: '/opt/fake/server',
+    port: 18999, apiKey: true,
+    paramSchema: Object.freeze({ type: 'object', additionalProperties: false, properties: {} }),
+    basicParams: Object.freeze([]),
+    normalizeParams: () => ({}),
+    describeContext: () => ({ totalContext: 1, perRequestContext: 1, parallel: 1, kvUnified: false }),
+    detect: () => ({ installed: true, version: 'v1', reason: null }),
+    async start(ctx) {
+        const process = ctx.launch({ command: '/opt/fake/server', args: [], env: {} });
+        await ctx.waitForHttp(`http://127.0.0.1:${ctx.port}/ready`, { process });
+        return {};
+    },
+    chatModel: (deployment) => deployment.modelId,
+    admit: () => admissionResult('ok', null, { gpuBytes: GIB, ramFloorBytes: 4 * GIB, basis: 'fake policy' }),
+    parseReport: () => ({}),
+});
+
+function dedicatedGuard(t, limits) {
+    const dataDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'limits-guard-'));
+    t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+    const reads = { count: 0, availableBytes: 24 * GIB };
+    const controller = createController({
+        dataDir, env: { PATH: '/usr/bin' }, seedCatalog: loadSeedCatalog(SEED_CATALOG_FILE), stateStore: createStateStore({ dataDir }), limits,
+        runners: { floored: FLOORED_RUNNER }, snapshot: async () => structuredClone(DEDICATED_SNAPSHOT),
+        download: async ({ artifact }) => ({ status: 'complete', path: `/data/models/gguf/${artifact.file}`, bytesTransferred: 0 }),
+        inspect: async () => ({ state: 'complete', bytes: 1 }),
+        startRunner({ command, args, env }) {
+            let running = true; let resolveExit;
+            const handle = { pid: 7000, command, args, env, exited: new Promise((resolve) => { resolveExit = resolve; }),
+                get running() { return running; },
+                async stop() { running = false; resolveExit({ code: 0, signal: 'SIGTERM', error: null }); return handle.exited; },
+                async kill() { return handle.stop(); } };
+            return handle;
+        },
+        fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({}) }),
+        detectRunner: (runner) => ({ installed: runner.supported, version: runner.pinnedVersion, reason: null }),
+        pollMs: 2, stopGraceMs: 20,
+        // The dedicated guard samples this slowly unless the limits ask to be watched; unifiedGuardMs is the short interval.
+        readMemory: () => { reads.count += 1; return { totalBytes: 31 * GIB, availableBytes: reads.availableBytes }; },
+        memoryGuardLoadMs: 60_000, memoryGuardReadyMs: 60_000, unifiedGuardMs: 5,
+    });
+    t.after(() => controller.drain());
+    const run = (requestId) => controller.run({ modelId: 'gpt-oss-20b', runnerId: 'floored', requestId, params: {} });
+    return { controller, reads, run };
+}
+
+test('guard hooks: a dedicated guard moves to the short interval only when the first sample is watched', async (t) => {
+    const watched = dedicatedGuard(t, recording({ guardSample: { watched: true } }).limits);
+    await watched.run('limits-dedicated-0001'); await until(() => watched.controller.state.deployment?.phase === 'ready');
+    await until(() => watched.reads.count >= 5);
+    const quiet = dedicatedGuard(t, recording({ guardSample: { watched: false } }).limits);
+    await quiet.run('limits-dedicated-0002'); await until(() => quiet.controller.state.deployment?.phase === 'ready');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(quiet.reads.count, 0, 'the slow interval has not elapsed');
+    const plain = dedicatedGuard(t, undefined);
+    await plain.run('limits-dedicated-0003'); await until(() => plain.controller.state.deployment?.phase === 'ready');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(plain.reads.count, 0, 'the identity default keeps the slow interval');
+});
+
+test('guard hooks: the headroom answer is compared with the floor of a dedicated guard, which stops it without a kill', async (t) => {
+    let cap = null;
+    const probe = recording({ guardSample: { watched: true }, guardBreach: (sample, context) => context.check === 'headroom' ? { available: cap ?? context.available } : null });
+    const h = dedicatedGuard(t, probe.limits);
+    await h.run('limits-dedicated-0004'); await until(() => h.controller.state.deployment?.phase === 'ready');
+    await until(() => probe.named('guardBreach').length >= 2);
+    assert.deepEqual([...new Set(probe.named('guardBreach').map((call) => call.args[1].check))], ['headroom'], 'the watchable check is the APU guard\'s alone');
+    const [sample, context] = probe.named('guardBreach')[0].args;
+    assert.deepEqual(sample, { watched: true });
+    assert.equal(context.available, 24 * GIB);
+    assert.equal(context.memory.totalBytes, 31 * GIB);
+    assert.equal(h.controller.state.deployment.phase, 'ready');
+    cap = 0;
+    await until(() => h.controller.state.deployment?.phase !== 'ready');
+    assert.match(h.controller.state.deployment.error ?? '', /below the floor \(0\.0 GiB available, 4\.0 GiB required\)/);
 });

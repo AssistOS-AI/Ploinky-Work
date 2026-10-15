@@ -12,7 +12,9 @@ import { loadSeedCatalog } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
 import { defaultThreads, physicalCoreCount } from '../../lib/local-llm/controller/hardware.mjs';
 import { defaultPorts } from '../../lib/local-llm/runners/index.mjs';
-import { RUNNERS } from './fixtures/host.mjs';
+import { createRunners } from '../../lib/local-llm/runners/index.mjs';
+import { defineLimits } from '../../lib/local-llm/limits.mjs';
+import { HOST, PLOINKY_MESSAGES, RUNNERS } from './fixtures/host.mjs';
 import {
     LMSTUDIO_SWITCH,
     createOutputFilter,
@@ -377,6 +379,27 @@ test('start runs llmster from its copy, imports by symbolic link, loads through 
     assert.ok(calls.exec.every((step) => !Object.keys(step.env).some((key) => /token|secret|key/i.test(key))));
     assert.deepEqual(calls.waited, ['http://127.0.0.1:18084/v1/models']);
     assert.deepEqual(details, { lmstudio: { modelKey: 'gpt-oss-20b', engine: { pid: 101, dir: 'llama.cpp-linux-x86_64-nvidia-cuda12-avx2-2.41.0' } } });
+});
+
+test('start sizes the engine threads from the core count the limits cap (limits.capCores)', async (t) => {
+    const limits = defineLimits({ capCores: () => 40 });
+    const capped = createRunners({ host: HOST, messages: PLOINKY_MESSAGES, limits }).lmstudio;
+    const root = tempDir(t, 'run');
+    const runDir = path.join(root, 'lmstudio', '0.0.25-1');
+    const engine = ENGINE.replace(RUN_DIR, runDir);
+    // The engine the fake /proc shows has the flags admission sized, with the threads of the capped 40 cores (40 - 2).
+    const procDir = fakeProc(t, [{ pid: 101, exe: engine, argv: [engine, ...ENGINE_ARGS.slice(0, -1), '38'] }]);
+    const { ctx, calls } = startContext(t, runDir);
+    await capped.start(ctx, { procDir, kill: () => {}, node: 'node' });
+    const load = JSON.parse(calls.exec.find((step) => step.args[0] === HELPER && step.args[1] === 'load').args[2]);
+    assert.equal(load.config.llamaCppArgumentsOverride.overrideParameters.find((parameter) => parameter.key === '--threads').value, '38');
+    // The runner of the plain table sizes them from the physical cores.
+    const plain = startContext(t, runDir);
+    const plainProc = fakeProc(t, [{ pid: 102, exe: engine, argv: [engine, ...ENGINE_ARGS] }]);
+    await RUNNERS.lmstudio.start(plain.ctx, { procDir: plainProc, kill: () => {}, node: 'node' });
+    const plainLoad = JSON.parse(plain.calls.exec.find((step) => step.args[0] === HELPER && step.args[1] === 'load').args[2]);
+    assert.equal(plainLoad.config.llamaCppArgumentsOverride.overrideParameters.find((parameter) => parameter.key === '--threads').value,
+        String(defaultThreads(physicalCoreCount())));
 });
 
 test('start refuses an engine whose flags differ from what admission sized, and an update llmster staged', async (t) => {
