@@ -123,6 +123,20 @@ This batching mode combines prompts; it does not use a provider's asynchronous B
 
 Example: `{ tier: 'small', template: 'Classify this text: ${input}', batch: true, code: 'this.end(result)' }`.
 
+## Local model engine
+
+`lib/local-llm` is an engine that runs one open-weight model at a time through on-demand runner processes (llama.cpp and its CPU and Vulkan builds, ik_llama.cpp, Ollama, vLLM, TabbyAPI, LM Studio). It is a library for programs that embed it; the `pworker` CLI does not call it yet. It keeps the code style of its origin (see [DS006](docs/specs/DS006-engine-coding-style.md)) and is specified in [docs/specs](docs/specs/matrix.md).
+
+| Subpath | Stability | Use |
+| --- | --- | --- |
+| `pworker/local-llm` | stable | `createLocalLlmController({ host, messages, limits, gatewayModelName, env })`, `defineHost`, `defineMessages`, `defineLimits` and the other exports of [DS007](docs/specs/DS007-host-limits-and-messages.md) |
+| `pworker/local-llm/chat` | stable | The pure helpers of a chat responder: request building, completion budgets (`LOCAL_LLM_MAX_COMPLETION_TOKENS`, `LOCAL_LLM_RUNNER_TIMEOUT_MS`) and the runner's speed figures |
+| `pworker/local-llm/runner-process` | stable | Start and supervise a runner process |
+| `pworker/local-llm/runner-install-check` | stable | `runInstallCheck(argv, { host })`, the install check for a runner lock entry |
+| `pworker/local-llm/internal/*` | unstable | Maps to `lib/local-llm/*`. For the local-llms agent only; it carries no compatibility promise |
+
+The engine has no container paths, vendor wording or hardware limits of its own. A host gives it the paths (`defineHost`), the wording (`defineMessages`) and the limits (`defineLimits`, hooks whose identity default limits nothing). It has no default catalog or runner-lock path, and it adds no dependency: the package runs on Node 22.13 or newer. A `.tar.zst` runner needs `zlib.createZstdDecompress` (Node 22.15 or newer); where it is missing the install is refused with `zstd_unsupported` before anything is downloaded.
+
 ## Implementation status
 
 The executor is deterministic and does not plan agentic loops while running. Compiling a text request makes an LLM call on the `good` tier; without an available provider, compilation cannot run, while model-free `.json` tasks can run offline.
