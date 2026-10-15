@@ -364,7 +364,7 @@ test('a pinned data file is copied read-only into its directory of the runnable 
         if (args[0] === 'venv') fs.mkdirSync(path.join(args.at(-1), 'bin'), { recursive: true });
         return { code: 0, signal: null, output: '', aborted: false };
     };
-    const { installer: inst, runRoot, cacheRoot } = installer(t, lock, base, { run: fakeRun });
+    const { installer: inst, runRoot, cacheRoot } = installer(t, lock, base, { run: fakeRun, uv: '/usr/local/bin/uv', python: '/usr/bin/python3' });
     await inst.fetchAll(inst.entryFor('tiny'));
     await inst.ensureRunnable('tiny');
     const runDir = path.join(runRoot, 'tiny', '1.2.3');
