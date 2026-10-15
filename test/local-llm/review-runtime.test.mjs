@@ -15,10 +15,10 @@ import test from 'node:test';
 import { admit } from '../../lib/local-llm/controller/admission.mjs';
 import { loadSeedCatalog, validateModel } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
-import { createController } from '../../lib/local-llm/controller/deployments.mjs';
+import { createController } from './fixtures/host.mjs';
 import { UNIFIED, UNIFIED_LOAD_MODES, envelopeFor } from '../../lib/local-llm/controller/profiles.mjs';
 import { createStateStore } from '../../lib/local-llm/controller/stateStore.mjs';
-import { getRunner } from '../../lib/local-llm/runners/index.mjs';
+import { getRunner } from './fixtures/host.mjs';
 import { LLAMA_SERVER_UNIFIED_PARAM_SCHEMA } from '../../lib/local-llm/runners/llamaServer.mjs';
 
 const MIB = 1024 * 1024;
@@ -85,7 +85,7 @@ async function until(predicate, label, timeoutMs = 3000) {
  * A controller with injected hardware. `snap(read)` gives the n-th snapshot
  * (it may throw); `onVerify` runs inside the final verification of the weights.
  */
-function harness(t, { seed, snap, onVerify = async () => {}, readMemory, dataDir, env = {}, resolveHf } = {}) {
+function harness(t, { seed, snap, onVerify = async () => {}, readMemory, dataDir, env = {}, resolveHf, seedCatalogFile } = {}) {
     const dir = dataDir || fs.mkdtempSync(path.join(os.tmpdir(), 'local-llm-review-runtime-'));
     if (!dataDir) t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
     const weights = path.join(dir, 'weights.gguf');
@@ -96,7 +96,9 @@ function harness(t, { seed, snap, onVerify = async () => {}, readMemory, dataDir
     const controller = createController({
         dataDir: dir,
         env: { PATH: '/usr/bin', ...env },
-        ...(seed ? { seedCatalog: seed } : env.LOCAL_LLM_CATALOG_FILE ? {} : { seedCatalog: loadSeedCatalog(SEED_CATALOG_FILE) }),
+        // The operator's catalog is the host's seed catalog file: the controller loads it itself.
+        ...(seedCatalogFile ? { hostOverrides: { seedCatalogFile } } : {}),
+        ...(seed ? { seedCatalog: seed } : seedCatalogFile ? {} : { seedCatalog: loadSeedCatalog(SEED_CATALOG_FILE) }),
         stateStore: createStateStore({ dataDir: dir }),
         snapshot: async () => {
             calls.snapshots += 1;
@@ -391,7 +393,7 @@ test('the operator catalog (LOCAL_LLM_CATALOG_FILE) is trusted: its envelope and
     const [entry] = loadSeedCatalog(file);
     assert.equal(entry.seed, true);
     assert.equal(entry.unified.envelope[0].loadMode, 'dio');
-    const h = harness(t, { env: { LOCAL_LLM_CATALOG_FILE: file }, snap: () => unifiedSnap() });
+    const h = harness(t, { seedCatalogFile: file, snap: () => unifiedSnap() });
     const overview = await h.controller.overview();
     const row = overview.models.find((model) => model.id === 'operator-moe');
     assert.deepEqual(row.validated, { 'llama.cpp': 'operator measurement record' });

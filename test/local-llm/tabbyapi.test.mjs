@@ -12,9 +12,11 @@ import test from 'node:test';
 import { admit } from '../../lib/local-llm/controller/admission.mjs';
 import { loadSeedCatalog } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
-import { RUNNERS, defaultPorts } from '../../lib/local-llm/runners/index.mjs';
+import { defaultPorts } from '../../lib/local-llm/runners/index.mjs';
+import { RUNNERS } from './fixtures/host.mjs';
 import { ParamError } from '../../lib/local-llm/runners/params.mjs';
-import { tabbyApiRunner } from '../../lib/local-llm/runners/tabbyApi.mjs';
+
+const tabbyApiRunner = RUNNERS.tabbyapi;
 
 const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
@@ -42,8 +44,8 @@ test('TabbyAPI is a supported runner that reads EXL3 snapshots on its own loopba
     assert.equal(tabbyApiRunner.supported, true);
     assert.equal(tabbyApiRunner.weightFormat, 'exl3');
     assert.equal(tabbyApiRunner.pinnedVersion, 'f07131c');
-    assert.equal(defaultPorts().tabbyapi, 18083);
-    assert.equal(new Set(Object.values(defaultPorts())).size, Object.keys(defaultPorts()).length);
+    assert.equal(defaultPorts(RUNNERS).tabbyapi, 18083);
+    assert.equal(new Set(Object.values(defaultPorts(RUNNERS))).size, Object.keys(defaultPorts(RUNNERS)).length);
 });
 
 test('TabbyAPI runs from its source directory with the snapshot, loopback only, and no key in its arguments or environment', () => {

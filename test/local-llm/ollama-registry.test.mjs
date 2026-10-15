@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { createController } from '../../lib/local-llm/controller/deployments.mjs';
+import { createController } from './fixtures/host.mjs';
 import { fetchOllamaRegistryManifest } from '../../lib/local-llm/controller/ollamaStore.mjs';
 import { createStateStore } from '../../lib/local-llm/controller/stateStore.mjs';
 import { manifestBytes, registry, sha256 } from './ollama-fixture.mjs';

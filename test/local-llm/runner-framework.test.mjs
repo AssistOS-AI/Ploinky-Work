@@ -11,9 +11,10 @@ import test from 'node:test';
 import { admissionResult } from '../../lib/local-llm/controller/admission.mjs';
 import { WEIGHT_FORMATS, loadSeedCatalog } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
-import { createController } from '../../lib/local-llm/controller/deployments.mjs';
+import { createController } from './fixtures/host.mjs';
 import { createStateStore } from '../../lib/local-llm/controller/stateStore.mjs';
-import { RUNNERS, defaultPorts, runnerSummaries } from '../../lib/local-llm/runners/index.mjs';
+import { defaultPorts, runnerSummaries } from '../../lib/local-llm/runners/index.mjs';
+import { RUNNERS } from './fixtures/host.mjs';
 import { deepFreeze, normalizeWith } from '../../lib/local-llm/runners/params.mjs';
 
 const MIB = 1024 * 1024;
@@ -178,7 +179,7 @@ test('a runner that dies right after its readiness probes ends in error, never i
 });
 
 test('ports come from the adapters, one per supported runner, all distinct', () => {
-    assert.deepEqual(defaultPorts(), { 'llama.cpp': 18080, 'ik_llama.cpp': 18081, ollama: 18434, vllm: 18082, tabbyapi: 18083, lmstudio: 18084, 'llama.cpp-cpu': 18085, 'llama.cpp-vulkan': 18086 });
+    assert.deepEqual(defaultPorts(RUNNERS), { 'llama.cpp': 18080, 'ik_llama.cpp': 18081, ollama: 18434, vllm: 18082, tabbyapi: 18083, lmstudio: 18084, 'llama.cpp-cpu': 18085, 'llama.cpp-vulkan': 18086 });
     assert.throws(() => defaultPorts({ a: { id: 'a', supported: true, port: 18080 }, b: { id: 'b', supported: true, port: 18080 } }),
         /port 18080/);
 });
@@ -190,7 +191,7 @@ test('the registry has llama.cpp, ik_llama.cpp, Ollama, vLLM, TabbyAPI, LM Studi
     assert.deepEqual(Object.keys(RUNNERS), ['llama.cpp', 'ik_llama.cpp', 'ollama', 'vllm', 'tabbyapi', 'lmstudio', 'llama.cpp-cpu', 'llama.cpp-vulkan']);
     assert.equal(fs.existsSync(new URL('../../lib/local-llm/runners/lmStudio.mjs', import.meta.url)), true);
     assert.equal(RUNNERS.lmstudio.supported, true);
-    const summaries = runnerSummaries();
+    const summaries = runnerSummaries(RUNNERS);
     assert.deepEqual(summaries.find((summary) => summary.id === 'llama.cpp').basicParams, ['ctxSize', 'nCpuMoe']);
     assert.deepEqual(summaries.find((summary) => summary.id === 'llama.cpp').moeParams, ['nCpuMoe']);
     assert.deepEqual(summaries.find((summary) => summary.id === 'ollama').basicParams, ['numCtx']);

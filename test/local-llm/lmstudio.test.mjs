@@ -11,14 +11,14 @@ import { admit } from '../../lib/local-llm/controller/admission.mjs';
 import { loadSeedCatalog } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
 import { defaultThreads, physicalCoreCount } from '../../lib/local-llm/controller/hardware.mjs';
-import { RUNNERS, defaultPorts } from '../../lib/local-llm/runners/index.mjs';
+import { defaultPorts } from '../../lib/local-llm/runners/index.mjs';
+import { RUNNERS } from './fixtures/host.mjs';
 import {
     LMSTUDIO_SWITCH,
     createOutputFilter,
     effectiveFlags,
     engineFlagProblems,
     expectedEngineFlags,
-    lmStudioRunner,
     loadConfig,
     strayProcesses,
 } from '../../lib/local-llm/runners/lmStudio.mjs';
@@ -44,8 +44,8 @@ test('LM Studio is a GGUF runner on its own loopback port, with no per-start key
     assert.equal(lmStudioRunner.pinnedVersion, '0.0.25-1');
     assert.equal(lmStudioRunner.supported, true);
     assert.equal(lmStudioRunner.apiKey, false);
-    assert.equal(defaultPorts().lmstudio, 18084);
-    assert.equal(new Set(Object.values(defaultPorts())).size, Object.keys(defaultPorts()).length);
+    assert.equal(defaultPorts(RUNNERS).lmstudio, 18084);
+    assert.equal(new Set(Object.values(defaultPorts(RUNNERS))).size, Object.keys(defaultPorts(RUNNERS)).length);
     assert.match(lmStudioRunner.displayName, /LM Studio/);
 });
 
@@ -422,6 +422,8 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 
 import { createLogBuffer, startRunnerProcess } from '../../lib/local-llm/controller/runnerProcess.mjs';
+
+const lmStudioRunner = RUNNERS.lmstudio;
 
 function fakeChild() {
     const child = new EventEmitter();

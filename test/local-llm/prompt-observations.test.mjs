@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { createPromptObservations } from '../../lib/local-llm/promptObservations.mjs';
 import { createObservationClock, createStartupObservations } from '../../lib/local-llm/controller/startupObservations.mjs';
-import { createController } from '../../lib/local-llm/controller/deployments.mjs';
+import { createController } from './fixtures/host.mjs';
 import { loadSeedCatalog, validateModel } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
 import { VULKAN_KEYS } from './fixtures/sharedFixtures.mjs';

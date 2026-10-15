@@ -14,8 +14,8 @@ import test from 'node:test';
 
 import { loadSeedCatalog } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
-import { createController } from '../../lib/local-llm/controller/deployments.mjs';
-import { readGpu, readSnapshot, unreapedQueries } from '../../lib/local-llm/controller/hardware.mjs';
+import { HOST, createController } from './fixtures/host.mjs';
+import { createHardwareQueryReaper, readGpu, readSnapshot } from '../../lib/local-llm/controller/hardware.mjs';
 import { createStateStore } from '../../lib/local-llm/controller/stateStore.mjs';
 import { HARDWARE_QUERY_REAP_MS } from '../../lib/local-llm/drainBudget.mjs';
 
@@ -76,7 +76,8 @@ async function until(predicate, label, timeoutMs = 5000) {
 test('a stopped query is killed at once, has exited when the snapshot answers, and no further query starts', async (t) => {
     const fixture = fixtureSmi(t, { delayMs: 8000, slowQueries: [1] });
     const stop = new AbortController();
-    const reading = readGpu({ nvidiaSmi: fixture.smi, env: {}, signal: stop.signal });
+    const reaper = createHardwareQueryReaper();
+    const reading = readGpu({ nvidiaSmi: fixture.smi, env: {}, signal: stop.signal, reaper });
     await until(() => fixture.queries().length === 1, 'the first query to start');
     const [query] = fixture.queries();
     assert.ok(alive(query.pid), 'the slow query is running');
@@ -87,7 +88,7 @@ test('a stopped query is killed at once, has exited when the snapshot answers, a
     assert.ok(elapsed < HARDWARE_QUERY_REAP_MS, `answered ${elapsed} ms after the stop`);
     assert.equal(alive(query.pid), false, 'the killed query has exited (reaped) before the answer');
     assert.equal(fixture.queries().length, 1, 'the device and process queries never started');
-    assert.deepEqual(unreapedQueries(), []);
+    assert.deepEqual(reaper.unreapedQueries(), []);
 });
 
 test('a snapshot stopped before it starts runs no query; an unstopped slow snapshot answers normally', async (t) => {
@@ -113,17 +114,18 @@ test('a killed query that does not exit is recorded after the bounded wait, unti
     const child = Object.assign(new EventEmitter(), { pid: 424242, exitCode: null, signalCode: null, signals: [] });
     child.kill = (signal) => { child.signals.push(signal); return true; };
     const stop = new AbortController();
-    const reading = readGpu({ execFileImpl: () => child, nvidiaSmi: '/fixture/nvidia-smi', env: {}, signal: stop.signal });
+    const reaper = createHardwareQueryReaper();
+    const reading = readGpu({ execFileImpl: () => child, nvidiaSmi: '/fixture/nvidia-smi', env: {}, signal: stop.signal, reaper });
     const stoppedAt = Date.now();
     stop.abort();
     await assert.rejects(reading, { name: 'AbortError' });
     const elapsed = Date.now() - stoppedAt;
     assert.deepEqual(child.signals, ['SIGKILL']);
     assert.ok(elapsed >= HARDWARE_QUERY_REAP_MS - 20 && elapsed < HARDWARE_QUERY_REAP_MS + 500, `answered after ${elapsed} ms`);
-    assert.deepEqual(unreapedQueries(), [424242]);
+    assert.deepEqual(reaper.unreapedQueries(), [424242]);
     child.signalCode = 'SIGKILL';
     child.emit('exit', null, 'SIGKILL');
-    assert.deepEqual(unreapedQueries(), []);
+    assert.deepEqual(reaper.unreapedQueries(), []);
 });
 
 // ------------------------------------------------- the deployment job
@@ -355,6 +357,7 @@ test('a snapshot stopped while only the free-disk read is pending answers at onc
     const reading = readSnapshot({
         dataDir: '/nowhere',
         signal: stop.signal,
+        nvidiaSmi: HOST.nvidiaSmi,
         execFileImpl: (command, args, options, callback) => {
             queries += 1;
             queueMicrotask(() => callback(null, answers[args[0]] ?? '', ''));

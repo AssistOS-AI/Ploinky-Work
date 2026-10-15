@@ -13,11 +13,11 @@ import test from 'node:test';
 import { Duplex, Transform } from 'node:stream';
 import zlib from 'node:zlib';
 
-import { createController } from '../../lib/local-llm/controller/deployments.mjs';
+import { createController } from './fixtures/host.mjs';
 import { createRunnerInstaller, runTool } from '../../lib/local-llm/controller/runnerInstaller.mjs';
 import { createStateStore } from '../../lib/local-llm/controller/stateStore.mjs';
 import { archiveCompressionFor, loadRunnerLock, loadRunnerLocks, validateRunnerLock } from '../../lib/local-llm/controller/runnerLock.mjs';
-import { RUNNERS } from '../../lib/local-llm/runners/index.mjs';
+import { RUNNERS } from './fixtures/host.mjs';
 import { IMAGE_LOCK } from './fixtures/sharedFixtures.mjs';
 import { probeExecutable } from '../../lib/local-llm/tools/runnerInstallCheck.mjs';
 

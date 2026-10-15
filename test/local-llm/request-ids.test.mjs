@@ -11,7 +11,7 @@ import test from 'node:test';
 
 import { loadSeedCatalog } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
-import { createController } from '../../lib/local-llm/controller/deployments.mjs';
+import { createController } from './fixtures/host.mjs';
 import { acceptedRequest, createStateStore, recordRequest, requestMap } from '../../lib/local-llm/controller/stateStore.mjs';
 
 const GIB = 1024 ** 3;

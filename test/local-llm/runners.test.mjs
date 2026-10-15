@@ -3,16 +3,20 @@ import assert from 'node:assert/strict';
 import { admit } from '../../lib/local-llm/controller/admission.mjs';
 import { cpuFloorBytes, cpuHostReserveBytes } from '../../lib/local-llm/controller/profiles.mjs';
 import { ParamError, validateParams } from '../../lib/local-llm/runners/params.mjs';
-import { RUNNERS, getRunner, offeredIn, runnerSummaries, runnerSummary } from '../../lib/local-llm/runners/index.mjs';
-import { ikLlamaCppRunner } from '../../lib/local-llm/runners/ikLlamaCpp.mjs';
-import { llamaCppCpuRunner, llamaCppRunner } from '../../lib/local-llm/runners/llamaCpp.mjs';
+import { offeredIn, runnerSummaries, runnerSummary } from '../../lib/local-llm/runners/index.mjs';
 import { createLlamaServerRunner } from '../../lib/local-llm/runners/llamaServer.mjs';
 import { parseRunnerReport } from '../../lib/local-llm/controller/runnerProcess.mjs';
 import { defaultThreads, physicalCoreCount } from '../../lib/local-llm/controller/hardware.mjs';
 import { loadSeedCatalog } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
-import { ollamaRunner } from '../../lib/local-llm/runners/ollama.mjs';
-import { vllmRunner, vllmRuntime } from '../../lib/local-llm/runners/vllm.mjs';
+import { RUNNERS, getRunner } from './fixtures/host.mjs';
+
+const ikLlamaCppRunner = RUNNERS['ik_llama.cpp'];
+const llamaCppCpuRunner = RUNNERS['llama.cpp-cpu'];
+const llamaCppRunner = RUNNERS['llama.cpp'];
+const ollamaRunner = RUNNERS.ollama;
+const vllmRunner = RUNNERS.vllm;
+const vllmRuntime = RUNNERS.vllm;
 
 const API_KEY = 'k'.repeat(24) + '_-AZaz09k';
 const MODEL = Object.freeze({ id: 'qwen3-8b-q4' });
@@ -473,7 +477,7 @@ describe('runner registry', () => {
     });
 
     it('summarizes runners with JSON-serializable, frozen schemas', () => {
-        const summaries = runnerSummaries();
+        const summaries = runnerSummaries(RUNNERS);
         assert.deepEqual(summaries.map((s) => s.id), ['llama.cpp', 'ik_llama.cpp', 'ollama', 'vllm', 'tabbyapi', 'lmstudio']);
         for (const summary of summaries) {
             assert.deepEqual(Object.keys(summary).sort(),
@@ -731,7 +735,7 @@ describe('llama.cpp (CPU build)', () => {
         for (const runner of Object.values(RUNNERS).filter((candidate) => !candidate.profiles)) {
             for (const profile of ['cpu', 'dedicated', 'unified', null]) assert.equal(offeredIn(runner, profile), true, `${runner.id} ${profile}`);
         }
-        assert.equal(runnerSummaries().some((summary) => summary.id === 'llama.cpp-cpu'), false);
+        assert.equal(runnerSummaries(RUNNERS).some((summary) => summary.id === 'llama.cpp-cpu'), false);
         assert.equal(runnerSummaries(RUNNERS, 'unified').some((summary) => summary.id === 'llama.cpp-cpu'), false);
         assert.equal(runnerSummaries(RUNNERS, 'cpu').at(-1).id, 'llama.cpp-cpu');
         assert.ok(runnerSummary(llamaCppCpuRunner, 'cpu').paramSchema);

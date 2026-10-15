@@ -5,9 +5,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { defaultThreads, physicalCoreCount } from '../../lib/local-llm/controller/hardware.mjs';
-import { ikLlamaCppRunner } from '../../lib/local-llm/runners/ikLlamaCpp.mjs';
-import { llamaCppRunner } from '../../lib/local-llm/runners/llamaCpp.mjs';
 import { createLlamaServerRunner } from '../../lib/local-llm/runners/llamaServer.mjs';
+import { RUNNERS } from './fixtures/host.mjs';
+
+const llamaCppRunner = RUNNERS['llama.cpp'];
+const ikLlamaCppRunner = RUNNERS['ik_llama.cpp'];
 
 function fakeFs(files) {
     return {

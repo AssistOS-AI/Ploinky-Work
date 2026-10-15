@@ -13,7 +13,7 @@ import test from 'node:test';
 
 import { admissionResult } from '../../lib/local-llm/controller/admission.mjs';
 import { HF_FILE_SEGMENT_RE, HF_REPO_RE, HF_REVISION_RE, validateModel } from '../../lib/local-llm/controller/catalog.mjs';
-import { createController } from '../../lib/local-llm/controller/deployments.mjs';
+import { PLOINKY_MESSAGES, createController } from './fixtures/host.mjs';
 import { DownloadError, fetchJson } from '../../lib/local-llm/controller/downloader.mjs';
 import { LOOKUP_METADATA_MAX_BYTES, lookupHuggingFaceModel, normalizeLookupInput, quantizationOf, sizingFromConfig } from '../../lib/local-llm/controller/modelLookup.mjs';
 import { admitCpuLlamaServer, admitUnifiedLlamaServer, admitUnifiedVllm } from '../../lib/local-llm/controller/profiles.mjs';
@@ -190,7 +190,7 @@ async function fakeHf(t, repo) {
     return { ...server, repo };
 }
 
-const ask = (hf, args, options = {}) => lookupHuggingFaceModel(args, { baseUrl: hf.origin, ...options });
+const ask = (hf, args, options = {}) => lookupHuggingFaceModel(args, { baseUrl: hf.origin, messages: PLOINKY_MESSAGES, ...options });
 const queries = (hf) => hf.requests.map((request) => request.url.replace(/\?.*$/, ''));
 
 // The header of a Qwen2.5-0.5B-like model: 24 layers, 14 heads, 2 KV heads, 896 wide, 32768 context.

@@ -14,7 +14,7 @@ import test from 'node:test';
 
 import { loadSeedCatalog, validateModel } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
-import { createController } from '../../lib/local-llm/controller/deployments.mjs';
+import { createController } from './fixtures/host.mjs';
 import {
     artifactPaths,
     downloadArtifact,

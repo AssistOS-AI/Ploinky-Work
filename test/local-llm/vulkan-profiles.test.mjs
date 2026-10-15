@@ -11,17 +11,18 @@ import test from 'node:test';
 import { admit } from '../../lib/local-llm/controller/admission.mjs';
 import { loadSeedCatalog } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
-import { createController } from '../../lib/local-llm/controller/deployments.mjs';
+import { createController } from './fixtures/host.mjs';
 import { readGpu, readSnapshot, runHardwareQuery } from '../../lib/local-llm/controller/hardware.mjs';
 import { decideProfile, VENUS } from '../../lib/local-llm/controller/profiles.mjs';
 import { parseRunnerReport } from '../../lib/local-llm/controller/runnerProcess.mjs';
-import { hasRenderNode, parseListDevices, readVulkanGpu, VULKAN_ALL_ICD_FILES, vulkanContractOf, vulkanProbeEnv } from '../../lib/local-llm/controller/vulkan.mjs';
-import { getRunner, RUNNERS, runnerSummary } from '../../lib/local-llm/runners/index.mjs';
+import { hasRenderNode, parseListDevices, readVulkanGpu, vulkanAllIcdFiles, vulkanContractOf, vulkanProbeEnv } from '../../lib/local-llm/controller/vulkan.mjs';
+import { runnerSummary } from '../../lib/local-llm/runners/index.mjs';
+import { HOST, HOST_VULKAN, PLOINKY_MESSAGES, getRunner, RUNNERS } from './fixtures/host.mjs';
 import { cpuFs, VULKAN_KEYS } from './fixtures/sharedFixtures.mjs';
 
 const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
-const contract = vulkanContractOf(VULKAN_KEYS);
+const contract = vulkanContractOf(VULKAN_KEYS, HOST_VULKAN);
 const runner = getRunner('llama.cpp-vulkan');
 const fixture = (name) => fs.readFileSync(new URL(`./fixtures/vulkan/${name}`, import.meta.url), 'utf8');
 const seed = loadSeedCatalog(SEED_CATALOG_FILE);
@@ -46,6 +47,7 @@ function renderFs() {
 async function snapshot(options = {}, vulkan = contract, fsApi = renderFs()) {
     const host = probe(options);
     const snap = await readSnapshot({ dataDir: '/tmp', vulkan, fsApi, execFileImpl: host.execFileImpl,
+        nvidiaSmi: HOST.nvidiaSmi, gpuAccess: HOST.gpuAccess, messages: PLOINKY_MESSAGES,
         apu: options.apu === true,
         env: { PLOINKY_GPU_STATUS: 'attached' }, statfs: async () => ({ bsize: 4096, blocks: 1000000, bavail: 999000 }) });
     return { snap, calls: host.calls };
@@ -56,17 +58,17 @@ async function gpu(driver = 'venus') {
 function roomy(gpu) { return { gpu, memory: { totalBytes: 6 * GIB, availableBytes: 5 * GIB }, disk: { freeBytes: 100 * GIB } }; }
 async function verdict(profile, { model = small, params = {}, snap = null, gpuBudget = { state: 'absent' } } = {}) {
     return admit({ runner, model, source: model.sources.gguf, params: runner.normalizeParams(params, { model, profile }),
-        snapshot: snap || roomy(await gpu(profile === 'vulkan' ? 'radv' : 'venus')), profile, gpuBudget });
+        snapshot: snap || roomy(await gpu(profile === 'vulkan' ? 'radv' : 'venus')), profile, gpuBudget, messages: PLOINKY_MESSAGES });
 }
 
 test('contract: valid; missing; wrong version; traversal; relative; server path mismatch', () => {
     assert.ok(Object.isFrozen(contract));
-    assert.equal(vulkanContractOf(null), null);
+    assert.equal(vulkanContractOf(null, HOST_VULKAN), null);
     for (const change of [{ vulkan_contract: '2' }, { vulkan_llama_cpp: 'latest' }, { vulkan_mesa: '' },
         { vulkan_icd_radv: '/opt/local-llm/vulkan/icd.d/../../../etc/x.json' }, { vulkan_icd_venus: 'relative.json' },
-        { vulkan_llama_cpp_server: '/opt/llama.cpp-vulkan/../llama-server' }]) assert.equal(vulkanContractOf({ ...VULKAN_KEYS, ...change }), null);
+        { vulkan_llama_cpp_server: '/opt/llama.cpp-vulkan/../llama-server' }]) assert.equal(vulkanContractOf({ ...VULKAN_KEYS, ...change }, HOST_VULKAN), null);
     for (const key of Object.keys(VULKAN_KEYS)) {
-        const missing = { ...VULKAN_KEYS }; delete missing[key]; assert.equal(vulkanContractOf(missing), null, key);
+        const missing = { ...VULKAN_KEYS }; delete missing[key]; assert.equal(vulkanContractOf(missing, HOST_VULKAN), null, key);
     }
 });
 test('snapshot: no render node keeps the absent GPU and runs nvidia-smi only', async () => {
@@ -133,7 +135,7 @@ test('snapshot: list-devices name mismatch, zero total and oversize values', asy
 test('probe exec options: explicit env without ambient Vulkan variables; nvidia-smi options unchanged', async () => {
     const { calls } = await snapshot();
     assert.deepEqual(calls[0].options, { timeout: 10000, killSignal: 'SIGKILL', encoding: 'utf8' });
-    assert.deepEqual(calls[1].options.env, vulkanProbeEnv(VULKAN_ALL_ICD_FILES));
+    assert.deepEqual(calls[1].options.env, vulkanProbeEnv(vulkanAllIcdFiles(HOST_VULKAN)));
     assert.deepEqual(calls[2].options.env, vulkanProbeEnv(contract.vulkan_icd_venus));
     assert.deepEqual(Object.keys(calls[1].options.env).sort(), ['PATH', 'HOME', 'LANG', 'VK_DRIVER_FILES', 'VK_LOADER_LAYERS_DISABLE', 'MESA_SHADER_CACHE_DISABLE'].sort());
 });
@@ -142,7 +144,7 @@ test('probe env: vulkanProbeEnv rejects an empty or relative ICD list; detect us
     let seen;
     runner.detect({ spawnSync(command, args, options) { seen = { command, args, options }; return { status: 0, stdout: 'build 11159,', stderr: '' }; } });
     assert.equal(seen.command, '/opt/llama.cpp-vulkan/llama-server');
-    assert.deepEqual(seen.options.env, vulkanProbeEnv(VULKAN_ALL_ICD_FILES));
+    assert.deepEqual(seen.options.env, vulkanProbeEnv(vulkanAllIcdFiles(HOST_VULKAN)));
 });
 test('probe cancellation kills and reaps the child, returning AbortError', async () => {
     const stop = new AbortController();
@@ -195,11 +197,11 @@ test('report: Vulkan0 buffers, device name with parentheses, offload count; CUDA
     assert.equal(parseRunnerReport(lines).modelMiB, null);
 });
 
-function controllerHarness(t, { driver = 'venus', defaultReader = null, imageContract = { architecture: 'arm64', gpu_compute_capabilities: '12.1', ...VULKAN_KEYS }, env = {} } = {}) {
+function controllerHarness(t, { driver = 'venus', defaultReader = null, imageContract = { architecture: 'arm64', gpu_compute_capabilities: '12.1', ...VULKAN_KEYS }, env = {}, runRoot } = {}) {
     const dataDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'local-llm-vulkan-test-'));
     const handles = []; const memory = { totalBytes: 6 * GIB, availableBytes: 5 * GIB }; let snaps;
     const controller = createController({
-        dataDir, env: { PATH: '/usr/bin', ...env }, seedCatalog: seed, imageContract, hostArch: 'arm64', fileExists: () => true,
+        dataDir, runRoot, env: { PATH: '/usr/bin', ...env }, seedCatalog: seed, imageContract, hostArch: 'arm64', fileExists: () => true,
         sharedModelsRoot: null, detectRunner: () => ({ installed: true, version: 'b11159', reason: null }),
         ...(defaultReader ? { readHardwareSnapshot: defaultReader } : { snapshot: async () => (snaps || roomy(await gpu(driver))) }),
         inspect: async () => ({ state: 'absent', bytes: 0 }),
@@ -273,7 +275,7 @@ test('controller: accepted Vulkan Run with the arm64 image contract', async (t) 
     await assert.rejects(h.controller.run({ modelId: small.id, runnerId: runner.id, requestId: 'vulkan-gone-0001' }), /restart local-llm/);
 });
 test('runner env: exact keys, Mesa cache outside /data, no LD_LIBRARY_PATH or GGML_VK_VISIBLE_DEVICES', async (t) => {
-    const h = controllerHarness(t, { env: { SECRET_SENTINEL: 'test-only', VK_DRIVER_FILES: '/evil.json', GGML_VK_VISIBLE_DEVICES: 'all', LOCAL_LLM_RUN_ROOT: '/opt/test-runners' } });
+    const h = controllerHarness(t, { env: { SECRET_SENTINEL: 'test-only', VK_DRIVER_FILES: '/evil.json', GGML_VK_VISIBLE_DEVICES: 'all' }, runRoot: '/opt/test-runners' });
     await h.controller.run({ modelId: small.id, runnerId: runner.id, requestId: 'venus-env-0001' });
     await waitFor(() => h.handles.length === 1);
     assert.deepEqual(Object.keys(h.handles[0].env).sort(), ['PATH', 'HOME', 'LANG', 'CUDA_CACHE_PATH', 'VK_DRIVER_FILES', 'VK_LOADER_LAYERS_DISABLE', 'MESA_SHADER_CACHE_DIR'].sort());
@@ -288,7 +290,7 @@ test('compat: old agent readGpu with an attached render node commits cpu absent'
     assert.equal(decision.profile, 'cpu'); assert.equal(decision.cause, 'absent');
 });
 test('compat: new agent with an old image is unusable then cpu', async () => {
-    const { snap } = await snapshot({}, vulkanContractOf({ architecture: 'arm64' }));
+    const { snap } = await snapshot({}, vulkanContractOf({ architecture: 'arm64' }, HOST_VULKAN));
     assert.equal(snap.gpu.state, 'unusable'); assert.equal(decideProfile({ snapshot: snap }).profile, 'cpu');
 });
 test('compat: no render node with a new image keeps cpu absent', async () => {

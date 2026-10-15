@@ -16,12 +16,14 @@ import test from 'node:test';
 import { admit, computeBufferBytes, DEFAULT_KV_BYTES_PER_TOKEN, VLLM_OVERHEAD_BYTES, VLLM_RUNNER_RAM_BYTES } from '../../lib/local-llm/controller/admission.mjs';
 import { loadSeedCatalog, validateModel } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
-import { createController } from '../../lib/local-llm/controller/deployments.mjs';
+import { RUNNERS, createController } from './fixtures/host.mjs';
 import { UNIFIED, estimateUnifiedLlamaServer } from '../../lib/local-llm/controller/profiles.mjs';
 import { createStateStore } from '../../lib/local-llm/controller/stateStore.mjs';
-import { llamaCppRunner } from '../../lib/local-llm/runners/llamaCpp.mjs';
-import { VLLM_UNIFIED_SWITCH, vllmRunner } from '../../lib/local-llm/runners/vllm.mjs';
+import { VLLM_UNIFIED_SWITCH } from '../../lib/local-llm/runners/vllm.mjs';
 import { compareInstalledDistributions, lockedDistributions } from '../../lib/local-llm/tools/runnerInstallCheck.mjs';
+
+const llamaCppRunner = RUNNERS['llama.cpp'];
+const vllmRunner = RUNNERS.vllm;
 
 const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;

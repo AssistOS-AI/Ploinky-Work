@@ -7,9 +7,9 @@ import test from 'node:test';
 import { loadSeedCatalog, validateModel, mergeCatalog, unsupportedRegistryEntries } from '../../lib/local-llm/controller/catalog.mjs';
 import { exportModelMetadata, measurementStatus } from '../../lib/local-llm/controller/venusMetadata.mjs';
 import { createStateStore } from '../../lib/local-llm/controller/stateStore.mjs';
-import { getRunner } from '../../lib/local-llm/runners/index.mjs';
+import { getRunner } from './fixtures/host.mjs';
 import { admit } from '../../lib/local-llm/controller/admission.mjs';
-import { createController } from '../../lib/local-llm/controller/deployments.mjs';
+import { createController } from './fixtures/host.mjs';
 import { loadSeedCatalog as loadV3SeedCatalog, mergeCatalog as mergeV3Catalog, validateModel as validateV3Model } from './fixtures/catalog-v3/src/controller/catalog.mjs';
 import { createStateStore as createV3StateStore } from './fixtures/catalog-v3/src/controller/stateStore.mjs';
 

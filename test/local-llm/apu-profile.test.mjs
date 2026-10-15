@@ -7,13 +7,14 @@ import test from 'node:test';
 import { admit, admitLlamaServer } from '../../lib/local-llm/controller/admission.mjs';
 import { loadSeedCatalog } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
-import { createController } from '../../lib/local-llm/controller/deployments.mjs';
+import { createController } from './fixtures/host.mjs';
 import { readSnapshot } from '../../lib/local-llm/controller/hardware.mjs';
 import { APU, cpuFloorBytes, cpuHostReserveBytes, decideProfile } from '../../lib/local-llm/controller/profiles.mjs';
 import { createLogBuffer, createReportCollector, parseRunnerReport } from '../../lib/local-llm/controller/runnerProcess.mjs';
 import { createStateStore, emptyState } from '../../lib/local-llm/controller/stateStore.mjs';
 import { catalogProfileOf, readVulkanGpu, vulkanContractOf } from '../../lib/local-llm/controller/vulkan.mjs';
-import { getRunner, RUNNERS, runnerSummary } from '../../lib/local-llm/runners/index.mjs';
+import { runnerSummary } from '../../lib/local-llm/runners/index.mjs';
+import { HOST, HOST_VULKAN, PLOINKY_MESSAGES, getRunner, RUNNERS } from './fixtures/host.mjs';
 import { cpuFs, VULKAN_KEYS } from './fixtures/sharedFixtures.mjs';
 
 const MIB = 1024 * 1024;
@@ -21,7 +22,7 @@ const GIB = 1024 * MIB;
 const seed = loadSeedCatalog(SEED_CATALOG_FILE);
 const model = seed.find((entry) => entry.id === 'qwen2.5-0.5b-instruct-q4_k_m');
 const runner = getRunner('llama.cpp-vulkan');
-const contract = vulkanContractOf(VULKAN_KEYS);
+const contract = vulkanContractOf(VULKAN_KEYS, HOST_VULKAN);
 const fixture = (name) => fs.readFileSync(new URL(`./fixtures/vulkan/${name}`, import.meta.url), 'utf8');
 const gpu = () => ({ available: true, backend: 'vulkan', driver: 'radv', memoryModel: 'shared', name: 'AMD Radeon Graphics',
     totalBytes: 16 * GIB, freeBytes: 16 * GIB, icdFile: contract.vulkan_icd_radv, processes: [] });
@@ -46,6 +47,7 @@ async function readApu({ enabled = true, memoryMax = undefined, ...options } = {
     const host = probe(options);
     const fake = cpuFs();
     const snap = await readSnapshot({ dataDir: '/tmp', apu: enabled, vulkan: contract, execFileImpl: host.execFileImpl,
+        nvidiaSmi: HOST.nvidiaSmi, messages: PLOINKY_MESSAGES,
         env: {}, statfs: async () => ({ bsize: 4096, blocks: 1000000, bavail: 999000 }),
         fsApi: { ...fake, readdirSync: () => ['renderD128'], lstatSync: () => ({ isCharacterDevice: () => true }),
             readFileSync(file) {
@@ -61,7 +63,7 @@ async function readApu({ enabled = true, memoryMax = undefined, ...options } = {
 function verdict({ snap = snapshot(), definition = runner, chosenModel = model, params = {}, profile = 'apu' } = {}) {
     return admit({ runner: definition, model: chosenModel, source: chosenModel.sources.gguf,
         params: definition.normalizeParams ? definition.normalizeParams(params, { model: chosenModel, profile }) : params,
-        snapshot: snap, profile, gpuBudget: { state: 'absent' } });
+        snapshot: snap, profile, gpuBudget: { state: 'absent' }, messages: PLOINKY_MESSAGES });
 }
 
 test('T2-T4: enabled integrated RADV selects apu; discrete RADV and Venus keep their profiles', async () => {

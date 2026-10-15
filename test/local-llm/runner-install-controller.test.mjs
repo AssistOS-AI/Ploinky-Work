@@ -13,12 +13,12 @@ import test from 'node:test';
 
 import { loadSeedCatalog } from '../../lib/local-llm/controller/catalog.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
-import { createController } from '../../lib/local-llm/controller/deployments.mjs';
+import { createController } from './fixtures/host.mjs';
 import { downloadFile } from '../../lib/local-llm/controller/downloader.mjs';
 import { validateRunnerLock } from '../../lib/local-llm/controller/runnerLock.mjs';
 import { createRunnerInstaller } from '../../lib/local-llm/controller/runnerInstaller.mjs';
 import { createStateStore } from '../../lib/local-llm/controller/stateStore.mjs';
-import { RUNNERS } from '../../lib/local-llm/runners/index.mjs';
+import { RUNNERS } from './fixtures/host.mjs';
 import { deepFreeze, normalizeWith } from '../../lib/local-llm/runners/params.mjs';
 import { LINUX_PROC_FD } from './fixtures/platform.mjs';
 
