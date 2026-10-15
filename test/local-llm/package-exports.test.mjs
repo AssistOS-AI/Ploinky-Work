@@ -1,6 +1,7 @@
 // The package surface of the engine: four stable subpaths, one unstable internal pattern, nothing excluded from the
 // package, and no dependency (the engine runs on Node alone).
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import test from 'node:test';
 
@@ -43,17 +44,13 @@ test('package: the runtime needs Node 22.13 and no dependency, and the package e
     // No `files` list and no .npmignore: the package holds what git holds, and git ignores nothing below lib/local-llm.
     assert.equal('files' in pkg, false);
     assert.equal(fs.existsSync(new URL('.npmignore', ROOT)), false);
-    const ignore = fs.readFileSync(new URL('.gitignore', ROOT), 'utf8').split('\n').map((line) => line.trim()).filter((line) => line && !line.startsWith('#') && !line.startsWith('!'));
     const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((item) => (item.isDirectory() ? walk(new URL(`${item.name}/`, dir)) : [new URL(item.name, dir)]));
-    for (const file of walk(new URL('lib/local-llm/', ROOT))) {
-        const relative = file.pathname.slice(ROOT.pathname.length);
-        for (const pattern of ignore) {
-            const bare = pattern.replace(/^\//, '').replace(/\/$/, '');
-            const parts = relative.split('/');
-            const hit = !bare.includes('*') && !bare.includes('/') ? parts.includes(bare) : false;
-            assert.equal(hit, false, `${relative} matches .gitignore pattern ${pattern}`);
-        }
-    }
+    const files = walk(new URL('lib/local-llm/', ROOT)).map((file) => file.pathname.slice(ROOT.pathname.length));
+    assert.ok(files.includes('lib/local-llm/runners/lmStudioLoad.mjs') && files.includes('lib/local-llm/catalog/schema.json'));
+    const git = spawnSync('git', ['-C', ROOT.pathname, 'rev-parse', '--is-inside-work-tree'], { encoding: 'utf8' });
+    if (git.status !== 0) return;
+    const ignored = spawnSync('git', ['-C', ROOT.pathname, 'check-ignore', '--no-index', '--stdin'], { input: files.join('\n'), encoding: 'utf8' });
+    assert.equal(ignored.stdout.trim(), '', 'git ignores nothing below lib/local-llm');
 });
 
 test('package: the test script names every test group', () => {
