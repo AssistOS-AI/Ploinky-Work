@@ -16,6 +16,7 @@ import { catalogProfileOf, readVulkanGpu, vulkanContractOf } from '../../lib/loc
 import { runnerSummary } from '../../lib/local-llm/runners/index.mjs';
 import { HOST, HOST_VULKAN, PLOINKY_MESSAGES, getRunner, RUNNERS } from './fixtures/host.mjs';
 import { cpuFs, VULKAN_KEYS } from './fixtures/sharedFixtures.mjs';
+import { defineLimits } from '../../lib/local-llm/limits.mjs';
 
 const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
@@ -43,27 +44,20 @@ function probe({ summary = fixture('radv-integrated-summary.txt'), devices = fix
         return null;
     } };
 }
-async function readApu({ enabled = true, memoryMax = undefined, ...options } = {}) {
+async function readApu({ enabled = true, ...options } = {}) {
     const host = probe(options);
     const fake = cpuFs();
     const snap = await readSnapshot({ dataDir: '/tmp', apu: enabled, vulkan: contract, execFileImpl: host.execFileImpl,
         nvidiaSmi: HOST.nvidiaSmi, messages: PLOINKY_MESSAGES,
         env: {}, statfs: async () => ({ bsize: 4096, blocks: 1000000, bavail: 999000 }),
         fsApi: { ...fake, readdirSync: () => ['renderD128'], lstatSync: () => ({ isCharacterDevice: () => true }),
-            readFileSync(file) {
-                if (String(file).endsWith('/memory.max') && memoryMax !== undefined) {
-                    if (memoryMax === null) throw Object.assign(new Error('unreadable'), { code: 'EACCES' });
-                    return memoryMax;
-                }
-                if (String(file).endsWith('/memory.current')) return '0';
-                return fake.readFileSync(file);
-            } } });
+            readFileSync(file) { return fake.readFileSync(file); } } });
     return { snap, calls: host.calls };
 }
 function verdict({ snap = snapshot(), definition = runner, chosenModel = model, params = {}, profile = 'apu' } = {}) {
     return admit({ runner: definition, model: chosenModel, source: chosenModel.sources.gguf,
         params: definition.normalizeParams ? definition.normalizeParams(params, { model: chosenModel, profile }) : params,
-        snapshot: snap, profile, gpuBudget: { state: 'absent' }, messages: PLOINKY_MESSAGES });
+        snapshot: snap, profile, messages: PLOINKY_MESSAGES });
 }
 
 test('T2-T4: enabled integrated RADV selects apu; discrete RADV and Venus keep their profiles', async () => {
@@ -98,7 +92,7 @@ test('T6: APU routing calls only admitApu and refuses other driver/memory pairs'
 test('T6: every other runner refuses APU; catalog uses CPU metadata without APU recommendations', () => {
     assert.equal(catalogProfileOf('apu'), 'cpu');
     for (const definition of Object.values(RUNNERS).filter((entry) => entry !== runner)) {
-        const result = admit({ runner: definition, model, source: model.sources.gguf, params: {}, snapshot: snapshot(), profile: 'apu', gpuBudget: { state: 'absent' } });
+        const result = admit({ runner: definition, model, source: model.sources.gguf, params: {}, snapshot: snapshot(), profile: 'apu' });
         assert.equal(result.status, 'incompatible', definition.id);
         assert.match(result.reason, /Vulkan build/);
         assert.match(runnerSummary(definition, 'apu').profileUnsupportedReason, /Vulkan build/);
@@ -150,7 +144,7 @@ test('T11-T12: physical total, device total, device free and disk constraints fa
     }
     const snap = snapshot(); snap.disk.freeBytes = 100;
     const result = admit({ runner, model, source: model.sources.gguf, params: { ctxSize: 4096, parallel: 1 }, snapshot: snap,
-        profile: 'apu', remainingDownloadBytes: 101, gpuBudget: { state: 'absent' } });
+        profile: 'apu', remainingDownloadBytes: 101 });
     assert.equal(result.status, 'insufficient-now'); assert.equal(result.estimate.constraint, 'C4');
 });
 test('T12: contradictory and unsafe Vulkan byte counts never become APU capacity', async () => {
@@ -162,15 +156,15 @@ test('T12: contradictory and unsafe Vulkan byte counts never become APU capacity
 
 function harness(t, { lines = reportLines, ready = true, env = {}, initialState = null, lookup = undefined,
     installer = undefined, downloadImpl = null, killImpl = null, monotonicNow = null, activityCounterLimit = undefined,
-    onSnapshot = null } = {}) {
+    onSnapshot = null, limits = undefined } = {}) {
     const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'local-llm-apu-'));
     const memory = { totalBytes: 32 * GIB, availableBytes: 24 * GIB };
     const time = { monotonic: 0, wall: Date.now() }; const handles = []; const calls = [];
     let snap = snapshot(); let downloads = 0; let responseReady = ready;
-    let budget = { memoryReadState: 'known', finiteMemoryBytes: null, headroomBytes: null };
     const store = createStateStore({ dataDir: root });
     if (initialState) store.save(initialState);
     const controller = createController({ dataDir: root, env: { PATH: '/usr/bin', LOCAL_LLM_AMD_APU: 'experimental', SECRET_SENTINEL: 'private-value', ...env },
+        ...(limits ? { limits } : {}),
         stateStore: store, seedCatalog: seed, imageContract: VULKAN_KEYS, hostArch: 'x64', fileExists: () => true,
         sharedModelsRoot: null, detectRunner: () => ({ installed: true, version: 'b11159', reason: null }),
         ...(lookup ? { lookup } : {}), ...(installer ? { installer } : {}),
@@ -191,12 +185,11 @@ function harness(t, { lines = reportLines, ready = true, env = {}, initialState 
         },
         fetchImpl: async () => ({ ok: responseReady, status: responseReady ? 200 : 503, json: async () => ({}) }),
         pollMs: 2, unifiedGuardMs: 5, readMemory: () => memory, readPressure: () => 0,
-        readBudget: () => { if (budget instanceof Error) throw budget; return budget; },
         monotonicNow: monotonicNow || (() => time.monotonic), now: () => new Date(time.wall),
     });
     t.after(async () => { await controller.drain(); fs.rmSync(root, { recursive: true, force: true }); });
     return { controller, handles, memory, time, calls, get downloads() { return downloads; },
-        setSnapshot(value) { snap = value; }, setBudget(value) { budget = value; }, ready() { responseReady = true; } };
+        setSnapshot(value) { snap = value; }, ready() { responseReady = true; } };
 }
 async function waitFor(check) {
     for (let i = 0; i < 500; i += 1) {
@@ -225,6 +218,72 @@ test('T13: guard is pooled, kills below admission floor and never relaunches CPU
     await waitFor(() => h.controller.state.deployment.phase === 'error');
     assert.equal(h.handles[0].killed, true); assert.equal(h.handles.length, 1);
     assert.match(h.controller.state.deployment.error, /below the floor/);
+    assert.equal(h.controller.state.deployment.profile, 'apu');
+});
+// The guard hooks (slice C of the engine move): the pooled guard samples the limits through guardSample, asks guardBreach, and
+// uses its answers. The recording plug-in below answers as the identity unless a test gives it a script.
+function guardLimits({ sample = () => null, breach = () => null } = {}) {
+    const calls = [];
+    const limits = defineLimits({
+        guardSample() { calls.push({ name: 'guardSample' }); return sample(); },
+        guardBreach(value, context) { calls.push({ name: 'guardBreach', sample: value, context }); return breach(value, context); },
+    });
+    return { limits, calls, headroom: () => calls.filter((call) => call.name === 'guardBreach' && call.context.check === 'headroom') };
+}
+test('guard hooks: a watched first sample samples again before every check; the headroom answer is what is compared with the floor', async (t) => {
+    let cap = null;
+    const g = guardLimits({ sample: () => ({ watched: true }), breach: (value, context) => context.check === 'headroom'
+        ? { available: cap ?? context.available } : null });
+    const h = harness(t, { limits: g.limits }); await run(h); await waitFor(() => h.controller.state.deployment?.phase === 'ready');
+    await waitFor(async () => (await h.controller.status()).memoryGuard?.samples > 1);
+    assert.deepEqual(g.calls.slice(0, 5).map((call) => call.name === 'guardBreach' ? `guardBreach:${call.context.check}` : call.name),
+        ['guardSample', 'guardSample', 'guardBreach:watchable', 'guardSample', 'guardBreach:headroom']);
+    const watchable = g.calls.find((call) => call.name === 'guardBreach' && call.context.check === 'watchable');
+    assert.deepEqual(watchable.sample, { watched: true });
+    assert.equal(watchable.context.profile, 'apu');
+    const first = g.headroom()[0];
+    assert.deepEqual(first.sample, { watched: true });
+    assert.equal(first.context.memory, h.memory);
+    assert.equal(first.context.available, 24 * GIB);
+    assert.equal(h.handles[0].running, true);
+    cap = 0;
+    await waitFor(() => h.controller.state.deployment.phase === 'error');
+    assert.match(h.controller.state.deployment.error, /below the floor \(0\.0 GiB available/);
+    assert.equal(h.handles[0].killed, true); assert.equal(h.handles.length, 1);
+});
+test('guard hooks: two consecutive unreadable answers stop the runner with the last message; a readable one in between resets the count', async (t) => {
+    const script = ['unreadable', 'ok', 'unreadable', 'unreadable'];
+    let index = 0;
+    const g = guardLimits({ sample: () => ({ watched: true }), breach: (value, context) => {
+        if (context.check !== 'headroom') return null;
+        const step = script[Math.min(index, script.length - 1)]; index += 1;
+        return step === 'unreadable' ? { unreadable: `stopped: unreadable reading ${index}` } : { available: context.available };
+    } });
+    const h = harness(t, { limits: g.limits }); await run(h);
+    await waitFor(() => h.controller.state.deployment?.phase === 'error');
+    assert.equal(g.headroom().length, 4, 'one readable answer in between restarts the count');
+    assert.equal(h.controller.state.deployment.error, 'stopped: unreadable reading 4');
+    assert.equal(h.handles[0].killed, true); assert.equal(h.handles.length, 1);
+});
+test('guard hooks: a guard whose first sample is not watched never asks for headroom; a sample that throws is no sample', async (t) => {
+    for (const [sample, given] of [[() => ({ watched: false }), { watched: false }], [() => null, null], [() => { throw new Error('unreadable'); }, null]]) {
+        const g = guardLimits({ sample, breach: (value, context) => context.check === 'headroom' ? { unreadable: 'must not be asked' } : null });
+        const h = harness(t, { limits: g.limits }); await run(h); await waitFor(() => h.controller.state.deployment?.phase === 'ready');
+        await waitFor(async () => (await h.controller.status()).memoryGuard?.samples > 2);
+        assert.equal(g.headroom().length, 0);
+        assert.equal(h.controller.state.deployment.phase, 'ready');
+        const watchable = g.calls.find((call) => call.name === 'guardBreach');
+        assert.equal(watchable.context.check, 'watchable');
+        assert.deepEqual(watchable.sample, given);
+        await h.controller.stop();
+    }
+});
+test('guard hooks: the APU guard stops the runner with the message the limits give for a runner they cannot watch', async (t) => {
+    const g = guardLimits({ breach: (value, context) => context.check === 'watchable' ? { message: 'stopped: this runner cannot be watched here' } : null });
+    const h = harness(t, { limits: g.limits }); await run(h);
+    await waitFor(() => h.controller.state.deployment?.phase === 'error');
+    assert.equal(h.controller.state.deployment.error, 'stopped: this runner cannot be watched here');
+    assert.equal(h.handles[0].killed, true); assert.equal(h.handles.length, 1);
     assert.equal(h.controller.state.deployment.profile, 'apu');
 });
 test('T13: raise-only runtime floor kills early while admission and dashboard keep their floors', async (t) => {
