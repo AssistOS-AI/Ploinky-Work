@@ -425,11 +425,12 @@ test('refuseProfile stage policy: the APU policy asks after its device-memory ch
 const OLLAMA = getRunner('ollama');
 const OLLAMA_MODEL = Object.freeze({ id: 'qwen', displayName: 'Qwen 0.5B', seed: true, contextLength: 32768, memory: Object.freeze({ layers: 24, kvBytesPerToken: 12288 }) });
 
-function onCpu(limits, { memory = { totalBytes: 8 * GIB, availableBytes: 7 * GIB } } = {}) {
-    const snapshot = { gpu: { available: false, state: 'absent' }, memory, disk: { freeBytes: 100 * GIB } };
-    const result = admit({ runner: OLLAMA, model: OLLAMA_MODEL, source: { type: 'ollama', tag: 't', size: 400 * MIB },
-        params: OLLAMA.normalizeParams({}, { model: OLLAMA_MODEL, profile: 'cpu' }), snapshot, profile: 'cpu',
-        decision: { cause: 'absent', reason: 'No GPU.' }, limits });
+function onCpu(limits, { memory = { totalBytes: 8 * GIB, availableBytes: 7 * GIB }, model = OLLAMA_MODEL, gpu = { available: false, state: 'absent' },
+    decision = { cause: 'absent', reason: 'No GPU.' } } = {}) {
+    const snapshot = { gpu, memory, disk: { freeBytes: 100 * GIB } };
+    const result = admit({ runner: OLLAMA, model, source: { type: 'ollama', tag: 't', size: 400 * MIB },
+        params: OLLAMA.normalizeParams({}, { model, profile: 'cpu' }), snapshot, profile: 'cpu',
+        decision, limits });
     return { result, snapshot };
 }
 
@@ -449,6 +450,15 @@ test('memoryPool: the CPU policy asks with the memory, the snapshot and a byte f
     const uncapped = onCpu(recording({ memoryPool: { ...pool, capped: false } }).limits).result;
     assert.equal(uncapped.estimate.poolBytes, 2 * GIB);
     assert.ok(!uncapped.warnings.includes('A limit of two applies.'));
+    // The pool warning sits between the user-sizing warning and the restart hint.
+    const added = { ...OLLAMA_MODEL, seed: false, memory: { ...OLLAMA_MODEL.memory } };
+    const recovered = onCpu(recording({ memoryPool: pool }).limits, { model: added, gpu: { ...dedicatedGpu },
+        decision: { cause: 'unreadable-timeout', reason: 'The GPU could not be read.', gpuRecovered: true } }).result;
+    const tail = recovered.warnings.slice(-3);
+    assert.match(tail[0], /^Sized with memory\.kvBytesPerToken from the model entry added at run time\./);
+    assert.equal(tail[1], 'A limit of two applies.');
+    assert.match(tail[2], /^GPU access is available now; restart to select it\./);
+    assert.equal(recovered.warnings.filter((warning) => /^Sized with /.test(warning)).length, 1);
     // Memory that cannot be read is the engine's own refusal; the hook is not asked.
     const unread = recording({ memoryPool: pool });
     const refused = onCpu(unread.limits, { memory: {} }).result;

@@ -135,7 +135,7 @@ Example: `{ tier: 'small', template: 'Classify this text: ${input}', batch: true
 | `pworker/local-llm/runner-install-check` | stable | `runInstallCheck(argv, { host })`, the install check for a runner lock entry |
 | `pworker/local-llm/internal/*` | unstable | Maps to `lib/local-llm/*`. For the local-llms agent only; it carries no compatibility promise |
 
-The engine has no container paths, vendor wording or hardware limits of its own. A host gives it the paths (`defineHost`), the wording (`defineMessages`) and the limits (`defineLimits`, hooks whose identity default limits nothing). It has no default catalog or runner-lock path, and it adds no dependency: the package runs on Node 22.13 or newer. A `.tar.zst` runner needs `zlib.createZstdDecompress` (Node 22.15 or newer); where it is missing the install is refused with `zstd_unsupported` before anything is downloaded.
+The engine has no container paths, vendor wording or hardware limits of its own. A host gives it the paths (`defineHost`), the wording (`defineMessages`) and the limits (`defineLimits`, hooks whose identity default limits nothing). It has no default catalog or runner-lock path, and it adds no dependency. `engines` stays `>=22.13`. A `.tar.zst` runner install needs zlib zstd support (`zlib.createZstdDecompress`, Node 22.15 or newer); where it is missing the install is refused with `zstd_unsupported` before anything is downloaded. The test suite (which uses `zstdCompressSync`) is only exercised on newer Node.
 
 ## Implementation status
 
