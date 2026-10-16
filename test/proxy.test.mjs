@@ -1,58 +1,15 @@
 import './home.mjs';
-import test, { before, after, afterEach } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { EventEmitter } from 'node:events';
 import { spawn as realSpawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { createProxy } from '../lib/core.mjs';
+import { installKillGuard, guardHits, launcherHarness, FAKE_BIN, FAKE_GGUF } from './launcher-safety.mjs';
 
-// Launcher safety. The local-server tests run a starter over fake children whose PIDs are small numbers (1, 1901, 1902). A signal sent
-// through the default process.kill would reach whatever owns that PID, and process.kill(-1, ...) reaches every process of the user.
-// So every starter in this file gets a recording killImpl (launcherHarness), and process.kill itself is replaced for the whole file by a
-// guard that throws and records; afterEach fails any test that reached it. The negative-control test builds a starter WITHOUT killImpl
-// to show that the guard catches it and that nothing is signalled.
-const realKill = process.kill;
-const guardHits = [];
-before(() => {
-  process.kill = function blockedKill(pid, sig) {
-    guardHits.push([pid, sig]);
-    throw Object.assign(new Error(`process.kill(${pid}, ${sig}) is blocked in the launcher tests`), { code: 'EPERM' });
-  };
-});
-after(() => { process.kill = realKill; });
-afterEach(() => { assert.deepEqual(guardHits.splice(0), [], 'a launcher test reached the process.kill guard (no killImpl injected)'); });
-
-// A real file for `bin` and `gguf` (the starter only checks that they exist; the children are fakes).
-const FAKE_BIN = process.execPath, FAKE_GGUF = fileURLToPath(import.meta.url);
-
-/**
- * Recording signals for local-server tests. `killImpl` records [pid, signal] and delivers the signal to the tracked child of that PID
- * (|pid|, because a group signal is negative); `fake(pid, opts)` makes a fake child that exits `exitDelayMs` after a signal it honors
- * (SIGTERM is ignored with `ignoreTerm`). The fake's own kill() is the fallback the launcher uses when killImpl throws; it only records,
- * so a test that expects no fallback asserts `fallbackKills` is empty. `trackReal` registers a REAL child that the test itself spawned:
- * its signals go through the ChildProcess handle (never process.kill), so the guard does not see them.
- */
-function launcherHarness() {
-  const signals = [], fallbackKills = [], children = new Map();
-  const killImpl = (pid, sig) => { signals.push([pid, sig]); children.get(Math.abs(pid))?.deliver(sig); };
-  const fake = (pid, { exitDelayMs = 1, ignoreTerm = false, onExit = null } = {}) => {
-    const c = new EventEmitter();
-    c.pid = pid; c.exitCode = null;
-    c.kill = (sig) => { fallbackKills.push([pid, sig]); };
-    c.deliver = (sig) => {
-      if (c.exitCode !== null || (sig === 'SIGTERM' && ignoreTerm)) return;
-      setTimeout(() => { if (c.exitCode !== null) return; c.exitCode = 0; onExit?.(); c.emit('exit', 0, null); }, exitDelayMs);
-    };
-    children.set(pid, c);
-    return c;
-  };
-  const trackReal = (c) => { c.deliver = (sig) => c.kill(sig); children.set(c.pid, c); return c; };
-  return { signals, fallbackKills, killImpl, fake, trackReal };
-}
+installKillGuard();
 
 const KEY = 'sk-test-SECRET-KEY-123456';
 const MODELS = { object: 'list', data: [{ id: 'm1', pricing: { prompt: '0.000001', completion: '0.000002', cache_read: '0.0000001' }, quota_multiplier: 2, context_length: 1000 }] };
@@ -735,9 +692,10 @@ test('local: servers of one exclusive group never run together (starting one sto
     assert.deepEqual(events, ['spawn 1901', 'exit 1901', 'spawn 1902']);
     assert.equal(starters.a.status().managed, false);
     assert.equal(starters.b.status().managed, true);
-    assert.deepEqual(h.signals, [[1901, 'SIGTERM']], 'starting b signals only the peer, with SIGTERM');
+    // A stop signals the peer's whole process group (negative PID); the SIGKILL after its exit sweeps what the group left behind.
+    assert.deepEqual(h.signals, [[-1901, 'SIGTERM'], [-1901, 'SIGKILL']], 'starting b signals only the peer');
     await starters.b.stop();
-    assert.deepEqual(h.signals, [[1901, 'SIGTERM'], [1902, 'SIGTERM']]);
+    assert.deepEqual(h.signals, [[-1901, 'SIGTERM'], [-1901, 'SIGKILL'], [-1902, 'SIGTERM'], [-1902, 'SIGKILL']]);
     assert.deepEqual(h.fallbackKills, []);
   } finally { rmSync(logDir, { recursive: true, force: true }); }
 });
@@ -792,6 +750,112 @@ test('local: the idle stop never stops a server with requests in flight or queue
   } finally { await st.stop(); rmSync(logDir, { recursive: true, force: true }); }
 });
 
+// The local-server starter on a recorded launcher (V21): what it spawns, how a start fails, how a stop escalates, and reuse.
+const startOf = (extra = {}) => ({ bin: FAKE_BIN, gguf: FAKE_GGUF, requireFreeGpu: false, ...extra });
+async function starterOn(h, { start, port = 1905, fetchImpl, spawn, ...options }) {
+  const { createLocalStarter } = await import('../lib/local.mjs');
+  const logDir = mkdtempSync(join(tmpdir(), 'pworker-launch-'));
+  const st = createLocalStarter({ name: 'x', baseUrl: `http://127.0.0.1:${port}`, start: { logFile: join(logDir, 'x.log'), ...start } },
+    { spawn, fetchImpl, gpuPids: () => [], killImpl: h.killImpl, ...options });
+  return { st, logDir, logFile: join(logDir, 'x.log') };
+}
+
+test('local: a server is spawned as its own process group with direct-to-file stdio, the old environment and no OOM mark', async () => {
+  const h = launcherHarness();
+  const calls = [];
+  let running = false;
+  const spawn = (cmd, argv, opts) => { calls.push({ cmd, argv, opts }); running = true; return h.fake(Number(argv[argv.indexOf('--port') + 1]), { onExit: () => { running = false; } }); };
+  const baseDir = mkdtempSync(join(tmpdir(), 'pworker-base-'));
+  const t = await starterOn(h, { port: 1906, spawn, fetchImpl: async () => ({ ok: running }), baseDir, start: startOf({ alias: 'a1', args: ['-ngl', '9'] }) });
+  try {
+    assert.equal(await t.st.ensure(), true);
+    const [{ cmd, argv, opts }] = calls;
+    assert.equal(cmd, FAKE_BIN);
+    assert.deepEqual(argv, ['-m', FAKE_GGUF, '--host', '127.0.0.1', '--port', '1906', '-a', 'a1', '-ngl', '9']);
+    assert.equal(opts.detached, true, 'the runner leads its own process group');
+    assert.equal(opts.stdio[0], 'ignore');
+    assert.ok(Number.isInteger(opts.stdio[1]) && opts.stdio[1] === opts.stdio[2], 'stdout and stderr are one file descriptor of the log file, not pipes');
+    assert.equal(opts.env, process.env);
+    assert.equal(opts.cwd, baseDir, 'the runner starts in baseDir');
+    assert.deepEqual(t.st.status(), { managed: true, pid: 1906, last_refusal: null });
+    await t.st.stop();
+    assert.deepEqual(h.signals, [[-1906, 'SIGTERM'], [-1906, 'SIGKILL']]);
+    assert.deepEqual(t.st.status(), { managed: false, pid: null, last_refusal: null });
+  } finally { await t.st.stop(); rmSync(t.logDir, { recursive: true, force: true }); rmSync(baseDir, { recursive: true, force: true }); }
+});
+
+test('local: a script server runs with this Node binary and --port', async () => {
+  const h = launcherHarness();
+  const calls = [];
+  let running = false;
+  const spawn = (cmd, argv, opts) => { calls.push({ cmd, argv }); running = true; return h.fake(1907, { onExit: () => { running = false; } }); };
+  const t = await starterOn(h, { port: 1907, spawn, fetchImpl: async () => ({ ok: running }), start: { script: FAKE_GGUF, args: ['--x'] } });
+  try {
+    assert.equal(await t.st.ensure(), true);
+    assert.deepEqual(calls, [{ cmd: process.execPath, argv: [FAKE_GGUF, '--port', '1907', '--x'] }]);
+  } finally { await t.st.stop(); rmSync(t.logDir, { recursive: true, force: true }); }
+});
+
+test('local: a stop that SIGTERM does not end escalates to a recorded SIGKILL of the group after the grace period', async () => {
+  const h = launcherHarness();
+  let running = false;
+  const spawn = () => { running = true; return h.fake(1908, { ignoreTerm: true, onExit: () => { running = false; } }); };
+  const t = await starterOn(h, { port: 1908, spawn, fetchImpl: async () => ({ ok: running }), start: startOf({ stopGraceMs: 80 }) });
+  try {
+    assert.equal(await t.st.ensure(), true);
+    const t0 = Date.now();
+    await t.st.stop();
+    assert.ok(Date.now() - t0 >= 70, 'the SIGKILL waits for the grace period');
+    assert.deepEqual(h.signals, [[-1908, 'SIGTERM'], [-1908, 'SIGKILL'], [-1908, 'SIGKILL']], 'SIGTERM, the escalation, and the sweep after the exit');
+    assert.deepEqual(h.fallbackKills, []);
+    assert.equal(running, false);
+  } finally { rmSync(t.logDir, { recursive: true, force: true }); }
+});
+
+test('local: a healthy port is reused: no spawn, no signal, and the server is not reported as managed', async () => {
+  const h = launcherHarness();
+  let spawned = 0;
+  const t = await starterOn(h, { port: 1909, spawn: () => { spawned += 1; throw new Error('must not spawn'); }, fetchImpl: async () => ({ ok: true }), start: startOf() });
+  try {
+    assert.equal(await t.st.ensure(), true);
+    assert.equal(spawned, 0);
+    assert.deepEqual(t.st.status(), { managed: false, pid: null, last_refusal: null });
+    await t.st.stop();
+    assert.deepEqual(h.signals, []);
+  } finally { rmSync(t.logDir, { recursive: true, force: true }); }
+});
+
+test('local: a server that cannot be spawned, exits during start, or never becomes healthy is refused with its reason', async () => {
+  const h = launcherHarness();
+  // 1. spawn fails (a missing binary arrives as the child's error event).
+  let t = await starterOn(h, { port: 1910, fetchImpl: async () => ({ ok: false }), start: startOf(), spawn: () => { const c = h.fake(undefined); setImmediate(() => c.emit('error', new Error('spawn llama-server ENOENT'))); return c; } });
+  try {
+    assert.equal(await t.st.ensure(), false);
+    assert.match(t.st.status().last_refusal.reason, /exited during start \(spawn llama-server ENOENT\); see .*x\.log/);
+    assert.match(readFileSync(t.logFile, 'utf8'), /\[controller\] runner failed to start: spawn llama-server ENOENT/, 'the controller line goes to the server log file');
+  } finally { rmSync(t.logDir, { recursive: true, force: true }); }
+  // 2. the server exits before it is healthy.
+  t = await starterOn(h, { port: 1911, fetchImpl: async () => ({ ok: false }), start: startOf(), spawn: () => h.fake(1911, { onExit: () => {} }) });
+  try {
+    const first = t.st.ensure();
+    await new Promise((r) => setTimeout(r, 50));
+    h.killImpl(1911, 'SIGTERM'); // the test ends the fake server itself
+    assert.equal(await first, false);
+    assert.match(t.st.status().last_refusal.reason, /exited during start; see /);
+    assert.equal(t.st.status().managed, false);
+  } finally { rmSync(t.logDir, { recursive: true, force: true }); }
+  // 3. it never becomes healthy: the start times out and the group is stopped.
+  h.signals.length = 0;
+  t = await starterOn(h, { port: 1912, fetchImpl: async () => ({ ok: false }), start: startOf({ startTimeoutMs: 100 }), spawn: () => h.fake(1912) });
+  try {
+    assert.equal(await t.st.ensure(), false);
+    assert.equal(t.st.status().last_refusal.reason, 'local server did not become healthy in time');
+    assert.deepEqual(h.signals, [[-1912, 'SIGTERM'], [-1912, 'SIGKILL']], 'the unhealthy server is stopped and awaited before the refusal');
+    assert.equal(t.st.status().managed, false);
+  } finally { rmSync(t.logDir, { recursive: true, force: true }); }
+  assert.deepEqual(h.fallbackKills, []);
+});
+
 test('launcher safety (negative control): a starter built without killImpl reaches the process.kill guard and nothing is signalled', async () => {
   const { createLocalStarter } = await import('../lib/local.mjs');
   const h = launcherHarness();
@@ -803,11 +867,12 @@ test('launcher safety (negative control): a starter built without killImpl reach
   try {
     assert.equal(await st.ensure(), true);
     const stopping = st.stop();
-    assert.deepEqual(guardHits, [[1, 'SIGTERM']], 'the default process.kill was reached and blocked');
+    assert.deepEqual(guardHits, [[-1, 'SIGTERM']], 'the default process.kill was reached and blocked');
     assert.deepEqual(h.signals, [], 'no signal was recorded through an injected killImpl');
     assert.deepEqual(h.fallbackKills, [[1, 'SIGTERM']], 'the launcher fell back to the fake child handle');
     child.deliver('SIGTERM');
     await stopping;
+    assert.deepEqual(h.signals, [], 'still nothing recorded through killImpl');
   } finally { guardHits.length = 0; rmSync(logDir, { recursive: true, force: true }); }
 });
 

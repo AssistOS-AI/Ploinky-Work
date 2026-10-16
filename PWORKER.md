@@ -137,6 +137,23 @@ Example: `{ tier: 'small', template: 'Classify this text: ${input}', batch: true
 
 The engine has no container paths, vendor wording or hardware limits of its own. A host gives it the paths (`defineHost`), the wording (`defineMessages`) and the limits (`defineLimits`, hooks whose identity default limits nothing). It has no default catalog or runner-lock path, and it adds no dependency. `engines` stays `>=22.13`. A `.tar.zst` runner install needs zlib zstd support (`zlib.createZstdDecompress`, Node 22.15 or newer); where it is missing the install is refused with `zstd_unsupported` before anything is downloaded. The test suite (which uses `zstdCompressSync`) is only exercised on newer Node.
 
+## Local servers started on demand
+
+An upstream with a `start` block (see the `localtiny`, `localsuper` and `localnano` entries of `config.default.json`) is a local server that the proxy starts when a request needs it. `lib/local.mjs` runs it through the engine's runner process (`lib/local-llm/controller/runnerProcess.mjs`): the server leads its own process group, its output goes straight to its log file, and a stop signals the whole group. A request to such an upstream first checks `/health` on its port. A healthy server is used as it is, whoever started it; this is also how a server that outlived a crashed or killed proxy is picked up again by the next one. Otherwise the proxy starts the server if the GPU is free, and the request falls back down its tier chain when the server may not or cannot start.
+
+| `start` key | Meaning |
+| --- | --- |
+| `bin`, `gguf`, `alias`, `args` | A `llama-server` over a GGUF file: `bin` is a path or a command name on `PATH`; the proxy adds `-m`, `--host 127.0.0.1`, `--port` (from the upstream's `baseUrl`) and `-a` (`alias`, default the upstream name) before `args` |
+| `script`, `requires`, `args` | A Node script run with the proxy's Node binary and `--port`, followed by `args`; every file in `requires` must exist |
+| `locks`, `requireFreeGpu` | A start is refused while a lock file exists, and, unless `requireFreeGpu` is `false`, while another program has a compute process on the GPU |
+| `startTimeoutMs` | How long to wait for `/health` after the spawn (default 120000). A server that exits, or does not answer in time, is stopped and the start is refused with the reason in `/stats` (`local.<name>.last_refusal`) |
+| `idleStopMs` | Stop the server after this long without a request. A server with requests in flight or queued is never stopped (0 or missing: never) |
+| `exclusiveGroup` | Servers of one group never run together: starting one first stops the others of the group that this proxy manages, and waits for them to exit |
+| `stopGraceMs` | A stop sends SIGTERM to the server's process group and, when the server has not exited after this long (default 30000, so a long generation is not cut short), SIGKILL; the stop waits for the exit, at most 5 s after the SIGKILL. Earlier versions called this key `stopWaitMs` |
+| `startAtBoot`, `logFile`, `identity`, `slots`, `ctxPerSlot` | Start with the proxy; the log file (default `<logDir>/<name>.log`, appended to); the files whose size and mtime identify the model for the cache; slot figures for the local status |
+
+The server starts in the proxy's `baseDir` (relative paths in `start` resolve there) with the proxy's environment. The engine's out-of-memory marking is off for these servers (`oomScoreAdj: null`). A graceful proxy shutdown stops the servers it manages; a proxy that is killed leaves them running.
+
 ## Implementation status
 
 The executor is deterministic and does not plan agentic loops while running. Compiling a text request makes an LLM call on the `good` tier; without an available provider, compilation cannot run, while model-free `.json` tasks can run offline.
