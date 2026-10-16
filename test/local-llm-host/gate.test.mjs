@@ -205,3 +205,40 @@ test('on demand: once a replace of the gate\'s own deployment is decided, a requ
     // With the replace over, the old model is served again.
     assert.equal((await gate.ensure(ENTRY)).ok, true);
 });
+
+test('on demand: a start that is still loading when startWaitMs expires is armed for the idle stop', async (t) => {
+    let release;
+    const loading = new Promise((resolve) => { release = resolve; });
+    const { fakeAdapter } = await import('./fixtures/engine.mjs');
+    const inner = fakeAdapter();
+    const adapter = Object.freeze({ ...inner, async start(ctx) { await loading; return inner.start(ctx); } });
+    const { host } = await startHost(t, { adapter });
+    let clock = Date.now();
+    const armed = new Map();
+    let handle = 0;
+    // A fake clock: the poll sleep advances it, any other timer is recorded (the idle timer) and fired by the test.
+    const timers = {
+        setTimeout: (fn, ms) => {
+            if (ms === 10) { clock += ms; return setTimeout(fn, 1); }
+            const id = ++handle;
+            armed.set(id, { fn, ms });
+            return id;
+        },
+        clearTimeout: (id) => { armed.delete(id); },
+    };
+    const gate = createLocalLlmGate({ host, settings: onDemand({ idleStopMs: 1000, startWaitMs: 100 }), now: () => clock, timers, pollMs: 10 });
+    t.after(() => release());
+    const timedOut = await gate.ensure(ENTRY);
+    assert.equal(timedOut.ok, false);
+    assert.match(timedOut.reason, /start timeout/);
+    assert.equal(host.current().state.deployment.phase, 'starting', 'the start is still going');
+    assert.equal(armed.size, 1, 'the idle stop is armed for the deployment that is still loading');
+    assert.equal([...armed.values()][0].ms, 1000);
+    // It finishes loading and nobody asks for it: the idle stop ends it.
+    release();
+    await until(() => host.current().state.deployment.phase === 'ready');
+    const pid = host.current().state.deployment.runner.pid;
+    clock += 5000;
+    assert.deepEqual(await gate.idleCheck(), { stopped: true });
+    await until(() => !alive(pid));
+});
