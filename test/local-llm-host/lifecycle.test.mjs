@@ -79,18 +79,34 @@ test('close() drains the engine before it returns: no runner, no record, no sock
 test('a second pworker for a home whose engine another process owns does not run, after waiting for a predecessor to leave', async (t) => {
     const home = scratch(t);
     fs.mkdirSync(path.join(home, 'proc'));
-    const options = await linuxHost(home);
-    // A process that holds the home's owner port (the same port the server derives for it).
-    const holder = spawn(process.execPath, [CONTENDER, JSON.stringify({ home, mode: 'bind', holdMs: -1, retryMs: 0, port: options.ownerPort })], { stdio: ['ignore', 'pipe', 'inherit'] });
-    t.after(() => holder.kill('SIGKILL'));
-    await new Promise((resolve) => holder.stdout.once('data', resolve));
+    // A process that holds the home's owner port (the same port the server is given). freePort() only names a port that was free a
+    // moment ago, and the test files run side by side, so another file may bind it first: the holder then reports `refused`, and
+    // the test picks another port instead of going on with a home nobody holds.
+    let holder = null, ownerPort = null;
+    for (let attempt = 0; attempt < 5 && !holder; attempt++) {
+        const port = await freePort();
+        const child = spawn(process.execPath, [CONTENDER, JSON.stringify({ home, mode: 'bind', holdMs: -1, retryMs: 0, port })], { stdio: ['ignore', 'pipe', 'inherit'] });
+        t.after(() => child.kill('SIGKILL'));
+        const ev = await new Promise((resolve) => {
+            let seen = '';
+            child.stdout.on('data', (chunk) => { seen += chunk; if (seen.includes('\n')) resolve(JSON.parse(seen.split('\n')[0]).ev); });
+            child.once('exit', () => resolve('exited'));
+        });
+        if (ev === 'acquired') [holder, ownerPort] = [child, port];
+    }
+    assert.ok(holder, 'a holder took the owner port');
+    const options = await linuxHost(home, { ownerPort });
     const logs = [];
     const started = Date.now();
     const result = await serve({ port: 0, env: { PWORKER_HOME: home }, project: false, log: (line) => logs.push(line), localLlmOptions: options, ownerWaitMs: 500 });
-    assert.equal(result.already, true);
-    assert.ok(Date.now() - started >= 450, 'it waited for the holder to leave');
-    assert.equal(fs.existsSync(path.join(home, 'server.json')), false, 'it recorded no server of its own');
-    assert.ok(logs.some((line) => /already runs the local models/.test(line)));
+    // A serve that ran after all is closed whatever the assertions find, so a failure here cannot keep the test file alive. It is
+    // closed in the test body, not in t.after: the scratch home is removed by an earlier after hook, and close() needs the home.
+    try {
+        assert.equal(result.already, true);
+        assert.ok(Date.now() - started >= 450, 'it waited for the holder to leave');
+        assert.equal(fs.existsSync(path.join(home, 'server.json')), false, 'it recorded no server of its own');
+        assert.ok(logs.some((line) => /already runs the local models/.test(line)));
+    } finally { await result.close?.(); }
 });
 
 test('a port held by a program that is not pworker leaves serve running with the engine unavailable, and says so', async (t) => {
