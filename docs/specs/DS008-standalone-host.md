@@ -162,7 +162,7 @@ Two probes drive the crash recovery on the real system, each ending inconclusive
 
 ### The host API
 
-`lib/local-llm-host/host.mjs` documents it at its top. In short: `acquire({ waitMs })`, `controller()`, `current()`, `drain()`, `describe()` (which never throws: an unusable socket directory is reported as `socketDirProblem`), `engineEnvironment()`, `redact(text)` and `secretValues()`. A failure to read the launch records at acquire is logged and does not undo the ownership. The server creates one host per home (`server.localLlm`), passes it to the core as `localLlm`, and `close()` awaits `drain()`, so a process that exits leaves no runner and no ownership behind. The gate and the `/v1/local-llm/*` routes use `await host.controller()`.
+`lib/local-llm-host/host.mjs` documents it at its top. In short: `acquire({ waitMs })`, `controller()`, `current()`, `drain()`, `describe()` (which never throws: an unusable socket directory is reported as `socketDirProblem`), `engineEnvironment()`, `redact(text)` and `secretValues()`. A failure to read the launch records at acquire is logged and does not undo the ownership. The server creates one host per home (`server.localLlm`), passes it to the core as `localLlm`, and `close()` awaits `drain()`, so a process that exits leaves no runner and no ownership behind. `close()` releases the listener and drains the engine even when the home's `jobs` folder was removed under the server (there is then no pending task to hand back) or handing the pending tasks back fails; such a failure is raised after the drain (a failure of the drain itself takes its place). The gate and the `/v1/local-llm/*` routes use `await host.controller()`.
 
 ## Decisions and Rationale
 

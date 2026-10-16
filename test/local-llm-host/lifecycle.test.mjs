@@ -41,16 +41,18 @@ test('default-config serve works with the engine idle: /health, /v1/local, the m
     const env = { PWORKER_HOME: home };
     const logs = [];
     const server = await serve({ port: 0, env, project: false, log: (line) => logs.push(line), localLlmOptions: await linuxHost(home) });
-    t.after(() => server.close());
-    assert.ok(server.localLlm.describe().ownership.port, 'the home is owned from the start of serve');
-    assert.equal(server.localLlm.current(), null, 'and the controller is not created until it is used');
-    const base = `http://127.0.0.1:${server.address().port}`;
-    const health = await get(base, '/health');
-    assert.equal(health.status, 200);
-    assert.equal(health.body.ok, true);
-    assert.equal((await get(base, '/v1/local')).status, 200);
-    assert.equal((await get(base, '/v1/models')).status, 200);
-    await server.close();
+    // Closed in the test body, not in t.after: the scratch home is removed by an earlier after hook, and a failed assertion must not
+    // leave the listener open and keep the test file alive.
+    try {
+        assert.ok(server.localLlm.describe().ownership.port, 'the home is owned from the start of serve');
+        assert.equal(server.localLlm.current(), null, 'and the controller is not created until it is used');
+        const base = `http://127.0.0.1:${server.address().port}`;
+        const health = await get(base, '/health');
+        assert.equal(health.status, 200);
+        assert.equal(health.body.ok, true);
+        assert.equal((await get(base, '/v1/local')).status, 200);
+        assert.equal((await get(base, '/v1/models')).status, 200);
+    } finally { await server.close(); }
     assert.equal(server.localLlm.describe().ownership.state, 'closed');
 });
 
@@ -74,6 +76,48 @@ test('close() drains the engine before it returns: no runner, no record, no sock
     // The owner port can be bound at once: the ownership was released by the drain.
     await new Promise((resolve, reject) => { const probe = net.createServer(); probe.once('error', reject); probe.listen(options.ownerPort, '127.0.0.1', () => probe.close(resolve)); });
     await assert.rejects(server.localLlm.controller(), { code: 'shutting_down' });
+});
+
+/** A server for `home` with a running fake model, listening on a port of its own; for the close() tests where the home goes bad. */
+const runningServer = async (home) => {
+    fs.mkdirSync(path.join(home, 'proc'));
+    const options = await linuxHost(home);
+    const server = await createPworkerServer({ config: { upstreams: {}, defaultUpstream: 'none', tiers: {} }, env: { PWORKER_HOME: home }, localLlmOptions: options });
+    const { port } = await server.listen(0);
+    await server.localLlm.acquire();
+    const controller = await server.localLlm.controller();
+    await runModel(controller);
+    return { server, port, ownerPort: options.ownerPort, pid: controller.state.deployment.runner.pid };
+};
+const bindable = (port) => new Promise((resolve, reject) => { const probe = net.createServer(); probe.once('error', reject); probe.listen(port, '127.0.0.1', () => probe.close(resolve)); });
+
+test('close() with the home removed under the server resolves, releases the listener and still drains the engine', async (t) => {
+    const home = scratch(t);
+    const { server, port, ownerPort, pid } = await runningServer(home);
+    try {
+        assert.doesNotThrow(() => process.kill(pid, 0));
+        fs.rmSync(home, { recursive: true, force: true });
+        await server.close();
+        assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'the runner process is gone when close() has returned');
+        assert.equal(server.localLlm.describe().ownership.state, 'closed');
+        await bindable(port);
+        await bindable(ownerPort);
+    } finally { server.server.close(); server.server.closeAllConnections?.(); try { process.kill(pid, 'SIGKILL'); } catch {} }
+});
+
+test('close() whose hand-back of pending tasks fails releases the listener and drains the engine, then raises that failure', async (t) => {
+    const home = scratch(t);
+    const { server, port, ownerPort, pid } = await runningServer(home);
+    try {
+        // A jobs folder that is a file: listing it fails with ENOTDIR, which is not the "nothing to hand back" of a missing folder.
+        fs.rmSync(path.join(home, 'jobs'), { recursive: true, force: true });
+        fs.writeFileSync(path.join(home, 'jobs'), '');
+        await assert.rejects(server.close(), { code: 'ENOTDIR' });
+        assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'the runner process is gone when close() has failed');
+        assert.equal(server.localLlm.describe().ownership.state, 'closed');
+        await bindable(port);
+        await bindable(ownerPort);
+    } finally { server.server.close(); server.server.closeAllConnections?.(); try { process.kill(pid, 'SIGKILL'); } catch {} }
 });
 
 test('a second pworker for a home whose engine another process owns does not run, after waiting for a predecessor to leave', async (t) => {
