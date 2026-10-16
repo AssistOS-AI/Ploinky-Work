@@ -1,0 +1,2 @@
+version: 0.5.0-dev (build 11295, commit 3b3d022b8)
+built with AppleClang 21.0.0.21000101 for Darwin arm64

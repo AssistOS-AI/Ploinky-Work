@@ -173,6 +173,16 @@
                   }
                 }
               }
+            },
+            "metal": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [],
+              "properties": {
+                "llama.cpp": {
+                  "type": "object"
+                }
+              }
             }
           }
         },
@@ -214,6 +224,17 @@
                   "items": {
                     "$ref": "#/$defs/venusMeasurement"
                   }
+                }
+              }
+            },
+            "metal": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [],
+              "properties": {
+                "llama.cpp": {
+                  "type": "string",
+                  "maxLength": 600
                 }
               }
             }

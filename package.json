@@ -28,7 +28,7 @@
   "scripts": {
     "start": "node bin/pworker.mjs",
     "serve": "node bin/pworker.mjs serve",
-    "test": "node --import ./test/home.mjs --test test/*.test.mjs test/local-llm/*.test.mjs test/local-llm-host/*.test.mjs"
+    "test": "node --import ./test/home.mjs --test test/*.test.mjs test/local-llm/*.test.mjs test/local-llm-darwin/*.test.mjs test/local-llm-host/*.test.mjs"
   },
   "dependencies": {}
 }
