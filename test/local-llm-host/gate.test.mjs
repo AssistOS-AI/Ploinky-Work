@@ -245,3 +245,26 @@ test('on demand: a start that is still loading when startWaitMs expires is armed
     assert.deepEqual(await gate.idleCheck(), { stopped: true });
     await until(() => !alive(pid));
 });
+
+test('on demand: a second request for the same model while the gate\'s own start is still loading waits on it and never stops the load', async (t) => {
+    let release;
+    let starts = 0;
+    const loading = new Promise((resolve) => { release = resolve; });
+    t.after(() => release());
+    const { fakeAdapter } = await import('./fixtures/engine.mjs');
+    const inner = fakeAdapter();
+    const adapter = Object.freeze({ ...inner, async start(ctx) { starts += 1; await loading; return inner.start(ctx); } });
+    const { host } = await startHost(t, { adapter });
+    const gate = createLocalLlmGate({ host, settings: onDemand({ startWaitMs: 300 }), pollMs: 10 });
+    const first = await gate.ensure(ENTRY);
+    assert.equal(first.ok, false);
+    assert.match(first.reason, /start timeout/);
+    const deploymentId = host.current().state.deployment.id;
+    // The second request arrives while the load goes on; the load finishes shortly after.
+    setTimeout(() => release(), 50);
+    const second = await gate.ensure(ENTRY);
+    assert.equal(second.ok, true, `the second request waits for the load: ${second.reason}`);
+    assert.equal(host.current().state.deployment.id, deploymentId, 'the same deployment, not a replacement');
+    assert.equal(host.current().state.deployment.phase, 'ready');
+    assert.equal(starts, 1);
+});
