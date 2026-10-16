@@ -44,7 +44,7 @@ Load command 20
 `;
 
 test('otool -L is parsed into its libraries, weak ones included, and otool -l into its rpaths and install name', () => {
-    assert.deepEqual(parseOtoolL(DYLIB_L), [{ arch: null, libraries: ['@rpath/libggml-cpu.0.dylib', '@rpath/libggml-base.0.dylib', '/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate', '/usr/lib/libc++.1.dylib', '/usr/lib/libSystem.B.dylib'] }]);
+    assert.deepEqual(parseOtoolL(DYLIB_L), [{ arch: null, libraries: ['@rpath/libggml-cpu.0.dylib', '@rpath/libggml-base.0.dylib', '/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate', '/usr/lib/libc++.1.dylib', '/usr/lib/libSystem.B.dylib'], unreadable: [] }]);
     assert.deepEqual(parseOtoolL(SERVER_L)[0].libraries, ['/usr/lib/librdma.dylib', '@rpath/libllama.0.dylib', '/opt/homebrew/opt/libomp/lib/libomp.dylib']);
     assert.deepEqual(parseOtoolLoadCommands(DYLIB_l), [{ arch: null, rpaths: ['@loader_path'], installName: '@rpath/libggml-cpu.0.dylib' }]);
     assert.deepEqual(parseOtoolLoadCommands(SERVER_l), [{ arch: null, rpaths: ['@loader_path'], installName: null }]);
@@ -108,7 +108,29 @@ test('system libraries pass, the install name is not a dependency, and any other
     assert.deepEqual(arch, { unresolved: ['arm64: /usr/local/lib/libz.dylib'] });
 });
 
-test('the strict check passes a complete copy, fails an unresolved or foreign library and a file otool cannot read, and an empty copy', (t) => {
+test('a listing that cannot be read fails the file: an indented line that is no dependency, and a slice without any library', (t) => {
+    const root = tree(t);
+    const listing = (body) => `/x/llama-server:\n${body}`;
+    const garbled = unresolvedDependencies({ file: path.join(root, 'llama-server'), root, executableDir: root, loadCommands: SERVER_l,
+        listing: listing('\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n\t/opt/homebrew/lib/libz.dylib (version 1)\n') });
+    assert.match(garbled.error, /not a dependency.*libz\.dylib/);
+    assert.deepEqual(parseOtoolL(listing('\tgarbage\n'))[0].unreadable, ['garbage']);
+    const empty = unresolvedDependencies({ file: path.join(root, 'llama-server'), root, executableDir: root, loadCommands: SERVER_l, listing: listing('') });
+    assert.match(empty.error, /listed no library/);
+    const bad = strictLibraryCheck(root, { otool: (flag) => ({ output: flag === '-L' ? listing('\t/opt/homebrew/lib/libz.dylib (version 1)\n') : SERVER_l }) });
+    assert.equal(bad.ok, false, 'an unreadable dependency line fails the check');
+    assert.match(bad.problems.join(), /otool could not check/);
+    const none = strictLibraryCheck(root, { otool: (flag) => ({ output: flag === '-L' ? listing('') : SERVER_l }) });
+    assert.equal(none.ok, false, 'a Mach-O file with no listed library fails the check');
+});
+
+test('the 64-bit fat magic is a Mach-O magic too', (t) => {
+    const root = fs.realpathSync(scratch(t));
+    fs.writeFileSync(path.join(root, 'fat64'), Buffer.concat([Buffer.from('cafebabf', 'hex'), Buffer.from([0, 0, 0, 1]), Buffer.alloc(8)]));
+    assert.deepEqual(findMachoFiles(root).map((file) => path.basename(file)), ['fat64']);
+});
+
+test('the strict check passes a complete copy, fails an unresolved library and a file otool cannot read, and an empty copy', (t) => {
     const root = tree(t);
     const answers = (table) => (flag, file) => {
         const name = path.basename(file);
@@ -118,8 +140,8 @@ test('the strict check passes a complete copy, fails an unresolved or foreign li
     const clean = strictLibraryCheck(root, { otool: answers({ 'libllama.0.5.0.dylib': { L: `x:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n` } }), executable: 'llama-server' });
     assert.equal(clean.ok, true, clean.problems.join());
     assert.equal(clean.checked, 2);
-    const foreign = strictLibraryCheck(root, { otool: answers({}), executable: 'llama-server' });
-    assert.equal(foreign.ok, true, 'both files only need system libraries and the copy\'s own');
+    const defaults = strictLibraryCheck(root, { otool: answers({}), executable: 'llama-server' });
+    assert.equal(defaults.ok, true, 'with the default listings both files need only system libraries and the copy\'s own');
     fs.unlinkSync(path.join(root, 'libllama.0.dylib'));
     const missing = strictLibraryCheck(root, { otool: answers({}) });
     assert.equal(missing.ok, false);

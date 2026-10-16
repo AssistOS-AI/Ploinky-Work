@@ -33,7 +33,11 @@ test('the workflow runs on pull_request and workflow_dispatch only, with read-on
     // Only the final job and the always-run steps carry an `if`, each `always()`, except the Linux-only disk step (on the OS, never on a result).
     const conditions = [...text.matchAll(/^\s+if: (.*)$/gm)].map((match) => match[1]);
     assert.ok(conditions.length > 0 && conditions.every((condition) => condition === '${{ always() }}' || condition === "${{ runner.os == 'Linux' }}"), conditions.join(' | '));
-    assert.match(text, /- name: Free runner disk\n(?: {8}#.*\n)* {8}if: \$\{\{ runner\.os == 'Linux' \}\}/, 'the disk step is Linux-only');
+    assert.equal(conditions.filter((condition) => condition.includes('runner.os')).length, 1, 'the OS condition is used exactly once');
+    assert.match(text, /- name: Free runner disk\n(?: {8}#.*\n)* {8}if: \$\{\{ runner\.os == 'Linux' \}\}/, 'and it is on the disk step');
+    const install = /- name: Install every lock entry and check its libraries\n((?: {8}.*\n)+)/.exec(text)[1];
+    assert.ok(!/^ {8}if:/m.test(install), 'the install step runs on every OS');
+    assert.match(install, /lockcheck\.mjs/);
 });
 
 test('every action is pinned to a full commit sha, and the pull request head is the revision under test', () => {

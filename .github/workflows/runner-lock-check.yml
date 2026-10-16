@@ -33,7 +33,7 @@ permissions:
   contents: read
 
 env:
-  # The build every entry of the Linux locks is pinned to; the install check must see the launched file name it.
+  # The build every entry of the host locks is pinned to; the install check must see the launched file name it.
   EXPECT_VERSION: b11295
 
 jobs:
