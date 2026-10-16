@@ -37,9 +37,9 @@ test('the public entry exports exactly the documented surface', () => {
     assert.deepEqual(Object.keys(engine).sort(), [
         'DEFAULT_MESSAGES', 'ENGINE_DRAIN', 'IDENTITY_LIMITS', 'LIMIT_HOOKS', 'LMSTUDIO_SWITCH', 'LocalLlmError', 'MESSAGE_KEYS',
         'OBSERVATION_ID_RE', 'RUNNER_IDS', 'VLLM_UNIFIED_SWITCH', 'computeDiagnostic', 'createController', 'createLocalLlmController',
-        'createObservationClock', 'createRunnerInstaller', 'createRunners', 'createStartupObservations', 'createStateStore', 'defineHost',
-        'defineLimits', 'defineMessages', 'linuxPlatform', 'loadRunnerLocks', 'loadSeedCatalog', 'readSnapshot', 'runnerSummaries',
-        'serializeError', 'validateModel',
+        'createObservationClock', 'createRunnerInstaller', 'createRunners', 'createStartupObservations', 'createStateStore', 'darwinPlatform',
+        'defineHost', 'defineLimits', 'defineMessages', 'linuxPlatform', 'loadRunnerLocks', 'loadSeedCatalog', 'platformFor', 'readSnapshot',
+        'runnerSummaries', 'serializeError', 'validateModel',
     ]);
     for (const [name, value] of Object.entries(engine)) {
         assert.ok(['function', 'object', 'string'].includes(typeof value), name);

@@ -44,7 +44,7 @@ The overview key `gatewayModel` keeps its place and holds `gatewayModelName` (nu
 
 | Subpath | Stability | Contents |
 | --- | --- | --- |
-| `pworker/local-llm` | stable | `createLocalLlmController`, `createController` (raw), `defineHost`, `linuxPlatform`, `defineMessages`, `DEFAULT_MESSAGES`, `MESSAGE_KEYS`, `defineLimits`, `IDENTITY_LIMITS`, `LIMIT_HOOKS`, `createRunners`, `RUNNER_IDS`, `runnerSummaries`, `ENGINE_DRAIN`, `LocalLlmError`, `serializeError`, `OBSERVATION_ID_RE`, `LMSTUDIO_SWITCH`, `VLLM_UNIFIED_SWITCH`, `createStateStore`, `validateModel`, `loadSeedCatalog`, `loadRunnerLocks`, `createRunnerInstaller`, `readSnapshot`, `computeDiagnostic`, `createStartupObservations`, `createObservationClock` |
+| `pworker/local-llm` | stable | `createLocalLlmController`, `createController` (raw), `defineHost`, `linuxPlatform`, `darwinPlatform`, `platformFor`, `defineMessages`, `DEFAULT_MESSAGES`, `MESSAGE_KEYS`, `defineLimits`, `IDENTITY_LIMITS`, `LIMIT_HOOKS`, `createRunners`, `RUNNER_IDS`, `runnerSummaries`, `ENGINE_DRAIN`, `LocalLlmError`, `serializeError`, `OBSERVATION_ID_RE`, `LMSTUDIO_SWITCH`, `VLLM_UNIFIED_SWITCH`, `createStateStore`, `validateModel`, `loadSeedCatalog`, `loadRunnerLocks`, `createRunnerInstaller`, `readSnapshot`, `computeDiagnostic`, `createStartupObservations`, `createObservationClock` |
 | `pworker/local-llm/chat` | stable | The pure helpers of a chat responder: `buildRunnerRequest`, `requestLimitProblem`, `chatLimits(env)`, `cpuCompletionBudget(env)`, `completionStats`, `createStreamStatsReader`, `MAX_COMPLETION_TOKENS`, `MAX_COMPLETION_TOKENS_LIMIT`, `CPU_MAX_COMPLETION_TOKENS`, `RUNNER_TIMEOUT_MS`. The environment names (`LOCAL_LLM_MAX_COMPLETION_TOKENS`, `LOCAL_LLM_RUNNER_TIMEOUT_MS`) and the defaults are part of the contract. The responder that reads a request, calls the controller and writes the answer belongs to the host |
 | `pworker/local-llm/runner-process` | stable | `startRunnerProcess`, `createLogBuffer`, `setOomScoreAdj`, `parseRunnerReport`, `createReportCollector` |
 | `pworker/local-llm/runner-install-check` | stable | `runInstallCheck(argv, { host })` (DS004) |
@@ -93,6 +93,24 @@ The overview key `gatewayModel` keeps its place and holds `gatewayModelName` (nu
 | `setOomScoreAdj(pid, value, { fsApi })` | Makes a process the out-of-memory killer's first choice | writes `<procDir>/<pid>/oom_score_adj` |
 | `tarFlags(into, strip)` | The extraction flags of the runner installer | `['-C', into, '--strip-components=<strip>', '--no-same-owner', '--touch']` |
 | `socketPathMax` | The longest Unix socket path in bytes (`sun_path` less its terminator); optional, 107 when absent | `107` |
+
+### The macOS platform (`darwinPlatform`) and `platformFor`
+
+`darwinPlatform({ privateRoot = null })` is frozen and has the members of `linuxPlatform()` that `defineHost` requires, with the macOS values below, plus four optional strategies that the engine uses only when a platform has them (a platform written for the Linux members alone keeps working). `platformFor(name = process.platform, options)` returns `linuxPlatform(options)` for `linux`, `darwinPlatform(options)` for `darwin`, and throws `LocalLlmError('unsupported_platform')` for any other name: the engine fails closed rather than run a download binder that was not written for the platform. Both functions are exported by `pworker/local-llm`. The binder that results is described in DS002.
+
+| Member | Meaning | macOS value |
+| --- | --- | --- |
+| `name` | A label for logs | `'darwin'` |
+| `procDir`, `devDriDir` | Required by the platform shape; macOS has neither | `/nonexistent/proc`, `/nonexistent/dri`: a reader that tried them finds nothing and fails closed |
+| `openedPathOf` | Where an open descriptor points | rejects with `unsupported_platform`; never returns a path |
+| `openatPath` | A name inside an open directory | throws `unsupported_platform`; unreachable, because untrusted roots are off |
+| `unreadableReason` | The text appended to `UNSAFE_PATH` | `macOS has no /proc/self/fd` |
+| `setOomScoreAdj` | The out-of-memory marking | does nothing |
+| `tarFlags(into, strip)` | The extraction flags of the runner installer | `['-C', into, '--strip-components=<strip>', '--no-same-owner', '-m']` (bsdtar rejects `--touch`) |
+| `confirmOpened(fsApi, handle, expected, anchor)` | Optional. Whether an opened handle is the regular file at `expected`, below the anchored root. Used in place of `openedPathOf` when present | the stat binder: the handle's `fstat`, the anchor's device and inode, every directory below it, and the final path's device and inode |
+| `beforeCreate(fsApi, anchor, file)` | Optional. Called before a file is created or a partial file is opened for appending; throws `UNSAFE_PATH` to refuse | every directory from `privateRoot` (when it holds the root) or the anchored root down to the parent must be a real directory owned by the user with no group or other write bit |
+| `untrustedRoots` | Optional. `false` makes `anchorRoot` return null for an untrusted root, so a shared root is never walked | `false` |
+| `performanceCores()` | Optional. The high-performance cores, or null; the llama-server runners use it for their default threads before counting cores themselves | `hw.perflevel0.physicalcpu` from `sysctl`, or null |
 
 ### The messages (`defineMessages`)
 
