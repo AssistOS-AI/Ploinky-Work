@@ -176,3 +176,32 @@ test('the default runner is the CUDA build on an NVIDIA profile and the CPU buil
     assert.equal(defaultRunnerFor('cpu'), 'llama.cpp-cpu');
     assert.equal(defaultRunnerFor(null), 'llama.cpp-cpu');
 });
+
+test('on demand: once a replace of the gate\'s own deployment is decided, a request for the deployment being replaced is refused, never forwarded to the dying runner', async (t) => {
+    const { host: real, counter } = await startHost(t);
+    // The replace for another model is decided (nothing is busy) and stalls while it asks the engine what it could start.
+    let hold = Promise.resolve();
+    let release = () => {};
+    const slow = (controller) => controller && Object.create(controller, { overview: { value: async (...args) => { await hold; return controller.overview(...args); } } });
+    const host = Object.create(real, { current: { value: () => slow(real.current()) }, controller: { value: async () => slow(await real.controller()) } });
+    const gate = createLocalLlmGate({ host, settings: onDemand(), pollMs: 10 });
+    assert.equal((await gate.ensure(ENTRY)).ok, true);
+    const controller = real.current();
+    const pid = controller.state.deployment.runner.pid;
+    hold = new Promise((resolve) => { release = resolve; });
+    const replacing = gate.ensure({ model: 'some-other-model', runner: 'fake-gguf' });
+    assert.equal(counter.starts, 1);
+    // The old model's request arrives mid-replace: refused (the chain falls back), not handed the target of the runner about to be stopped.
+    const late = await gate.ensure(ENTRY);
+    assert.equal(late.ok, false, 'no target for a deployment that is being replaced');
+    assert.match(late.reason, /starting another model/);
+    assert.equal(late.target, undefined);
+    release();
+    // The replace itself ends in its own refusal here (the model is not in the catalog); the old runner was never stopped.
+    const replaced = await replacing;
+    assert.equal(replaced.ok, false);
+    assert.match(replaced.reason, /not in the local-llm catalog/);
+    assert.ok(alive(pid), 'the old runner still runs: the replace was refused before it stopped anything');
+    // With the replace over, the old model is served again.
+    assert.equal((await gate.ensure(ENTRY)).ok, true);
+});
