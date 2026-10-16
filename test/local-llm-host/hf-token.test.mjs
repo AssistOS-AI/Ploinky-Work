@@ -12,7 +12,10 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { checkToken, hfTokenFile, readTokenInput, writeHfToken } from '../../lib/pworker/hf-token.mjs';
+import { loadLayers } from '../../lib/config.mjs';
 import { createLocalLlmHost } from '../../lib/local-llm-host/host.mjs';
+import { createPworkerServer } from '../../lib/server.mjs';
+import { serverHome } from '../../lib/settings.mjs';
 import { scratch } from './fixtures/engine.mjs';
 
 const BIN = fileURLToPath(new URL('../../bin/pworker.mjs', import.meta.url));
@@ -121,3 +124,46 @@ test('on a terminal the token is typed without echo: nothing of it is written to
     cancelled.input.emit('data', '\u0003');
     assert.equal(await second, null);
 });
+
+// The token file is read by the host of the server, whose home is config.taskHome, else the parent of its data folder
+// (serverHome); the command must write where the server reads, also when the user's configuration moves the data folder.
+test('the command writes the token where the server reads it: dataDir and taskHome of the configuration move both', async (t) => {
+    const servers = [];
+    try {
+        await writtenWhereRead(t, servers);
+    } finally {
+        for (const server of servers) await server.close();
+    }
+});
+
+async function writtenWhereRead(t, servers) {
+    const configured = async (layout) => {
+        const home = scratch(t);
+        const other = scratch(t);
+        fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(layout(other)));
+        const written = await bin(home, ['models', 'hf-token'], `${FIRST}\n`);
+        assert.equal(written.code, 0, written.stderr);
+        const env = { PWORKER_HOME: home };
+        const { config } = loadLayers({ env, project: false });
+        const server = await createPworkerServer({ config, env });
+        servers.push(server);
+        return { home, other, server };
+    };
+    const byData = await configured((other) => ({ dataDir: path.join(other, 'data') }));
+    assert.equal(byData.server.localLlm.layout.home, byData.other);
+    assert.equal(byData.server.localLlm.layout.keysFile, path.join(byData.other, 'keys', 'huggingface.env'));
+    assert.equal(fs.readFileSync(byData.server.localLlm.layout.keysFile, 'utf8'), `HF_TOKEN="${FIRST}"\n`, 'the server reads the file the command wrote');
+    assert.equal(byData.server.localLlm.engineEnvironment().HF_TOKEN, FIRST);
+    assert.equal(fs.existsSync(hfTokenFile(byData.home)), false, 'nothing is written under the PWORKER_HOME the server does not use');
+    const byTask = await configured((other) => ({ taskHome: other }));
+    assert.equal(byTask.server.localLlm.layout.home, byTask.other);
+    assert.equal(byTask.server.localLlm.engineEnvironment().HF_TOKEN, FIRST);
+    assert.equal(fs.existsSync(hfTokenFile(byTask.home)), false);
+    // Without a configured home both are PWORKER_HOME.
+    const plain = await configured(() => ({}));
+    assert.equal(plain.server.localLlm.layout.home, plain.home);
+    assert.equal(plain.server.localLlm.engineEnvironment().HF_TOKEN, FIRST);
+    assert.equal(serverHome({ taskHome: '/x/y', dataDir: '/z/data' }, {}), '/x/y');
+    assert.equal(serverHome({ dataDir: '/z/data' }, { PWORKER_HOME: '/ignored' }), '/z');
+    assert.equal(serverHome({}, { PWORKER_HOME: '/h' }), '/h');
+}

@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createPworkerClient } from '../lib/client.mjs';
 import { ensureUserHome, loadLayers } from '../lib/config.mjs';
-import { pworkerHome } from '../lib/settings.mjs';
+import { pworkerHome, serverHome } from '../lib/settings.mjs';
 import { Pworker } from '../lib/pworker/task.mjs';
 import { jobStore } from '../lib/pworker/jobs.mjs';
 import { selectMenu, promptChat, promptField } from '../lib/pworker/menu.mjs';
@@ -479,7 +479,9 @@ async function main() {
     if (args[1] !== 'hf-token') await startProxy();
     const abort = new AbortController();
     process.once('SIGINT', () => abort.abort());
-    process.exitCode = await runEngineVerb({ args, client: client(), io: { out: (text) => stdout.write(text), err: (text) => process.stderr.write(text), stdin, stdout, isTTY: Boolean(stdout.isTTY), signal: abort.signal, home } });
+    // The token file is read by the engine's host in the server's home (serverHome), which a configured dataDir or taskHome can move off PWORKER_HOME.
+    const engineHome = args[1] === 'hf-token' ? serverHome(loadLayers().config) : home;
+    process.exitCode = await runEngineVerb({ args, client: client(), io: { out: (text) => stdout.write(text), err: (text) => process.stderr.write(text), stdin, stdout, isTTY: Boolean(stdout.isTTY), signal: abort.signal, home: engineHome } });
     return;
   }
   if (['run', '--async', 'queue', 'flush', 'stats', 'models', 'tier'].includes(command)) await startProxy();
