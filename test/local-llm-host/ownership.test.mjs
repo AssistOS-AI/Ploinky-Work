@@ -24,7 +24,7 @@ function scratchHome(t) {
 }
 
 function startContender(t, options) {
-    const child = spawn(process.execPath, [CONTENDER, JSON.stringify(options)], { stdio: ['ignore', 'pipe', 'inherit'] });
+    const child = spawn(process.execPath, [CONTENDER, JSON.stringify(options)], { stdio: ['pipe', 'pipe', 'inherit'] });
     const events = [];
     const waiters = [];
     let buffer = '';
@@ -42,6 +42,7 @@ function startContender(t, options) {
     return {
         child, events, exited,
         pid: child.pid,
+        go: () => child.stdin.write('go\n'),
         async event(name, timeoutMs = 10_000) {
             const deadline = Date.now() + timeoutMs;
             for (;;) {
@@ -169,8 +170,8 @@ test('a stale owner.json is informational: it is neither read nor moved, and the
 
 test('four real processes race for one home: exactly one owner at every observation point, and each gets its turn', async (t) => {
     const home = scratchHome(t);
-    const startAtMs = Date.now() + 700;
-    const racers = [0, 1, 2, 3].map(() => startContender(t, { home, mode: 'bind', holdMs: 150, retryMs: 20_000, startAtMs }));
+    const racers = [0, 1, 2, 3].map(() => startContender(t, { home, mode: 'bind', holdMs: 150, retryMs: 20_000, waitForGo: true }));
+    await Promise.all(racers.map((racer) => racer.event('ready')));
     // Polling during the race: who answers on the port right now. A pid seen must belong to a contender that holds then.
     const realHome = fs.realpathSync(home);
     const port = ownerPortFor(realHome);
@@ -178,11 +179,13 @@ test('four real processes race for one home: exactly one owner at every observat
     let racing = true;
     const poller = (async () => {
         while (racing) {
+            const from = process.hrtime.bigint();
             const seen = await diagnoseHolder({ port, realHome, timeoutMs: 500 });
-            samples.push({ t: process.hrtime.bigint(), pid: seen.kind === 'same-home' ? seen.pid : null });
+            samples.push({ from, to: process.hrtime.bigint(), pid: seen.kind === 'same-home' ? seen.pid : null });
             await new Promise((resolve) => setTimeout(resolve, 3));
         }
     })();
+    for (const racer of racers) racer.go();
     const exits = await Promise.all(racers.map((racer) => racer.exited));
     racing = false;
     await poller;
@@ -197,15 +200,17 @@ test('four real processes race for one home: exactly one owner at every observat
         seenPids.add(sample.pid);
         const owner = held.find((interval) => interval.pid === sample.pid);
         assert.ok(owner, `pid ${sample.pid} answered on the port but never reported holding it`);
-        assert.ok(sample.t >= owner.from - slack && sample.t <= owner.to + slack, `pid ${sample.pid} answered outside its held interval`);
+        // The answer came at some instant between the start and the end of the sample: that span must meet the owner's held interval.
+        assert.ok(sample.from <= owner.to + slack && sample.to >= owner.from - slack, `pid ${sample.pid} answered outside its held interval`);
     }
     assert.ok(seenPids.size >= 2, `the poller saw the handover (${seenPids.size} owners seen)`);
 });
 
 test('negative control: a check-then-write lock under the same harness is caught as two owners', async (t) => {
     const home = scratchHome(t);
-    const startAtMs = Date.now() + 700;
-    const racers = [0, 1].map(() => startContender(t, { home, mode: 'check-then-write', gapMs: 80, holdMs: 300, retryMs: 0, startAtMs }));
+    const racers = [0, 1].map(() => startContender(t, { home, mode: 'check-then-write', gapMs: 150, holdMs: 400, retryMs: 0, waitForGo: true }));
+    await Promise.all(racers.map((racer) => racer.event('ready')));
+    for (const racer of racers) racer.go();
     await Promise.all(racers.map((racer) => racer.exited));
     const held = intervals(racers);
     assert.equal(held.length, 2, 'both passed the check');

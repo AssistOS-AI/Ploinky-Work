@@ -23,7 +23,7 @@ async function makeHost(t, { home = scratch(t), config = {}, extra = {}, withRun
     const procDir = path.join(home, 'proc');
     fs.mkdirSync(procDir, { recursive: true });
     const logs = [];
-    const ownerPort = extra.ownerPort ?? await freePort();
+    const ownerPort = extra.ownerPort === undefined ? await freePort() : extra.ownerPort;
     const adapter = fakeAdapter();
     const controllerOptions = withRunner ? {
         runners: { 'fake-gguf': adapter },
@@ -225,6 +225,8 @@ test('the socket path fits under the test home on both platforms, and an over-lo
     await host.acquire();
     const longest = path.join(host.layout.socketDir, '00000000.sock');
     assert.ok(Buffer.byteLength(longest) <= 103, `${longest} is ${Buffer.byteLength(longest)} bytes; macOS allows 103`);
+    // The home every test file runs under has the longest path of them: its sockets fit too.
+    assert.ok(Buffer.byteLength(path.join(fs.realpathSync(process.env.PWORKER_HOME), 'r', '00000000.sock')) <= 103, 'the test home\'s own socket path fits macOS');
 
     // A home so deep that <home>/r/<8 hex>.sock cannot fit sun_path.
     const deep = path.join(scratch(t), 'd'.repeat(60), 'd'.repeat(40));
@@ -242,9 +244,15 @@ test('the socket path fits under the test home on both platforms, and an over-lo
     assert.ok(home);
 });
 
-test('a model runs on a real Unix socket: records before the process, a socket target that answers with the per-start key, and a clean stop', async (t) => {
-    const { host, home } = await makeHost(t);
+// The only test that acquires the shared test home (PWORKER_HOME, which every test file of a run inherits): the others use their own.
+test('a model runs on a real Unix socket under the test home: records before the process, a socket target that answers with the per-start key, and a clean stop', async (t) => {
+    const home = fs.realpathSync(process.env.PWORKER_HOME);
+    assert.match(path.basename(home), /^pworker-test-home-/);
+    const { host } = await makeHost(t, { home, extra: { ownerPort: null } });
     const controller = await host.controller();
+    assert.equal(host.describe().ownership.port, ownerPortFor(home), 'the real, derived owner port of the test home');
+    const longest = path.join(host.layout.socketDir, '00000000.sock');
+    assert.ok(Buffer.byteLength(longest) <= 103, `${longest} is ${Buffer.byteLength(longest)} bytes; macOS allows 103`);
     const launchDir = path.join(home, 'local-llm', 'state', 'launch');
     await runModel(controller);
     const target = controller.chatTarget();
@@ -426,4 +434,56 @@ test('through the controller the host lock makes the CUDA build installable on a
     assert.equal(runner(cpu, 'llama.cpp-cpu').supported, true);
     assert.equal(runner(cpu, 'llama.cpp-cpu').install.totalBytes, 17531126);
     assert.equal(runner(cpu, 'llama.cpp-cpu').installed, false, 'nothing is installed, and nothing was downloaded to find out');
+});
+
+test('the CUDA build is for the NVIDIA profiles: with nvidia-smi present but the cpu profile committed it is hidden, and Run and Install refuse it', async (t) => {
+    const { host } = await makeHost(t, { withRunner: false, extra: { arch: 'x64', which: () => '/usr/bin/nvidia-smi', controllerOptions: {
+        profile: 'cpu',
+        snapshot: async () => ({ gpu: { available: false }, memory: { totalBytes: 31 * GIB, availableBytes: 24 * GIB }, disk: { freeBytes: 300 * GIB, totalBytes: 500 * GIB }, cpus: 8 }),
+    } } });
+    const controller = await host.controller();
+    const ids = (await controller.overview()).runners.map((runner) => runner.id);
+    assert.equal(ids.includes('llama.cpp'), false);
+    assert.equal(ids.includes('llama.cpp-cpu'), true);
+    await assert.rejects(controller.run({ modelId: MODEL, runnerId: 'llama.cpp', requestId: 'request-cpu-01' }), { code: 'runner_unavailable' });
+    await assert.rejects(controller.installRunner({ runnerId: 'llama.cpp' }), { code: 'runner_unavailable' });
+    // The same host description still lists it as a runner of the host: it is the profile that hides it, not the registry.
+    assert.equal(host.describe().runners.find((runner) => runner.id === 'llama.cpp').supported, true);
+});
+
+test('describe never throws: an unusable socketDir is reported in the result, and the runners are still listed', async (t) => {
+    for (const socketDir of ['relative/r', '/a:b/r', '/a,b/r']) {
+        const { host } = await makeHost(t, { withRunner: false, config: { localLlm: { socketDir } } });
+        const description = host.describe();
+        assert.match(description.socketDirProblem, /socket|listen/i, socketDir);
+        assert.equal(description.runners.length, 8, socketDir);
+        await assert.rejects(host.acquire(), { code: 'invalid_socket_dir' }, socketDir);
+    }
+    const { host: fine } = await makeHost(t, { withRunner: false });
+    assert.equal(fine.describe().socketDirProblem, null);
+});
+
+test('a launch directory that cannot be read does not undo the ownership: the host stays the owner, logs it, and its own second acquire is idempotent', async (t) => {
+    const home = scratch(t);
+    const failing = new Proxy(fs, {
+        get(target, name) {
+            if (name !== 'readdirSync') return target[name];
+            return (dir, ...rest) => {
+                if (String(dir).endsWith(`${path.sep}launch`)) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+                return target.readdirSync(dir, ...rest);
+            };
+        },
+    });
+    const { host, logs, ownerPort } = await makeHost(t, { home, extra: { fsApi: failing } });
+    const result = await host.acquire();
+    assert.equal(result.owned, true);
+    assert.deepEqual(result.reaped.reaped, []);
+    assert.match(result.reaped.skipped[0].reason, /could not be read \(EACCES\)/);
+    assert.ok(logs.some((line) => /could not be looked for \(EACCES\)/.test(line)));
+    assert.equal((await host.acquire()).owned, true, 'no owner_held against its own process');
+    assert.equal(host.describe().ownership.port, ownerPort);
+    assert.ok(await host.controller(), 'the controller can be created');
+    // And the port really is held: another host is refused.
+    const { host: other } = await makeHost(t, { home, extra: { ownerPort } });
+    await assert.rejects(other.acquire(), { code: 'owner_held' });
 });

@@ -10,6 +10,7 @@
 //   holdMs      how long to hold; -1 holds until killed
 //   retryMs     how long to keep trying (0: one attempt)
 //   startAtMs   wall-clock time at which every contender starts (a barrier)
+//   waitForGo   true: print `ready` once loaded, then wait for a line `go` on stdin (a barrier that does not depend on start-up time)
 //   gapMs       the check-then-write variant's window between the check and the write
 //   port        owner port override (bind mode)
 //   child       true: start a long-lived child process while holding
@@ -27,6 +28,10 @@ const emit = (ev, extra = {}) => process.stdout.write(`${JSON.stringify({ ev, pi
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 while (options.startAtMs && Date.now() < options.startAtMs) await sleep(1);
+if (options.waitForGo) {
+    emit('ready');
+    await new Promise((resolve) => { let seen = ''; process.stdin.on('data', (chunk) => { seen += chunk; if (seen.includes('go')) resolve(); }); });
+}
 
 const realHome = fs.realpathSync(options.home);
 const deadline = Date.now() + (options.retryMs ?? 0);
@@ -38,7 +43,7 @@ async function attempt() {
         if (fs.existsSync(lockFile)) return null;
         await sleep(options.gapMs ?? 50);
         fs.writeFileSync(lockFile, String(process.pid));
-        return { release: async () => { fs.unlinkSync(lockFile); } };
+        return { release: async () => { fs.rmSync(lockFile, { force: true }); } };
     }
     if (options.mode === 'leak') {
         const server = net.createServer();

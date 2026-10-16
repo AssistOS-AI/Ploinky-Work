@@ -70,7 +70,7 @@ Runners listen on a Unix socket, not on a TCP port (the engine side is `host.lis
 
 | Runner | Offered | Source |
 | --- | --- | --- |
-| `llama.cpp` | When `nvidia-smi` is on PATH | The CUDA build of the host lock (b11295): the main archive and the CUDA runtime archive, both unpacked into the same runnable copy. The binaries have `$ORIGIN` as their run path, so they find `libcudart` and `libcublas` beside them. `libcuda.so.1` comes from the driver and is listed as optional, so the install check passes on a machine without a GPU |
+| `llama.cpp` | When `nvidia-smi` is on PATH, and on the dedicated and unified profiles only: a machine that commits to the cpu profile (a broken driver, no usable device) hides it and refuses Run and Install for it | The CUDA build of the host lock (b11295): the main archive and the CUDA runtime archive, both unpacked into the same runnable copy. The binaries have `$ORIGIN` as their run path, so they find `libcudart` and `libcublas` beside them. `libcuda.so.1` comes from the driver and is listed as optional, so the install check passes on a machine without a GPU |
 | `llama.cpp-cpu` | Always | The CPU build of the host lock (b11295) |
 | ik_llama.cpp, Ollama, vLLM, TabbyAPI, LM Studio, the Vulkan build | Never | Listed as unsupported with a reason |
 
@@ -80,7 +80,7 @@ The engine's environment holds `PATH` (the system directories and the directory 
 
 ### The host API
 
-`lib/local-llm-host/host.mjs` documents it at its top. In short: `acquire({ waitMs })`, `controller()`, `current()`, `drain()`, `describe()`, `engineEnvironment()` and `redact(text)`. The server creates one host per home (`server.localLlm`), passes it to the core as `localLlm`, and `close()` awaits `drain()`, so a process that exits leaves no runner and no ownership behind. The gate and the `/v1/local-llm/*` routes use `await host.controller()`.
+`lib/local-llm-host/host.mjs` documents it at its top. In short: `acquire({ waitMs })`, `controller()`, `current()`, `drain()`, `describe()` (which never throws: an unusable socket directory is reported as `socketDirProblem`), `engineEnvironment()` and `redact(text)`. A failure to read the launch records at acquire is logged and does not undo the ownership. The server creates one host per home (`server.localLlm`), passes it to the core as `localLlm`, and `close()` awaits `drain()`, so a process that exits leaves no runner and no ownership behind. The gate and the `/v1/local-llm/*` routes use `await host.controller()`.
 
 ## Decisions and Rationale
 
