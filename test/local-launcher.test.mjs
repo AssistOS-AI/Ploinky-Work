@@ -53,8 +53,9 @@ test('local: a server started by a real starter survives a kill -9 of its proxy 
     assert.deepEqual(h.signals, []);
     assert.deepEqual(next.status(), { managed: false, pid: null, last_refusal: null });
   } finally {
+    // The stand-in proxy goes first, so it never sees its server exit; then the server is asked to exit.
+    if (proxy.exitCode === null && proxy.signalCode === null) { const gone = once(proxy, 'exit'); proxy.kill('SIGKILL'); await gone; }
     await fetch(`http://127.0.0.1:${port}/shutdown`, { signal: AbortSignal.timeout(1000) }).catch(() => {});
-    if (proxy.exitCode === null && proxy.signalCode === null) proxy.kill('SIGKILL');
     assert.equal(await until(async () => !(await health(port))), true, 'the fixture server is gone');
     rmSync(dir, { recursive: true, force: true });
   }

@@ -4,7 +4,7 @@ import { createLocalStarter } from '../lib/local.mjs';
 
 const [serverScript, port, logFile] = process.argv.slice(2);
 const starter = createLocalStarter({ name: 'fixture', baseUrl: `http://127.0.0.1:${port}`,
-  start: { script: serverScript, requireFreeGpu: false, startTimeoutMs: 10000, logFile, args: ['--lifetime-ms', '40000'] } }, { gpuPids: () => [] });
+  start: { script: serverScript, requireFreeGpu: false, startTimeoutMs: 10000, logFile, args: ['--lifetime-ms', '40000'] } }, { gpuPids: () => [], killImpl: () => {} }); // this process never stops its server; a no-op keeps the real process.kill out of reach
 if (!(await starter.ensure())) { console.error(JSON.stringify(starter.status().last_refusal)); process.exit(2); }
 console.log(JSON.stringify({ runnerPid: starter.status().pid }));
 setTimeout(() => process.exit(0), 40000); // never outlives a failed test

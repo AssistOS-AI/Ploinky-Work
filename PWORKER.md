@@ -139,7 +139,7 @@ The engine has no container paths, vendor wording or hardware limits of its own.
 
 ## Local servers started on demand
 
-An upstream with a `start` block (see the `localtiny`, `localsuper` and `localnano` entries of `config.default.json`) is a local server that the proxy starts when a request needs it. `lib/local.mjs` runs it through the engine's runner process (`lib/local-llm/controller/runnerProcess.mjs`): the server leads its own process group, its output goes straight to its log file, and a stop signals the whole group. A request to such an upstream first checks `/health` on its port. A healthy server is used as it is, whoever started it; this is also how a server that outlived a crashed or killed proxy is picked up again by the next one. Otherwise the proxy starts the server if the GPU is free, and the request falls back down its tier chain when the server may not or cannot start.
+An upstream with a `start` block (see the `local`, `localsuper` and `localnano` entries of `config.default.json`) is a local server that the proxy starts when a request needs it. `lib/local.mjs` runs it through the engine's runner process (`lib/local-llm/controller/runnerProcess.mjs`): the server leads its own process group, its output goes straight to its log file, and a stop signals the whole group. A request to such an upstream first checks `/health` on its port. A healthy server is used as it is, whoever started it; this is also how a server that outlived a crashed or killed proxy is picked up again by the next one. Otherwise the proxy starts the server if the GPU is free, and the request falls back down its tier chain when the server may not or cannot start.
 
 | `start` key | Meaning |
 | --- | --- |
@@ -150,7 +150,8 @@ An upstream with a `start` block (see the `localtiny`, `localsuper` and `localna
 | `idleStopMs` | Stop the server after this long without a request. A server with requests in flight or queued is never stopped (0 or missing: never) |
 | `exclusiveGroup` | Servers of one group never run together: starting one first stops the others of the group that this proxy manages, and waits for them to exit |
 | `stopGraceMs` | A stop sends SIGTERM to the server's process group and, when the server has not exited after this long (default 30000, so a long generation is not cut short), SIGKILL; the stop waits for the exit, at most 5 s after the SIGKILL. Earlier versions called this key `stopWaitMs` |
-| `startAtBoot`, `logFile`, `identity`, `slots`, `ctxPerSlot` | Start with the proxy; the log file (default `<logDir>/<name>.log`, appended to); the files whose size and mtime identify the model for the cache; slot figures for the local status |
+| `slots`, `ctxPerSlot` | `slots` becomes llama-server's `--parallel` and the upstream's default `limits.maxConcurrent`; with `ctxPerSlot`, `-c` is `slots * ctxPerSlot` (set once in the config, written into `args` when the config is loaded) |
+| `startAtBoot`, `logFile`, `identity` | Start with the proxy; the log file (default `<logDir>/<name>.log`, appended to); the files whose size and mtime identify the model for the cache |
 
 The server starts in the proxy's `baseDir` (relative paths in `start` resolve there) with the proxy's environment. The engine's out-of-memory marking is off for these servers (`oomScoreAdj: null`). A graceful proxy shutdown stops the servers it manages; a proxy that is killed leaves them running.
 
