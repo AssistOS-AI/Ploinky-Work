@@ -501,6 +501,7 @@ async function main() {
     const name = args[1], key = option('key', '');
     const prior = loadLayers().config.providers?.[name] ?? {};
     if (prior.start) throw new Error('Use the local model menu to start a managed local provider');
+    if (prior.kind === 'local-llm') throw new Error(`${name} is the local-llm engine of this machine, not an endpoint; manage its models with \`pworker models\``);
     const spec = providerSpec(name, option('endpoint'), key, option('rpm', 60), prior);
     const models = await fetchModelCatalog(spec, { key });
     saveProvider(name, spec, key); await restartProxy();

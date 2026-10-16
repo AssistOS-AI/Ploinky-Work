@@ -16,7 +16,7 @@ import { loadLayers } from '../../lib/config.mjs';
 import { createLocalLlmHost } from '../../lib/local-llm-host/host.mjs';
 import { createPworkerServer } from '../../lib/server.mjs';
 import { serverHome } from '../../lib/settings.mjs';
-import { scratch } from './fixtures/engine.mjs';
+import { freePort, scratch } from './fixtures/engine.mjs';
 
 const BIN = fileURLToPath(new URL('../../bin/pworker.mjs', import.meta.url));
 const FIRST = 'hf_SyntheticTokenOne0123456789abcdef';
@@ -169,3 +169,28 @@ async function writtenWhereRead(t, servers) {
     assert.equal(serverHome({ dataDir: '/home/me/pw-data' }, { PWORKER_HOME: '/h' }), '/h', 'a data folder under a home folder does not make it the engine home');
     assert.equal(serverHome({}, { PWORKER_HOME: '/h' }), '/h');
 }
+
+test('the host\'s own log lines pass the token filter: a refusal that names the token in a path is logged with ***', async (t) => {
+    const home = scratch(t);
+    const lines = [];
+    // An unusable socket directory is refused with a message that quotes the path; here the path carries the token.
+    const host = createLocalLlmHost({
+        config: { localLlm: { socketDir: `/tmp/not:ok-${FIRST}` } }, home, env: { PWORKER_HOME: home, HF_TOKEN: FIRST },
+        platformName: 'linux', ownerPort: await freePort(), log: (line) => lines.push(line),
+    });
+    t.after(() => host.drain());
+    await assert.rejects(host.acquire(), (error) => error.code === 'invalid_socket_dir');
+    assert.ok(lines.length > 0, 'the refusal was logged');
+    assert.ok(lines.every((line) => !line.includes(FIRST)), 'no log line holds the token');
+    assert.ok(lines.some((line) => line.includes('***')), lines.join('\n'));
+});
+
+test('`pworker provider local-llm --endpoint ...` is refused and the engine\'s provider spec is not overwritten', async (t) => {
+    const home = scratch(t);
+    const result = await bin(home, ['provider', 'local-llm', '--endpoint', 'http://127.0.0.1:9/v1'], '');
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /local-llm engine of this machine/);
+    const config = path.join(home, 'config.json');
+    const written = fs.existsSync(config) ? JSON.parse(fs.readFileSync(config, 'utf8')) : {};
+    assert.equal(written.providers?.['local-llm'], undefined, 'no user override of the engine provider was saved');
+});
