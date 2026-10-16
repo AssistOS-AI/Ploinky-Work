@@ -1,0 +1,56 @@
+{
+  "schema": "local-llm.runners-lock/v1",
+  "runners": {
+    "llama.cpp": {
+      "version": "b11295",
+      "kind": "archive",
+      "licence": {
+        "name": "MIT",
+        "url": "https://github.com/ggml-org/llama.cpp/blob/b11295/LICENSE",
+        "source": "https://github.com/ggml-org/llama.cpp",
+        "requiresAcceptance": false
+      },
+      "files": [
+        {
+          "name": "llama-b11295-bin-ubuntu-cuda-12.8-x64.tar.gz",
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11295/llama-b11295-bin-ubuntu-cuda-12.8-x64.tar.gz",
+          "size": 171347739,
+          "sha256": "328f9723589f5cf47e35d8f934d814d738000d4309d11246ea631c50f24c6c0f"
+        },
+        {
+          "name": "cudart-llama-b11295-bin-ubuntu-cuda-12.8-x64.tar.gz",
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11295/cudart-llama-b11295-bin-ubuntu-cuda-12.8-x64.tar.gz",
+          "size": 594377809,
+          "sha256": "7aad6f467985f777db2ea83762fdd563a8d0ad8c0baeef960527d9bb2024f371"
+        }
+      ],
+      "check": {
+        "executable": "llama-server",
+        "optionalLibraries": {
+          "libcuda.so.1": "The NVIDIA driver supplies it; a machine without a GPU has none, and the CPU launch never loads the CUDA backend."
+        }
+      }
+    },
+    "llama.cpp-cpu": {
+      "version": "b11295",
+      "kind": "archive",
+      "licence": {
+        "name": "MIT",
+        "url": "https://github.com/ggml-org/llama.cpp/blob/b11295/LICENSE",
+        "source": "https://github.com/ggml-org/llama.cpp",
+        "requiresAcceptance": false
+      },
+      "files": [
+        {
+          "name": "llama-b11295-bin-ubuntu-x64.tar.gz",
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11295/llama-b11295-bin-ubuntu-x64.tar.gz",
+          "size": 17531126,
+          "sha256": "cd54d7dcf8818acc69c54dfc559b36da5f693d30b223e8dde87b4da4570664ed"
+        }
+      ],
+      "check": {
+        "executable": "llama-server"
+      }
+    }
+  }
+}

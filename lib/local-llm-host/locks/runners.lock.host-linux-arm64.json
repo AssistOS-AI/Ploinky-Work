@@ -1,0 +1,56 @@
+{
+  "schema": "local-llm.runners-lock/v1",
+  "runners": {
+    "llama.cpp": {
+      "version": "b11295",
+      "kind": "archive",
+      "licence": {
+        "name": "MIT",
+        "url": "https://github.com/ggml-org/llama.cpp/blob/b11295/LICENSE",
+        "source": "https://github.com/ggml-org/llama.cpp",
+        "requiresAcceptance": false
+      },
+      "files": [
+        {
+          "name": "llama-b11295-bin-ubuntu-cuda-13.4-arm64.tar.gz",
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11295/llama-b11295-bin-ubuntu-cuda-13.4-arm64.tar.gz",
+          "size": 147324674,
+          "sha256": "97b4e529ec79e730f960fd3ae6f92000a37c536c7d2b9d052a9a525a90c696dc"
+        },
+        {
+          "name": "cudart-llama-b11295-bin-ubuntu-cuda-13.4-arm64.tar.gz",
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11295/cudart-llama-b11295-bin-ubuntu-cuda-13.4-arm64.tar.gz",
+          "size": 552521416,
+          "sha256": "90b74a4562c751534bd4a9de7ce56a878fc3d31c4ab6dc661e4729014d31772a"
+        }
+      ],
+      "check": {
+        "executable": "llama-server",
+        "optionalLibraries": {
+          "libcuda.so.1": "The NVIDIA driver supplies it; a machine without a GPU has none, and the CPU launch never loads the CUDA backend."
+        }
+      }
+    },
+    "llama.cpp-cpu": {
+      "version": "b11295",
+      "kind": "archive",
+      "licence": {
+        "name": "MIT",
+        "url": "https://github.com/ggml-org/llama.cpp/blob/b11295/LICENSE",
+        "source": "https://github.com/ggml-org/llama.cpp",
+        "requiresAcceptance": false
+      },
+      "files": [
+        {
+          "name": "llama-b11295-bin-ubuntu-arm64.tar.gz",
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11295/llama-b11295-bin-ubuntu-arm64.tar.gz",
+          "size": 13577862,
+          "sha256": "439dff1fdb5d223f1d1e1adacd6845abff12aa518b746e2a2f4f01d55d57aae9"
+        }
+      ],
+      "check": {
+        "executable": "llama-server"
+      }
+    }
+  }
+}
