@@ -1,0 +1,9 @@
+hw.memsize: 17179869184
+hw.pagesize: 16384
+kern.memorystatus_level: 34
+kern.memorystatus_vm_pressure_level: 2
+hw.perflevel0.physicalcpu: 4
+hw.physicalcpu: 8
+hw.logicalcpu: 8
+hw.ncpu: 8
+iogpu.wired_limit_mb: 0

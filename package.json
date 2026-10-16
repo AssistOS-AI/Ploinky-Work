@@ -18,12 +18,17 @@
     "./config": "./lib/config.mjs",
     "./prompted": "./lib/prompted.mjs",
     "./http-fetch": "./lib/http-fetch.mjs",
-    "./settings": "./lib/settings.mjs"
+    "./settings": "./lib/settings.mjs",
+    "./local-llm": "./lib/local-llm/index.mjs",
+    "./local-llm/chat": "./lib/local-llm/chat.mjs",
+    "./local-llm/runner-process": "./lib/local-llm/controller/runnerProcess.mjs",
+    "./local-llm/runner-install-check": "./lib/local-llm/tools/runnerInstallCheck.mjs",
+    "./local-llm/internal/*": "./lib/local-llm/*"
   },
   "scripts": {
     "start": "node bin/pworker.mjs",
     "serve": "node bin/pworker.mjs serve",
-    "test": "node --import ./test/home.mjs --test test/*.test.mjs"
+    "test": "node --import ./test/home.mjs --test test/*.test.mjs test/local-llm/*.test.mjs test/local-llm-host/*.test.mjs"
   },
   "dependencies": {}
 }

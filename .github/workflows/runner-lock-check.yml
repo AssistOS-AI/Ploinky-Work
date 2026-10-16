@@ -1,0 +1,154 @@
+# The install check of the host runner locks of pworker (lib/local-llm-host/locks/runners.lock.host-<os>-<arch>.json, DS008).
+#
+# A lock entry reaches users with the revision they run: `pworker models runner install` downloads exactly the files the lock pins,
+# verifies them, unpacks them and launches the result. This workflow proves, on each architecture's own runner and for EVERY entry of
+# that architecture's lock, that this chain works: pworker's installer (lib/local-llm/tools/runnerInstallCheck.mjs, with
+# --require-executable) downloads each entry, checks its sha256, unpacks it, finds the file the adapter launches, and runs
+# `<executable> --version` naming the pinned build; then lib/local-llm-host/lockcheck.mjs runs `ldd` on every ELF file the copy ships
+# (lib/local-llm-host/elf.mjs) and fails on any library that is not found, except libcuda.so.1, which only the NVIDIA driver supplies
+# (a GitHub runner has no GPU, so the CUDA build is checked up to its driver library).
+#
+# The darwin-arm64 (macos-15) and darwin-x64 (macos-15-intel) legs run the same chain with the macOS platform (bsdtar's `-m`): macOS has
+# no `ldd`, so lockcheck.mjs reads every Mach-O file the copy ships with `otool -L` and `otool -l` (lib/local-llm-host/macho.mjs) and
+# fails on any dependency that is neither a system library (/usr/lib, /System/Library) nor an @rpath, @loader_path or @executable_path
+# name that resolves to a file inside the copy. The `uname -m` guard keeps a wrong label from running a lock under Rosetta.
+#
+# It runs for every pull request and on demand, never on a push, and never skips: there is no path detection, every run installs
+# everything. `workflow_dispatch` needs the workflow to be registered, which GitHub does when it runs on a branch for the first time
+# (a pull_request run does that); after that `gh workflow run runner-lock-check.yml --ref <branch>` works.
+#
+# THE GATE HOLDS ONLY ONCE `runner-lock-check` IS A REQUIRED STATUS CHECK ON THE DEFAULT BRANCH (a repository setting, not something
+# this file can turn on).
+#
+# The final job `runner-lock-check` is the one status to require: it waits for all four legs (Linux amd64 and arm64, darwin-arm64 and
+# darwin-x64) and is red unless every one of them succeeded.
+
+name: runner-lock-check
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The build every entry of the host locks is pinned to; the install check must see the launched file name it.
+  EXPECT_VERSION: b11295
+
+jobs:
+  install-check:
+    name: Install every entry of the ${{ matrix.arch }} lock
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            machine: x86_64
+            runs-on: ubuntu-24.04
+            lock: lib/local-llm-host/locks/runners.lock.host-linux-amd64.json
+          - arch: arm64
+            machine: aarch64
+            runs-on: ubuntu-24.04-arm
+            lock: lib/local-llm-host/locks/runners.lock.host-linux-arm64.json
+          - arch: darwin-arm64
+            machine: arm64
+            runs-on: macos-15
+            lock: lib/local-llm-host/locks/runners.lock.host-darwin-arm64.json
+          - arch: darwin-x64
+            machine: x86_64
+            runs-on: macos-15-intel
+            lock: lib/local-llm-host/locks/runners.lock.host-darwin-amd64.json
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 90
+    env:
+      ARCH: ${{ matrix.arch }}
+      MACHINE: ${{ matrix.machine }}
+      LOCK: ${{ matrix.lock }}
+      EVENT_NAME: ${{ github.event_name }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Checkout the revision under test
+        # For a pull request GitHub's default is the merge commit with the base; the revision under test is the head of the pull request.
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Record the revision and the machine
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/runner-lock-check"
+          mkdir -p "$out"
+          {
+            echo "git rev-parse HEAD: $(git rev-parse HEAD)"
+            echo "GITHUB_SHA: $GITHUB_SHA"
+            echo "event: $EVENT_NAME"
+            echo "pull request head: ${PR_HEAD_SHA:-none}"
+            echo "lock: $LOCK"
+            echo "architecture: $ARCH (expected machine $MACHINE, uname -m $(uname -m))"
+            if [ "$(uname -s)" = Linux ]; then echo "ldd: $(ldd --version | head -n 1)"; else echo "otool: $(/usr/bin/otool --version 2>&1 | head -n 1)"; fi
+          } | tee "$out/revision.txt"
+          # The label of the runner decides the architecture; a lock must never be checked on the other one.
+          [ "$(uname -m)" = "$MACHINE" ] || { echo "this runner is $(uname -m), not $MACHINE"; exit 1; }
+          if [ -n "$PR_HEAD_SHA" ]; then
+            [ "$(git rev-parse HEAD)" = "$PR_HEAD_SHA" ] || { echo "the checkout is not the head of the pull request"; exit 1; }
+          else
+            [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ] || { echo "the checkout is not GITHUB_SHA"; exit 1; }
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      - name: Free runner disk
+        # Linux only: these paths are not on a macOS runner (and the macOS entries are 12 MB archives).
+        if: ${{ runner.os == 'Linux' }}
+        # The CUDA runtime archives are about 0.55 to 0.6 GB each, and an archive is downloaded and unpacked.
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install every lock entry and check its libraries
+        # lockcheck.mjs fails when the lock has no entry, when any entry fails (a report that is not ok, was not downloaded, or does
+        # not name EXPECT_VERSION) and when any ELF file (Mach-O file on macOS) has a library that is not found other than libcuda.so.1. It goes on after a
+        # failed entry so that the report covers all of them.
+        run: |
+          set -euo pipefail
+          test -f "$LOCK"
+          out="$RUNNER_TEMP/runner-lock-check"
+          df -h / | tee "$out/disk-before.txt"
+          node --version
+          node lib/local-llm-host/lockcheck.mjs --lock "$LOCK" --out "$out" --work "$RUNNER_TEMP/lockcheck-work" --expect-version "$EXPECT_VERSION"
+
+      - name: Disk after the check
+        if: ${{ always() }}
+        run: df -h / | tee "$RUNNER_TEMP/runner-lock-check/disk-after.txt" || true
+
+      - name: Upload the install reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runner-lock-check-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/runner-lock-check
+          if-no-files-found: error
+          retention-days: 30
+
+  runner-lock-check:
+    # The one job to require. It always runs and is red unless every architecture's job succeeded (a cancelled or skipped job is not a success).
+    name: runner-lock-check
+    needs: [install-check]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      INSTALLED: ${{ needs.install-check.result }}
+    steps:
+      - name: Report
+        run: |
+          set -euo pipefail
+          echo "install check on every architecture: $INSTALLED"
+          [ "$INSTALLED" = success ] || { echo "the install check did not pass on every architecture"; exit 1; }

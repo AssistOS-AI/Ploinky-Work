@@ -123,6 +123,38 @@ This batching mode combines prompts; it does not use a provider's asynchronous B
 
 Example: `{ tier: 'small', template: 'Classify this text: ${input}', batch: true, code: 'this.end(result)' }`.
 
+## Local model engine
+
+`lib/local-llm` is an engine that runs one open-weight model at a time through on-demand runner processes (llama.cpp and its CPU and Vulkan builds, ik_llama.cpp, Ollama, vLLM, TabbyAPI, LM Studio). It is a library for programs that embed it. `pworker serve` hosts one engine per home on Linux and on macOS through `lib/local-llm-host` ([DS008](docs/specs/DS008-standalone-host.md)): the home is owned by one process, runners listen on Unix sockets under `<home>/r`, and a runner an earlier process left behind is ended when the next one starts. On macOS the profile is fixed by the architecture: Apple Silicon runs the Metal build of llama.cpp (`pworker models runner install llama.cpp`, profile `metal`), an Intel Mac the CPU build (`llama.cpp-cpu`; not yet run on hardware). The other runners are not offered there, and the host refuses a home or engine directory that is a link, not yours, or writable by others. The Metal inference smoke on a real model has not run yet, and the Metal constants are provisional. The seed model `qwen3-0.6b` is a small first check on any of these machines. The provider `local-llm` (in the default configuration, in no tier) and the `pworker models` commands use it: `pworker models runner install llama.cpp-cpu`, then `pworker models run qwen2.5-0.5b-instruct-q4_k_m`, then a tier entry `{ "upstream": "local-llm", "model": "qwen2.5-0.5b-instruct-q4_k_m" }`. `pworker models status` says what runs and why the engine is unavailable when it is; `pworker models hf-token` stores a Hugging Face token (`keys/huggingface.env`, mode 0600, read from hidden input or stdin). A request never downloads weights or installs a runner; with `localLlm.onDemand.enabled` it may start a model whose weights and runner are already there. It keeps the code style of its origin (see [DS006](docs/specs/DS006-engine-coding-style.md)) and is specified in [docs/specs](docs/specs/matrix.md).
+
+| Subpath | Stability | Use |
+| --- | --- | --- |
+| `pworker/local-llm` | stable | `createLocalLlmController({ host, messages, limits, gatewayModelName, env })`, `defineHost`, `defineMessages`, `defineLimits` and the other exports of [DS007](docs/specs/DS007-host-limits-and-messages.md) |
+| `pworker/local-llm/chat` | stable | The pure helpers of a chat responder: request building, completion budgets (`LOCAL_LLM_MAX_COMPLETION_TOKENS`, `LOCAL_LLM_RUNNER_TIMEOUT_MS`) and the runner's speed figures |
+| `pworker/local-llm/runner-process` | stable | Start and supervise a runner process |
+| `pworker/local-llm/runner-install-check` | stable | `runInstallCheck(argv, { host })`, the install check for a runner lock entry |
+| `pworker/local-llm/internal/*` | unstable | Maps to `lib/local-llm/*`. For the local-llms agent only; it carries no compatibility promise |
+
+The engine has no container paths, vendor wording or hardware limits of its own. A host gives it the paths (`defineHost`), the wording (`defineMessages`) and the limits (`defineLimits`, hooks whose identity default limits nothing). It has no default catalog or runner-lock path, and it adds no dependency. `engines` stays `>=22.13`. A `.tar.zst` runner install needs zlib zstd support (`zlib.createZstdDecompress`, Node 22.15 or newer); where it is missing the install is refused with `zstd_unsupported` before anything is downloaded. The test suite (which uses `zstdCompressSync`) is only exercised on newer Node.
+
+## Local servers started on demand
+
+An upstream with a `start` block (see the `local`, `localsuper` and `localnano` entries of `config.default.json`) is a local server that the proxy starts when a request needs it. `lib/local.mjs` runs it through the engine's runner process (`lib/local-llm/controller/runnerProcess.mjs`): the server leads its own process group, its output goes straight to its log file, and a stop signals the whole group. A request to such an upstream first checks `/health` on its port. A healthy server is used as it is, whoever started it; this is also how a server that outlived a crashed or killed proxy is picked up again by the next one. Otherwise the proxy starts the server if the GPU is free, and the request falls back down its tier chain when the server may not or cannot start.
+
+| `start` key | Meaning |
+| --- | --- |
+| `bin`, `gguf`, `alias`, `args` | A `llama-server` over a GGUF file: `bin` is a path or a command name on `PATH`; the proxy adds `-m`, `--host 127.0.0.1`, `--port` (from the upstream's `baseUrl`) and `-a` (`alias`, default the upstream name) before `args` (entries of `args` are passed as strings, so a number works) |
+| `script`, `requires`, `args` | A Node script run with the proxy's Node binary and `--port`, followed by `args`; every file in `requires` must exist |
+| `locks`, `requireFreeGpu` | A start is refused while a lock file exists, and, unless `requireFreeGpu` is `false`, while another program has a compute process on the GPU |
+| `startTimeoutMs` | How long to wait for `/health` after the spawn (default 120000). A server that exits, or does not answer in time, is stopped and the start is refused with the reason in `/stats` (`local.<name>.last_refusal`) |
+| `idleStopMs` | Stop the server after this long without a request. A server with requests in flight or queued is never stopped (0 or missing: never) |
+| `exclusiveGroup` | Servers of one group never run together: starting one first stops the others of the group that this proxy manages, and waits for them to exit |
+| `stopGraceMs` | A stop sends SIGTERM to the server's process group and, when the server has not exited after this long (default 30000, so a long generation is not cut short), SIGKILL; the stop waits for the exit, at most 5 s after the SIGKILL. Earlier versions called this key `stopWaitMs` |
+| `slots`, `ctxPerSlot` | `slots` becomes llama-server's `--parallel` and the upstream's default `limits.maxConcurrent`; with `ctxPerSlot`, `-c` is `slots * ctxPerSlot` (set once in the config, written into `args` when the config is loaded) |
+| `startAtBoot`, `logFile`, `identity` | Start with the proxy; the log file (default `<logDir>/<name>.log`, appended to); the files whose size and mtime identify the model for the cache |
+
+The server starts in the proxy's `baseDir` (relative paths in `start` resolve there) with the proxy's environment. The engine's out-of-memory marking is off for these servers (`oomScoreAdj: null`). A graceful proxy shutdown stops the servers it manages; a proxy that is killed leaves them running.
+
 ## Implementation status
 
 The executor is deterministic and does not plan agentic loops while running. Compiling a text request makes an LLM call on the `good` tier; without an available provider, compilation cannot run, while model-free `.json` tasks can run offline.

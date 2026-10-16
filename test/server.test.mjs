@@ -2,6 +2,7 @@ import './home.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import {createPworkerServer} from '../lib/server.mjs';
@@ -104,4 +105,16 @@ test('a task submitted over HTTP sends its model calls with the submitter\'s pur
     assert.ok(upstream.some(r=>r.purpose==='pworker:tasks'),'a task without tags keeps the server purpose');
     assert.equal(JSON.parse(fs.readFileSync(path.join(root,'jobs',done.id+'.json'),'utf8')).tags.run,'run-42','the tags are kept with the task for a recovery');
   }finally{await server.close();up.close();fs.rmSync(root,{recursive:true,force:true});}
+});
+
+test('close releases the listener and resolves when the home was removed under the server',async()=>{
+  const t=await fixture();
+  const {port}=t.server.address();
+  try {
+    fs.rmSync(t.root,{recursive:true,force:true});
+    await t.server.close();
+    const probe=net.createServer();
+    await new Promise((resolve,reject)=>{probe.once('error',reject);probe.listen(port,'127.0.0.1',resolve);});
+    await new Promise(resolve=>probe.close(resolve));
+  }finally{t.server.server.close();t.server.server.closeAllConnections?.();fs.rmSync(t.root,{recursive:true,force:true});}
 });

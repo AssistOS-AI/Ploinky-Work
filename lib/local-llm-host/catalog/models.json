@@ -1,0 +1,86 @@
+{
+  "schema": "local-llm.catalog/v4",
+  "models": [
+    {
+      "id": "qwen2.5-0.5b-instruct-q4_k_m",
+      "displayName": "Qwen2.5 0.5B Instruct (Q4_K_M)",
+      "description": "A small dense chat model that runs on the CPU of a machine with a few GiB of free RAM; the quickest way to check that a machine can serve a model.",
+      "license": "Apache-2.0",
+      "architecture": "dense",
+      "totalParams": "0.5B",
+      "activeParams": "0.5B",
+      "contextLength": 32768,
+      "profiles": [
+        "cpu",
+        "dedicated",
+        "unified"
+      ],
+      "sources": {
+        "gguf": {
+          "type": "huggingface",
+          "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+          "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+          "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+          "commit": "9217f5db79a29953eb74d5343926648285ec7e67",
+          "size": 491400032,
+          "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
+          "quantization": "Q4_K_M"
+        }
+      },
+      "memory": {
+        "layers": 24,
+        "kvBytesPerToken": 12288
+      },
+      "recommended": {
+        "cpu": {
+          "llama.cpp": {
+            "ctxSize": 4096
+          }
+        }
+      }
+    },
+    {
+      "id": "qwen3-0.6b",
+      "displayName": "Qwen3 0.6B (Q8_0)",
+      "description": "A small dense chat model with thinking and non-thinking modes; light enough for the CPU of a laptop or the GPU of a Mac, and a quick check that a machine can serve a model.",
+      "license": "Apache-2.0",
+      "architecture": "dense",
+      "totalParams": "0.6B",
+      "activeParams": "0.6B",
+      "contextLength": 40960,
+      "profiles": [
+        "cpu",
+        "dedicated",
+        "unified"
+      ],
+      "sources": {
+        "gguf": {
+          "type": "huggingface",
+          "repo": "Qwen/Qwen3-0.6B-GGUF",
+          "file": "Qwen3-0.6B-Q8_0.gguf",
+          "revision": "23749fefcc72300e3a2ad315e1317431b06b590a",
+          "commit": "23749fefcc72300e3a2ad315e1317431b06b590a",
+          "size": 639446688,
+          "sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+          "quantization": "Q8_0"
+        }
+      },
+      "memory": {
+        "layers": 28,
+        "kvBytesPerToken": 114688
+      },
+      "recommended": {
+        "cpu": {
+          "llama.cpp": {
+            "ctxSize": 4096
+          }
+        },
+        "metal": {
+          "llama.cpp": {
+            "ctxSize": 2048
+          }
+        }
+      }
+    }
+  ]
+}

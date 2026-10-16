@@ -1,0 +1,2 @@
+Available devices:
+  Vulkan0: Virtio-GPU Venus (Apple M1) (16384 MiB, 16384 MiB free)

@@ -2,10 +2,14 @@ import './home.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { spawn as realSpawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createProxy } from '../lib/core.mjs';
+import { installKillGuard, killGuard, guardHits, launcherHarness, FAKE_BIN, FAKE_GGUF } from './launcher-safety.mjs';
+
+installKillGuard();
 
 const KEY = 'sk-test-SECRET-KEY-123456';
 const MODELS = { object: 'list', data: [{ id: 'm1', pricing: { prompt: '0.000001', completion: '0.000002', cache_read: '0.0000001' }, quota_multiplier: 2, context_length: 1000 }] };
@@ -419,7 +423,9 @@ async function tierSetup({ primary, secondary, localStart = null, audit = null }
     upstreams: { a: upA, b: { ...upA, baseUrl: `http://127.0.0.1:${b.port}` }, ...(localStart ? { loc: { ...upA, baseUrl: 'http://127.0.0.1:1', noKey: true, keyVar: undefined, start: localStart } } : {}) },
     tiers: { tiny: localStart ? [{ upstream: 'loc', model: 'L' }, { upstream: 'b', model: 'B' }] : [{ upstream: 'b', model: 'B' }], small: [{ upstream: 'a', model: 'A' }, { upstream: 'b', model: 'B' }], good: [{ upstream: 'b', model: 'G' }] },
     audit };
-  const p = createProxy({ config, env: { K: KEY }, dataDir, auditDir: join(dataDir, 'aud'), cacheDir: dataDir + '-cache', starterOptions: { gpuPids: () => [4242] } });
+  const h = launcherHarness();
+  const noSpawn = () => { throw new Error('this test must not start a local server'); };
+  const p = createProxy({ config, env: { K: KEY }, dataDir, auditDir: join(dataDir, 'aud'), cacheDir: dataDir + '-cache', starterOptions: { gpuPids: () => [4242], killImpl: h.killImpl, spawn: noSpawn } });
   const port = await listen(p.server);
   const close = () => { p.server.close(); a.s.close(); b.s.close(); p.server.closeAllConnections?.(); a.s.closeAllConnections?.(); b.s.closeAllConnections?.(); rmSync(dataDir, { recursive: true, force: true }); rmSync(dataDir + '-cache', { recursive: true, force: true }); };
   return { base: `http://127.0.0.1:${port}`, dataDir, close };
@@ -450,7 +456,7 @@ test('tiers: a tier resolves to its first upstream, falls back down its chain, u
 });
 
 test('tiers: a local upstream that may not start (GPU busy) falls back without calling it', async () => {
-  const t = await tierSetup({ primary: echoModel, secondary: echoModel, localStart: { bin: '/bin/true', gguf: '/etc/hostname', requireFreeGpu: true } });
+  const t = await tierSetup({ primary: echoModel, secondary: echoModel, localStart: { bin: FAKE_BIN, gguf: FAKE_GGUF, requireFreeGpu: true } });
   try {
     const r = await ask(t.base, 'tiny');
     assert.equal(r.status, 200);
@@ -565,6 +571,7 @@ test('json tiers: structure and formalizer start a script upstream, forward, cac
   writeFileSync(script, `import http from 'node:http';
 const port = Number(process.argv[process.argv.indexOf('--port') + 1]);
 let calls = 0;
+setTimeout(() => process.exit(0), 60000); // the fixture never outlives a failed test
 http.createServer(async (req, res) => {
   const c = []; for await (const x of req) c.push(x);
   const send = (o) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
@@ -582,7 +589,9 @@ http.createServer(async (req, res) => {
     upstreams: { sm: { baseUrl: `http://127.0.0.1:${free}`, noKey: true, limits: { maxConcurrent: 2, maxPerSecond: 50 }, retry: { max: 0, max5xx: 0, baseMs: 10, maxWaitMs: 100 }, formats: { structure: '/v1/structure', fol: '/v1/fol' },
       start: { script, requireFreeGpu: false, identity: [script], startTimeoutMs: 10000, logFile: join(dir, 'sm.log') } } },
     tiers: { structure: [{ upstream: 'sm', model: 'psm' }], formalizer: [{ upstream: 'sm', model: 'lfm' }] }, cache: { defaultMode: 'use' } };
-  const p = createProxy({ config, env: {}, dataDir, cacheDir: dataDir + '-cache' });
+  // A real fixture child: the starter really spawns it, and its signals are recorded and delivered through the child handle.
+  const h = launcherHarness();
+  const p = createProxy({ config, env: {}, dataDir, cacheDir: dataDir + '-cache', starterOptions: { killImpl: h.killImpl, spawn: (...a) => h.trackReal(realSpawn(...a)) } });
   const port = await listen(p.server);
   const post = (path, b) => fetch(`http://127.0.0.1:${port}${path}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-pworker-purpose': 'test:json-tiers' }, body: JSON.stringify(b) });
   try {
@@ -605,7 +614,7 @@ http.createServer(async (req, res) => {
     assert.ok(recs.some((x) => x.upstream === 'cache' && x.endpoint === '/v1/structure'));
   } finally {
     p.server.close(); p.server.closeAllConnections?.();
-    p.starters.sm.stop();
+    await p.starters.sm.stop();
     rmSync(dataDir, { recursive: true, force: true }); rmSync(dataDir + '-cache', { recursive: true, force: true }); rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -663,29 +672,32 @@ test('prompted tiers: structure and fol through a chat upstream, validation and 
 });
 
 test('local: servers of one exclusive group never run together (starting one stops and awaits the other)', async () => {
-  const { EventEmitter } = await import('node:events');
   const { createLocalStarter, stopPeers } = await import('../lib/local.mjs');
+  const h = launcherHarness();
   const up = new Set(), events = [];
   const spawn = (cmd, argv) => {
-    const port = argv[argv.indexOf('--port') + 1], c = new EventEmitter();
-    c.exitCode = null; c.pid = Number(port);
-    c.kill = () => setTimeout(() => { up.delete(port); c.exitCode = 0; events.push(`exit ${port}`); c.emit('exit', 0); }, 20);
+    const port = argv[argv.indexOf('--port') + 1];
     up.add(port); events.push(`spawn ${port}`);
-    return c;
+    return h.fake(Number(port), { exitDelayMs: 20, onExit: () => { up.delete(port); events.push(`exit ${port}`); } });
   };
   const fetchImpl = async (url) => ({ ok: up.has(new URL(url).port) });
   const logDir = mkdtempSync(join(tmpdir(), 'pworker-excl-'));
-  const st = (n) => ({ bin: '/bin/true', gguf: '/etc/hostname', requireFreeGpu: false, exclusiveGroup: 'moe', logFile: join(logDir, `${n}.log`) });
+  const st = (n) => ({ bin: FAKE_BIN, gguf: FAKE_GGUF, requireFreeGpu: false, exclusiveGroup: 'moe', logFile: join(logDir, `${n}.log`) });
   const cfg = { a: { start: st('a') }, b: { start: st('b') } };
   const starters = {};
-  for (const [n, port] of [['a', 1901], ['b', 1902]]) starters[n] = createLocalStarter({ name: n, baseUrl: `http://127.0.0.1:${port}`, start: cfg[n].start }, { spawn, fetchImpl, gpuPids: () => [], beforeStart: () => stopPeers(n, starters, cfg) });
-  assert.equal(await starters.a.ensure(), true);
-  assert.equal(await starters.b.ensure(), true);
-  assert.deepEqual(events, ['spawn 1901', 'exit 1901', 'spawn 1902']);
-  assert.equal(starters.a.status().managed, false);
-  assert.equal(starters.b.status().managed, true);
-  await starters.b.stop();
-  rmSync(logDir, { recursive: true, force: true });
+  for (const [n, port] of [['a', 1901], ['b', 1902]]) starters[n] = createLocalStarter({ name: n, baseUrl: `http://127.0.0.1:${port}`, start: cfg[n].start }, { spawn, fetchImpl, gpuPids: () => [], killImpl: h.killImpl, beforeStart: () => stopPeers(n, starters, cfg) });
+  try {
+    assert.equal(await starters.a.ensure(), true);
+    assert.equal(await starters.b.ensure(), true);
+    assert.deepEqual(events, ['spawn 1901', 'exit 1901', 'spawn 1902']);
+    assert.equal(starters.a.status().managed, false);
+    assert.equal(starters.b.status().managed, true);
+    // A stop signals the peer's whole process group (negative PID); the SIGKILL after its exit sweeps what the group left behind.
+    assert.deepEqual(h.signals, [[-1901, 'SIGTERM'], [-1901, 'SIGKILL']], 'starting b signals only the peer');
+    await starters.b.stop();
+    assert.deepEqual(h.signals, [[-1901, 'SIGTERM'], [-1901, 'SIGKILL'], [-1902, 'SIGTERM'], [-1902, 'SIGKILL']]);
+    assert.deepEqual(h.fallbackKills, []);
+  } finally { rmSync(logDir, { recursive: true, force: true }); }
 });
 
 test('prompted tiers: a reply cut by its budget is asked again with four times the budget, and usage is reported', async () => {
@@ -719,22 +731,155 @@ test('prompted tiers: the re-ask keeps the better-formed reply and fills what it
 });
 
 test('local: the idle stop never stops a server with requests in flight or queued', async () => {
-  const { EventEmitter } = await import('node:events');
   const { createLocalStarter } = await import('../lib/local.mjs');
-  let running = false, kills = 0, busy = true;
-  const spawn = () => { const c = new EventEmitter(); c.exitCode = null; c.pid = 1; c.kill = () => { kills += 1; running = false; c.exitCode = 0; setTimeout(() => c.emit('exit', 0), 1); }; running = true; return c; };
+  const h = launcherHarness();
+  let running = false, busy = true;
+  const spawn = () => { running = true; return h.fake(1, { onExit: () => { running = false; } }); };
+  const terms = () => h.signals.filter(([, sig]) => sig === 'SIGTERM').length;
   const logDir = mkdtempSync(join(tmpdir(), 'pworker-idle-'));
-  const st = createLocalStarter({ name: 'x', baseUrl: 'http://127.0.0.1:1903', start: { bin: '/bin/true', gguf: '/etc/hostname', requireFreeGpu: false, idleStopMs: 30, logFile: join(logDir, 'x.log') } },
-    { spawn, fetchImpl: async () => ({ ok: running }), gpuPids: () => [], busy: () => busy });
+  const st = createLocalStarter({ name: 'x', baseUrl: 'http://127.0.0.1:1903', start: { bin: FAKE_BIN, gguf: FAKE_GGUF, requireFreeGpu: false, idleStopMs: 30, logFile: join(logDir, 'x.log') } },
+    { spawn, fetchImpl: async () => ({ ok: running }), gpuPids: () => [], busy: () => busy, killImpl: h.killImpl });
   try {
-    running = false;
     assert.equal(await st.ensure(), true);
     await new Promise((r) => setTimeout(r, 150));
-    assert.equal(kills, 0, 'a busy server is not stopped');
+    assert.equal(terms(), 0, 'a busy server is not stopped');
     busy = false;
     await new Promise((r) => setTimeout(r, 150));
-    assert.equal(kills, 1, 'an idle server is stopped');
+    assert.equal(terms(), 1, 'an idle server is stopped');
+    assert.deepEqual(h.signals[0], [-1, 'SIGTERM'], 'the idle stop signals the process group');
+    assert.deepEqual(h.fallbackKills, []);
   } finally { await st.stop(); rmSync(logDir, { recursive: true, force: true }); }
+});
+
+// The local-server starter on a recorded launcher (V21): what it spawns, how a start fails, how a stop escalates, and reuse.
+const startOf = (extra = {}) => ({ bin: FAKE_BIN, gguf: FAKE_GGUF, requireFreeGpu: false, ...extra });
+async function starterOn(h, { start, port = 1905, fetchImpl, spawn, ...options }) {
+  const { createLocalStarter } = await import('../lib/local.mjs');
+  const logDir = mkdtempSync(join(tmpdir(), 'pworker-launch-'));
+  const st = createLocalStarter({ name: 'x', baseUrl: `http://127.0.0.1:${port}`, start: { logFile: join(logDir, 'x.log'), ...start } },
+    { spawn, fetchImpl, gpuPids: () => [], killImpl: h.killImpl, ...options });
+  return { st, logDir, logFile: join(logDir, 'x.log') };
+}
+
+test('local: a server is spawned as its own process group with direct-to-file stdio, the old environment and no OOM mark', async () => {
+  const h = launcherHarness();
+  const calls = [];
+  let running = false;
+  const spawn = (cmd, argv, opts) => { calls.push({ cmd, argv, opts }); running = true; return h.fake(Number(argv[argv.indexOf('--port') + 1]), { onExit: () => { running = false; } }); };
+  const baseDir = mkdtempSync(join(tmpdir(), 'pworker-base-'));
+  const t = await starterOn(h, { port: 1906, spawn, fetchImpl: async () => ({ ok: running }), baseDir, start: startOf({ alias: 'a1', args: ['-ngl', 9] }) });
+  try {
+    assert.equal(await t.st.ensure(), true);
+    const [{ cmd, argv, opts }] = calls;
+    assert.equal(cmd, FAKE_BIN);
+    assert.deepEqual(argv, ['-m', FAKE_GGUF, '--host', '127.0.0.1', '--port', '1906', '-a', 'a1', '-ngl', '9'], 'a numeric start.args entry reaches spawn as a string');
+    assert.ok(argv.every((a) => typeof a === 'string'));
+    assert.equal(opts.detached, true, 'the runner leads its own process group');
+    assert.equal(opts.stdio[0], 'ignore');
+    assert.ok(Number.isInteger(opts.stdio[1]) && opts.stdio[1] === opts.stdio[2], 'stdout and stderr are one file descriptor of the log file, not pipes');
+    assert.equal(opts.env, process.env);
+    assert.equal(opts.cwd, baseDir, 'the runner starts in baseDir');
+    assert.deepEqual(t.st.status(), { managed: true, pid: 1906, last_refusal: null });
+    await t.st.stop();
+    assert.deepEqual(h.signals, [[-1906, 'SIGTERM'], [-1906, 'SIGKILL']]);
+    assert.deepEqual(h.fallbackKills, [], 'the group signals went through killImpl, not the child handle');
+    assert.deepEqual(t.st.status(), { managed: false, pid: null, last_refusal: null });
+  } finally { await t.st.stop(); rmSync(t.logDir, { recursive: true, force: true }); rmSync(baseDir, { recursive: true, force: true }); }
+});
+
+test('local: a script server runs with this Node binary and --port', async () => {
+  const h = launcherHarness();
+  const calls = [];
+  let running = false;
+  const spawn = (cmd, argv, opts) => { calls.push({ cmd, argv }); running = true; return h.fake(1907, { onExit: () => { running = false; } }); };
+  const t = await starterOn(h, { port: 1907, spawn, fetchImpl: async () => ({ ok: running }), start: { script: FAKE_GGUF, args: ['--x', 7] } });
+  try {
+    assert.equal(await t.st.ensure(), true);
+    assert.deepEqual(calls, [{ cmd: process.execPath, argv: [FAKE_GGUF, '--port', '1907', '--x', '7'] }]);
+  } finally { await t.st.stop(); rmSync(t.logDir, { recursive: true, force: true }); }
+});
+
+test('local: a stop that SIGTERM does not end escalates to a recorded SIGKILL of the group after the grace period', async () => {
+  const h = launcherHarness();
+  let running = false;
+  const spawn = () => { running = true; return h.fake(1908, { ignoreTerm: true, onExit: () => { running = false; } }); };
+  const t = await starterOn(h, { port: 1908, spawn, fetchImpl: async () => ({ ok: running }), start: startOf({ stopGraceMs: 80 }) });
+  try {
+    assert.equal(await t.st.ensure(), true);
+    const t0 = Date.now();
+    await t.st.stop();
+    assert.ok(Date.now() - t0 >= 70, 'the SIGKILL waits for the grace period');
+    assert.deepEqual(h.signals, [[-1908, 'SIGTERM'], [-1908, 'SIGKILL'], [-1908, 'SIGKILL']], 'SIGTERM, the escalation, and the sweep after the exit');
+    assert.deepEqual(h.fallbackKills, []);
+    assert.equal(running, false);
+  } finally { rmSync(t.logDir, { recursive: true, force: true }); }
+});
+
+test('local: a healthy port is reused: no spawn, no signal, and the server is not reported as managed', async () => {
+  const h = launcherHarness();
+  let spawned = 0;
+  const t = await starterOn(h, { port: 1909, spawn: () => { spawned += 1; throw new Error('must not spawn'); }, fetchImpl: async () => ({ ok: true }), start: startOf() });
+  try {
+    assert.equal(await t.st.ensure(), true);
+    assert.equal(spawned, 0);
+    assert.deepEqual(t.st.status(), { managed: false, pid: null, last_refusal: null });
+    await t.st.stop();
+    assert.deepEqual(h.signals, []);
+  } finally { rmSync(t.logDir, { recursive: true, force: true }); }
+});
+
+test('local: a server that cannot be spawned, exits during start, or never becomes healthy is refused with its reason', async () => {
+  const h = launcherHarness();
+  // 1. spawn fails (a missing binary arrives as the child's error event).
+  let t = await starterOn(h, { port: 1910, fetchImpl: async () => ({ ok: false }), start: startOf(), spawn: () => { const c = h.fake(undefined); setImmediate(() => c.emit('error', new Error('spawn llama-server ENOENT'))); return c; } });
+  try {
+    assert.equal(await t.st.ensure(), false);
+    assert.match(t.st.status().last_refusal.reason, /exited during start \(spawn llama-server ENOENT\); see .*x\.log/);
+    assert.match(readFileSync(t.logFile, 'utf8'), /\[controller\] runner failed to start: spawn llama-server ENOENT/, 'the controller line goes to the server log file');
+  } finally { rmSync(t.logDir, { recursive: true, force: true }); }
+  // 2. the server exits before it is healthy.
+  t = await starterOn(h, { port: 1911, fetchImpl: async () => ({ ok: false }), start: startOf(), spawn: () => h.fake(1911, { onExit: () => {} }) });
+  try {
+    const first = t.st.ensure();
+    await new Promise((r) => setTimeout(r, 50));
+    h.killImpl(1911, 'SIGTERM'); // the test ends the fake server itself
+    assert.equal(await first, false);
+    assert.match(t.st.status().last_refusal.reason, /exited during start; see /);
+    assert.equal(t.st.status().managed, false);
+  } finally { rmSync(t.logDir, { recursive: true, force: true }); }
+  // 3. it never becomes healthy: the start times out and the group is stopped.
+  h.signals.length = 0;
+  t = await starterOn(h, { port: 1912, fetchImpl: async () => ({ ok: false }), start: startOf({ startTimeoutMs: 100 }), spawn: () => h.fake(1912) });
+  try {
+    assert.equal(await t.st.ensure(), false);
+    assert.equal(t.st.status().last_refusal.reason, 'local server did not become healthy in time');
+    assert.deepEqual(h.signals, [[-1912, 'SIGTERM'], [-1912, 'SIGKILL']], 'the unhealthy server is stopped and awaited before the refusal');
+    assert.equal(t.st.status().managed, false);
+  } finally { rmSync(t.logDir, { recursive: true, force: true }); }
+  assert.deepEqual(h.fallbackKills, []);
+});
+
+test('launcher safety (negative control): a starter built without killImpl reaches the process.kill guard and nothing is signalled', async () => {
+  const { createLocalStarter } = await import('../lib/local.mjs');
+  const h = launcherHarness();
+  let running = false;
+  // A PID above the pid maximum of Linux (4194304) and of macOS (99999): if the guard were ever missing, the signal ends in ESRCH, never in a real process.
+  const PID = 4194304 + 12345;
+  const child = h.fake(PID, { onExit: () => { running = false; } });
+  const logDir = mkdtempSync(join(tmpdir(), 'pworker-neg-'));
+  const st = createLocalStarter({ name: 'neg', baseUrl: 'http://127.0.0.1:1904', start: { bin: FAKE_BIN, gguf: FAKE_GGUF, requireFreeGpu: false, logFile: join(logDir, 'neg.log') } },
+    { spawn: () => { running = true; return child; }, fetchImpl: async () => ({ ok: running }), gpuPids: () => [] });
+  try {
+    assert.equal(process.kill, killGuard, 'the process.kill guard is installed (the control fails closed without it)');
+    assert.equal(await st.ensure(), true);
+    const stopping = st.stop();
+    assert.deepEqual(guardHits, [[-PID, 'SIGTERM']], 'the default process.kill was reached and blocked');
+    assert.deepEqual(h.signals, [], 'no signal was recorded through an injected killImpl');
+    assert.deepEqual(h.fallbackKills, [[PID, 'SIGTERM']], 'the launcher fell back to the fake child handle');
+    child.deliver('SIGTERM');
+    await stopping;
+    assert.deepEqual(h.signals, [], 'still nothing recorded through killImpl');
+  } finally { guardHits.length = 0; rmSync(logDir, { recursive: true, force: true }); }
 });
 
 test('plan limits: a background share below one call still holds the limit', async () => {

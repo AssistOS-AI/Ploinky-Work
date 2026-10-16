@@ -258,6 +258,25 @@
         "startAtBoot": false
       }
     },
+    "local-llm": {
+      "_note": "The engine of lib/local-llm-host: one model at a time, started with `pworker models run <id>` (weights are downloaded there, never by a chat request), served over a Unix socket. No tier uses it by default; add it to a tier with `{ \"upstream\": \"local-llm\", \"model\": \"<catalog id>\" }`.",
+      "kind": "local-llm",
+      "baseUrl": "http://localhost",
+      "noKey": true,
+      "modelsPath": "/v1/models",
+      "formats": {
+        "openai": "/v1/chat/completions"
+      },
+      "limits": {
+        "maxConcurrent": 1
+      },
+      "retry": {
+        "max": 0,
+        "max5xx": 0,
+        "baseMs": 500,
+        "maxWaitMs": 5000
+      }
+    },
     "openai": {
       "baseUrl": "https://api.openai.com",
       "envFile": "openai.env",
