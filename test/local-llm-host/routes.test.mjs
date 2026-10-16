@@ -151,3 +151,54 @@ test('a runner log line or a deployment field that echoes the key of the run or 
     assert.equal(sent[0][1].logs[0].text, 'argv: llama-server --api-key *** HF_TOKEN=***');
     assert.equal(sent[0][1].phase, 'ready');
 });
+
+// run and preview without a runnerId: the route picks the gate's default for the machine's profile instead of handing the engine undefined.
+function defaultRunnerRoutes({ profile, runners }) {
+    const calls = [];
+    const controller = {
+        overview: async (options) => { calls.push(['overview', options?.preview?.runnerId]); return { profile, runners, preview: options?.preview ?? null }; },
+        run: async (input) => { calls.push(['run', input.runnerId]); return { accepted: true }; },
+    };
+    const host = { redact: (text) => text, current: () => null, controller: async () => controller, describe: () => ({ runners: [], ownership: {} }) };
+    const call = async (route, body) => {
+        const sent = [];
+        const req = Object.assign(Readable.from([Buffer.from(JSON.stringify(body))]), { method: 'POST' });
+        await createLocalLlmRoutes({ host })(req, {}, new URL(`http://x/v1/local-llm/${route}`), { sendJson: (res, status, answer) => sent.push([status, answer]) });
+        return sent[0];
+    };
+    return { calls, call };
+}
+const BOTH = [{ id: 'llama.cpp', supported: true }, { id: 'llama.cpp-cpu', supported: true }];
+
+test('run without runnerId uses llama.cpp-cpu on the cpu profile and llama.cpp on dedicated and unified', async () => {
+    for (const [profile, expected] of [['cpu', 'llama.cpp-cpu'], ['dedicated', 'llama.cpp'], ['unified', 'llama.cpp']]) {
+        const { calls, call } = defaultRunnerRoutes({ profile, runners: BOTH });
+        const [status] = await call('run', { modelId: MODEL });
+        assert.equal(status, 202, profile);
+        assert.deepEqual(calls.filter(([name]) => name === 'run'), [['run', expected]], profile);
+    }
+    const named = defaultRunnerRoutes({ profile: 'cpu', runners: BOTH });
+    await named.call('run', { modelId: MODEL, runnerId: 'llama.cpp' });
+    assert.deepEqual(named.calls, [['run', 'llama.cpp']], 'a runner the caller names is passed through untouched');
+});
+
+test('preview without runnerId asks the engine about the default runner', async () => {
+    const { calls, call } = defaultRunnerRoutes({ profile: 'cpu', runners: BOTH });
+    const [status] = await call('preview', { modelId: MODEL });
+    assert.equal(status, 200);
+    assert.deepEqual(calls.filter(([, runner]) => runner !== undefined), [['overview', 'llama.cpp-cpu']]);
+});
+
+test('run or preview without runnerId on a machine whose default runner is unsupported is a 409 that names --runner, and nothing runs', async () => {
+    for (const route of ['run', 'preview']) {
+        const { calls, call } = defaultRunnerRoutes({ profile: 'dedicated', runners: [{ id: 'llama.cpp', supported: false, unsupportedReason: 'no NVIDIA driver' }] });
+        const [status, answer] = await call(route, { modelId: MODEL });
+        assert.equal(status, 409, route);
+        assert.equal(answer.error.type, 'runner_unsupported');
+        assert.match(answer.error.message, /--runner/);
+        assert.match(answer.error.message, /no NVIDIA driver/);
+        assert.equal(calls.some(([name]) => name === 'run'), false);
+    }
+    const missing = defaultRunnerRoutes({ profile: 'cpu', runners: [] });
+    assert.equal((await missing.call('run', { modelId: MODEL }))[0], 409, 'a runner the engine does not list');
+});

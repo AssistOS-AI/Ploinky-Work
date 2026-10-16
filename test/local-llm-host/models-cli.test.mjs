@@ -182,3 +182,13 @@ test('the binary: models stop NAME still posts to /v1/local/NAME/stop, models st
     await bin(home, ['models', 'start', 'localnano']);
     assert.ok(requests.includes('POST /v1/local/localnano/start'), requests.join(', '));
 });
+
+test('models run and preview without --runner send no runnerId at all (never the string "undefined")', async () => {
+    const seen = [];
+    const client = { engine: { run: async (body) => { seen.push(['run', body]); return { accepted: true, deployment: { phase: 'ready', modelId: body.modelId } }; }, preview: async (body) => { seen.push(['preview', body]); return { preview: {} }; }, overview: async () => ({ runners: [] }), status: async () => ({ deployment: { phase: 'ready', modelId: 'm' } }) } };
+    const c = cliIo();
+    await runEngineVerb({ args: ['models', 'run', 'some-model', '--detach'], client, io: c.io, pollMs: 5, lineMs: 0 });
+    await runEngineVerb({ args: ['models', 'preview', 'some-model'], client, io: cliIo().io, pollMs: 5, lineMs: 0 });
+    assert.deepEqual(seen.map(([name]) => name), ['run', 'preview']);
+    for (const [, body] of seen) assert.equal(JSON.stringify(body).includes('runnerId'), false, JSON.stringify(body));
+});
