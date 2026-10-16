@@ -30,9 +30,17 @@ test('without PWORKER_LIVE_ENGINE=1 the smoke script refuses, with exit 2, and c
 
 test('a bad option or probe is refused before anything starts, even with the variable set', (t) => {
     const out = path.join(scratch(t), 'out');
-    for (const args of [['--out', out, '--probe', 'nonsense'], ['--out', out, '--bogus'], ['--probe', 'ready-kill']]) {
+    // Off Linux the platform refusal comes first; the message is asserted either way, so a bad option is never satisfied by it unnoticed.
+    const platform = /Refusing to run on \w+: the standalone engine is Linux-only/;
+    const cases = [
+        [['--out', out, '--probe', 'nonsense'], /Unknown probe nonsense; use ready-kill or record-kill\./],
+        [['--out', out, '--bogus'], /Unknown or incomplete option --bogus/],
+        [['--probe', 'ready-kill'], /^Usage: PWORKER_LIVE_ENGINE=1 node test\/live\/engine-smoke\.mjs --out DIR/],
+    ];
+    for (const [args, message] of cases) {
         const result = smoke(args, { PWORKER_LIVE_ENGINE: '1' });
         assert.equal(result.status, 2, args.join(' '));
+        assert.match(result.stderr, process.platform === 'linux' ? message : platform, args.join(' '));
     }
     assert.equal(fs.existsSync(out), false);
 });
