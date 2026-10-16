@@ -34,6 +34,7 @@ test('a bad option or probe is refused before anything starts, even with the var
     const platform = /Refusing to run on \w+: the standalone engine is Linux-only/;
     const cases = [
         [['--out', out, '--probe', 'nonsense'], /Unknown probe nonsense; use ready-kill or record-kill\./],
+        [['--out', out, '--home', path.join(path.dirname(out), 'missing-home')], /--home .*missing-home is not an existing folder; create an empty one or omit --home/],
         [['--out', out, '--bogus'], /Unknown or incomplete option --bogus/],
         [['--probe', 'ready-kill'], /^Usage: PWORKER_LIVE_ENGINE=1 node test\/live\/engine-smoke\.mjs --out DIR/],
     ];

@@ -71,6 +71,10 @@ const probe = args.values.probe ?? null;
 if (probe !== null && !['ready-kill', 'record-kill'].includes(probe)) refuse(`Unknown probe ${probe}; use ready-kill or record-kill.`);
 const crashAt = args.values.at ?? 'after-spawn';
 if (!['after-spawn', 'after-intent'].includes(crashAt)) refuse(`Unknown --at ${crashAt}; use after-spawn or after-intent.`);
+if (args.values.home !== undefined) {
+    const named = path.resolve(args.values.home);
+    if (!fs.existsSync(named) || !fs.statSync(named).isDirectory()) refuse(`--home ${named} is not an existing folder; create an empty one or omit --home`);
+}
 const model = args.values.model ?? DEFAULT_MODEL;
 const timeoutMs = Number(args.values['timeout-min'] ?? 40) * 60_000;
 
