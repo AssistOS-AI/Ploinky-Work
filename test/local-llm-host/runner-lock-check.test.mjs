@@ -1,6 +1,6 @@
-// The runner-lock-check workflow and the checks it runs (lib/local-llm-host/lockcheck.mjs, elf.mjs). The real proof of a lock is the
-// workflow's own run on a Linux runner of each architecture; these tests keep the workflow honest about WHAT it runs (every Linux host
-// lock, never skipped, pinned actions, no push trigger) and keep the checks able to fail.
+// The runner-lock-check workflow and the checks it runs (lib/local-llm-host/lockcheck.mjs, elf.mjs, macho.mjs). The real proof of a lock
+// is the workflow's own run on a runner of each OS and architecture; these tests keep the workflow honest about WHAT it runs (every host
+// lock, Linux and darwin, never skipped, pinned actions, no push trigger) and keep the checks able to fail.
 import '../home.mjs';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -13,7 +13,8 @@ import { fileURLToPath } from 'node:url';
 import { classifyMissingLibraries } from '../../lib/local-llm/tools/runnerInstallCheck.mjs';
 import { loadRunnerLock } from '../../lib/local-llm/controller/runnerLock.mjs';
 import { findElfFiles, strictLibraryCheck } from '../../lib/local-llm-host/elf.mjs';
-import { checkLock, reportProblems } from '../../lib/local-llm-host/lockcheck.mjs';
+import { strictLibraryCheck as strictMachoCheck } from '../../lib/local-llm-host/macho.mjs';
+import { checkLock, checksFor, reportProblems } from '../../lib/local-llm-host/lockcheck.mjs';
 import { scratch } from './fixtures/engine.mjs';
 
 const ROOT = fileURLToPath(new URL('../..', import.meta.url));
@@ -21,6 +22,7 @@ const WORKFLOW = path.join(ROOT, '.github', 'workflows', 'runner-lock-check.yml'
 const LOCK_DIR = path.join(ROOT, 'lib', 'local-llm-host', 'locks');
 const text = fs.readFileSync(WORKFLOW, 'utf8');
 const lockFiles = fs.readdirSync(LOCK_DIR).filter((name) => /^runners\.lock\.host-linux-[a-z0-9]+\.json$/.test(name)).sort();
+const darwinLockFiles = fs.readdirSync(LOCK_DIR).filter((name) => /^runners\.lock\.host-darwin-[a-z0-9]+\.json$/.test(name)).sort();
 
 test('the workflow runs on pull_request and workflow_dispatch only, with read-only contents, and no job is conditional', () => {
     const triggers = /^on:\n((?: {2}.*\n)+)/m.exec(text)[1].split('\n').filter(Boolean).map((line) => line.trim().replace(/:$/, ''));
@@ -28,9 +30,10 @@ test('the workflow runs on pull_request and workflow_dispatch only, with read-on
     assert.match(text, /^permissions:\n {2}contents: read\n/m);
     assert.ok(!/^\s*paths(-ignore)?:/m.test(text), 'no path filter');
     assert.ok(!/^\s+if: .*(needed|changes|paths)/m.test(text), 'no change detection');
-    // Only the final job and the always-run steps carry an `if`, and each is `always()`.
+    // Only the final job and the always-run steps carry an `if`, each `always()`, except the Linux-only disk step (on the OS, never on a result).
     const conditions = [...text.matchAll(/^\s+if: (.*)$/gm)].map((match) => match[1]);
-    assert.ok(conditions.length > 0 && conditions.every((condition) => condition === '${{ always() }}'), conditions.join(' | '));
+    assert.ok(conditions.length > 0 && conditions.every((condition) => condition === '${{ always() }}' || condition === "${{ runner.os == 'Linux' }}"), conditions.join(' | '));
+    assert.match(text, /- name: Free runner disk\n(?: {8}#.*\n)* {8}if: \$\{\{ runner\.os == 'Linux' \}\}/, 'the disk step is Linux-only');
 });
 
 test('every action is pinned to a full commit sha, and the pull request head is the revision under test', () => {
@@ -48,12 +51,19 @@ test('every action is pinned to a full commit sha, and the pull request head is 
     assert.match(text, /GITHUB_SHA/);
 });
 
-test('the matrix lists exactly the Linux host locks that exist, one arch each, amd64 on ubuntu-24.04 and arm64 on ubuntu-24.04-arm', () => {
+test('the matrix lists exactly the host locks that exist (Linux and darwin), one leg each, on a runner of that architecture', () => {
     const listed = [...text.matchAll(/^\s+lock: (\S+)$/gm)].map((match) => match[1]).sort();
-    assert.deepEqual(listed, lockFiles.map((name) => `lib/local-llm-host/locks/${name}`));
+    assert.deepEqual(listed, [...lockFiles, ...darwinLockFiles].sort().map((name) => `lib/local-llm-host/locks/${name}`));
     assert.deepEqual(lockFiles, ['runners.lock.host-linux-amd64.json', 'runners.lock.host-linux-arm64.json']);
-    const runsOn = Object.fromEntries([...text.matchAll(/- arch: (\w+)\n\s+machine: (\w+)\n\s+runs-on: (\S+)\n/g)].map((match) => [match[1], { machine: match[2], runsOn: match[3] }]));
-    assert.deepEqual(runsOn, { amd64: { machine: 'x86_64', runsOn: 'ubuntu-24.04' }, arm64: { machine: 'aarch64', runsOn: 'ubuntu-24.04-arm' } });
+    assert.deepEqual(darwinLockFiles, ['runners.lock.host-darwin-amd64.json', 'runners.lock.host-darwin-arm64.json']);
+    const runsOn = Object.fromEntries([...text.matchAll(/- arch: ([\w-]+)\n\s+machine: (\w+)\n\s+runs-on: (\S+)\n\s+lock: (\S+)\n/g)].map((match) => [match[1], { machine: match[2], runsOn: match[3], lock: path.basename(match[4]) }]));
+    assert.deepEqual(runsOn, {
+        amd64: { machine: 'x86_64', runsOn: 'ubuntu-24.04', lock: 'runners.lock.host-linux-amd64.json' },
+        arm64: { machine: 'aarch64', runsOn: 'ubuntu-24.04-arm', lock: 'runners.lock.host-linux-arm64.json' },
+        'darwin-arm64': { machine: 'arm64', runsOn: 'macos-15', lock: 'runners.lock.host-darwin-arm64.json' },
+        'darwin-x64': { machine: 'x86_64', runsOn: 'macos-15-intel', lock: 'runners.lock.host-darwin-amd64.json' },
+    });
+    assert.match(text, /\[ "\$\(uname -m\)" = "\$MACHINE" \]/, 'a wrong label fails instead of running under Rosetta');
     assert.match(text, /fail-fast: false/);
     assert.match(text, /needs: \[install-check\]/, 'the final job waits for every architecture');
     assert.match(text, /\[ "\$INSTALLED" = success \] \|\| /, 'and fails unless the matrix succeeded');
@@ -66,18 +76,19 @@ test('the step runs lockcheck.mjs on the matrix lock with a work and an out fold
     assert.ok(fs.existsSync(path.join(ROOT, 'lib', 'local-llm-host', 'lockcheck.mjs')));
 });
 
-test('each Linux host lock validates with the engine\'s validator, requires an executable and pins b11295 for every entry', () => {
-    for (const name of lockFiles) {
+test('each host lock validates with the engine\'s validator, requires an executable and pins b11295 for every entry', () => {
+    for (const name of [...lockFiles, ...darwinLockFiles]) {
         const lock = loadRunnerLock(path.join(LOCK_DIR, name), { requireExecutable: true });
         const ids = Object.keys(lock.runners).sort();
-        assert.deepEqual(ids, ['llama.cpp', 'llama.cpp-cpu'], name);
+        // Linux locks carry the CUDA and the CPU build; the darwin-arm64 lock the Metal build, the darwin-amd64 lock the CPU build.
+        assert.deepEqual(ids, name.includes('darwin-arm64') ? ['llama.cpp'] : name.includes('darwin-amd64') ? ['llama.cpp-cpu'] : ['llama.cpp', 'llama.cpp-cpu'], name);
         for (const id of ids) {
             assert.equal(lock.runners[id].version, 'b11295', `${name} ${id}`);
             assert.equal(lock.runners[id].kind, 'archive');
             assert.equal(typeof lock.runners[id].check.executable, 'string', `${name} ${id} names the file it launches`);
         }
-        // The CUDA entry ships its runtime in a second archive.
-        assert.equal(lock.runners['llama.cpp'].files.length, 2, name);
+        // The Linux CUDA entry ships its runtime in a second archive; the macOS entries are one archive each.
+        assert.equal(lock.runners[ids[0]].files.length, name.includes('linux') && ids[0] === 'llama.cpp' ? 2 : 1, name);
     }
 });
 
@@ -220,4 +231,26 @@ test('with the real ldd, a copy of a system binary resolves its libraries (Linux
     assert.equal(result.checked, 1);
     assert.equal(result.ok, true, result.problems.join());
     assert.ok(os.platform() === 'linux');
+});
+
+test('the platform picks the installer\'s checks: Linux the defaults, macOS the Mach-O check, and any other platform is refused', async () => {
+    assert.equal(checksFor('linux').strict, strictLibraryCheck);
+    assert.throws(() => checksFor('win32'), /linux and darwin/);
+    assert.equal(checksFor('darwin').strict, strictMachoCheck);
+    // A lock that cannot be read fails the install check itself (no download); it resolves with a report rather than throwing.
+    const { report } = await checksFor('darwin').installCheck(['llama.cpp', '--lock', '/nonexistent/lock.json']);
+    assert.equal(report.ok, false);
+});
+
+test('the strict check is told which file the entry launches, so @executable_path means the launched program\'s directory', async (t) => {
+    const out = scratch(t);
+    const seen = [];
+    const installCheck = async (args) => {
+        fs.mkdirSync(path.join(args[args.indexOf('--run-root') + 1], args[0], 'b11295'), { recursive: true });
+        return { report: { ...GOOD_REPORT, runnerId: args[0] }, code: 0 };
+    };
+    const strict = (dir, options) => { seen.push(options); return { ok: true, problems: [] }; };
+    const result = await checkLock({ lockFile: path.join(LOCK_DIR, darwinLockFiles[0]), outDir: path.join(out, 'o'), workDir: path.join(out, 'w'), installCheck, strict, platform: 'darwin' });
+    assert.equal(result.ok, true);
+    assert.deepEqual(seen, [{ executable: 'llama-server' }]);
 });

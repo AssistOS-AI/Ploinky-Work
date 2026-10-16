@@ -1,4 +1,4 @@
-# The install check of the host runner locks of pworker (lib/local-llm-host/locks/runners.lock.host-linux-<arch>.json, DS008).
+# The install check of the host runner locks of pworker (lib/local-llm-host/locks/runners.lock.host-<os>-<arch>.json, DS008).
 #
 # A lock entry reaches users with the revision they run: `pworker models runner install` downloads exactly the files the lock pins,
 # verifies them, unpacks them and launches the result. This workflow proves, on each architecture's own runner and for EVERY entry of
@@ -8,6 +8,11 @@
 # (lib/local-llm-host/elf.mjs) and fails on any library that is not found, except libcuda.so.1, which only the NVIDIA driver supplies
 # (a GitHub runner has no GPU, so the CUDA build is checked up to its driver library).
 #
+# The darwin-arm64 (macos-15) and darwin-x64 (macos-15-intel) legs run the same chain with the macOS platform (bsdtar's `-m`): macOS has
+# no `ldd`, so lockcheck.mjs reads every Mach-O file the copy ships with `otool -L` and `otool -l` (lib/local-llm-host/macho.mjs) and
+# fails on any dependency that is neither a system library (/usr/lib, /System/Library) nor an @rpath, @loader_path or @executable_path
+# name that resolves to a file inside the copy. The `uname -m` guard keeps a wrong label from running a lock under Rosetta.
+#
 # It runs for every pull request and on demand, never on a push, and never skips: there is no path detection, every run installs
 # everything. `workflow_dispatch` needs the workflow to be registered, which GitHub does when it runs on a branch for the first time
 # (a pull_request run does that); after that `gh workflow run runner-lock-check.yml --ref <branch>` works.
@@ -15,9 +20,8 @@
 # THE GATE HOLDS ONLY ONCE `runner-lock-check` IS A REQUIRED STATUS CHECK ON THE DEFAULT BRANCH (a repository setting, not something
 # this file can turn on).
 #
-# P6 (macOS): add the darwin-arm64 and darwin-x64 locks as further matrix entries below if lockcheck.mjs can run there. macOS has no
-# `ldd` (it uses `otool -L`), so the darwin jobs more likely need a job of their own with their own library check; if so, add it to
-# the `needs` list of the final job. The final job is the one status to require.
+# The final job `runner-lock-check` is the one status to require: it waits for all four legs (Linux amd64 and arm64, darwin-arm64 and
+# darwin-x64) and is red unless every one of them succeeded.
 
 name: runner-lock-check
 
@@ -47,7 +51,14 @@ jobs:
             machine: aarch64
             runs-on: ubuntu-24.04-arm
             lock: lib/local-llm-host/locks/runners.lock.host-linux-arm64.json
-          # P6: darwin-arm64 and darwin-x64 (see the note at the top).
+          - arch: darwin-arm64
+            machine: arm64
+            runs-on: macos-15
+            lock: lib/local-llm-host/locks/runners.lock.host-darwin-arm64.json
+          - arch: darwin-x64
+            machine: x86_64
+            runs-on: macos-15-intel
+            lock: lib/local-llm-host/locks/runners.lock.host-darwin-amd64.json
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 90
     env:
@@ -77,7 +88,7 @@ jobs:
             echo "pull request head: ${PR_HEAD_SHA:-none}"
             echo "lock: $LOCK"
             echo "architecture: $ARCH (expected machine $MACHINE, uname -m $(uname -m))"
-            echo "ldd: $(ldd --version | head -n 1)"
+            if [ "$(uname -s)" = Linux ]; then echo "ldd: $(ldd --version | head -n 1)"; else echo "otool: $(/usr/bin/otool --version 2>&1 | head -n 1)"; fi
           } | tee "$out/revision.txt"
           # The label of the runner decides the architecture; a lock must never be checked on the other one.
           [ "$(uname -m)" = "$MACHINE" ] || { echo "this runner is $(uname -m), not $MACHINE"; exit 1; }
@@ -93,6 +104,8 @@ jobs:
           node-version: 24
 
       - name: Free runner disk
+        # Linux only: these paths are not on a macOS runner (and the macOS entries are 12 MB archives).
+        if: ${{ runner.os == 'Linux' }}
         # The CUDA runtime archives are about 0.55 to 0.6 GB each, and an archive is downloaded and unpacked.
         run: |
           set -euo pipefail
@@ -101,7 +114,7 @@ jobs:
 
       - name: Install every lock entry and check its libraries
         # lockcheck.mjs fails when the lock has no entry, when any entry fails (a report that is not ok, was not downloaded, or does
-        # not name EXPECT_VERSION) and when any ELF file has a library that is not found other than libcuda.so.1. It goes on after a
+        # not name EXPECT_VERSION) and when any ELF file (Mach-O file on macOS) has a library that is not found other than libcuda.so.1. It goes on after a
         # failed entry so that the report covers all of them.
         run: |
           set -euo pipefail
