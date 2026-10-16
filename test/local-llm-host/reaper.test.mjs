@@ -78,6 +78,28 @@ test('a matching record: the group is sent SIGTERM and, once the runner is gone,
     assert.deepEqual(result, { reaped: ['aaaaaaaa'], skipped: [], failed: [] });
     assert.equal(fs.existsSync(sock), false, 'the socket file was removed');
     assert.equal(fs.existsSync(path.join(w.launchDir, 'aaaaaaaa.json')), false, 'the record was removed');
+    assert.ok(w.logs.some((line) => /sent SIGTERM to the orphaned runner aaaaaaaa \(pid 4100\)/.test(line)), w.logs.join('\n'));
+});
+
+test('a runner that is gone before the first signal is logged as already gone: no signal is sent and no line claims it was ended', async (t) => {
+    const w = world(t);
+    const sock = socketOf(w, 'a1a1a1a1');
+    writeProc(w.procDir, { pid: 4150, startTime: '5050', argv: runnerArgv(sock) });
+    writeRecord(w, 'a1a1a1a1', { phase: 'spawned', pid: 4150, startTime: '5050' });
+    // The runner disappears after the reaper found it (its first /proc listing) and before it signals (the group listing that follows).
+    let listings = 0;
+    const fsApi = Object.create(fs, { readdirSync: { value: (...args) => {
+        const out = fs.readdirSync(...args);
+        if (String(args[0]) === w.procDir && ++listings === 2) removeProc(w.procDir, 4150);
+        return out;
+    } } });
+    const kill = recordingKill();
+    const result = await reap(w, { killImpl: kill, fsApi });
+    assert.ok(listings >= 2, 'the hook fired');
+    assert.deepEqual(kill.calls, [], 'nothing was signalled');
+    assert.deepEqual(result.reaped, ['a1a1a1a1']);
+    assert.ok(w.logs.some((line) => /orphaned runner a1a1a1a1 \(pid 4150\) was already gone; no signal was sent/.test(line)), w.logs.join('\n'));
+    assert.ok(w.logs.every((line) => !/sent SIG|ended the orphaned/.test(line)), w.logs.join('\n'));
 });
 
 test('a runner that ignores SIGTERM gets SIGKILL for its group after the grace period, and a survivor keeps its record', async (t) => {

@@ -122,7 +122,7 @@ test('the owner reaps at acquire: the orphan of an earlier process is ended befo
     const result = await host.acquire();
     assert.deepEqual(kill.calls, [[-4200, 'SIGTERM']]);
     assert.deepEqual(result.reaped.reaped, ['abcdef02']);
-    assert.ok(logs.some((line) => /ended the orphaned runner abcdef02/.test(line)));
+    assert.ok(logs.some((line) => /sent SIGTERM to the orphaned runner abcdef02 \(pid 4200\)/.test(line)));
 });
 
 test('a predecessor that is still draining is waited for; one that never leaves is a final owner_held for that wait, and a later attempt can succeed', async (t) => {

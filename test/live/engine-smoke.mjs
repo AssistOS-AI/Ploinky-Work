@@ -441,7 +441,7 @@ async function stepStopProxy() {
 
 /** Whether the reaper's log says it found nothing to end for this start (the runner was gone, or the pid no longer is the runner). */
 function reaperFoundNothing(log, startId) {
-    return new RegExp(`launch record ${startId} named no live runner|pid \\d+ of launch record ${startId} is not that runner any more`).test(log);
+    return new RegExp(`launch record ${startId} named no live runner|pid \\d+ of launch record ${startId} is not that runner any more|orphaned runner ${startId} \\(pid \\d+\\) was already gone`).test(log);
 }
 
 async function killServeHard() {
@@ -472,9 +472,9 @@ async function probeReadyKill() {
         started.push({ pid: newPid, startTime: readStartTime(newPid), what: 'serve (started by pworker start)' });
         await waitFor('the orphan to be gone', () => !runnerIdentity(launch).alive, { waitMs: 30_000 });
         const log = fs.readFileSync(path.join(home, 'logs', 'pworker.log'), 'utf8');
-        const evidence = new RegExp(`ended the orphaned runner ${launch.startId} \\(pid ${launch.pid}\\)`).exec(log);
+        const evidence = new RegExp(`sent SIGTERM[^\\n]* to the orphaned runner ${launch.startId} \\(pid ${launch.pid}\\)`).exec(log);
         if (!evidence && reaperFoundNothing(log, launch.startId)) inconclusive(`the reaper found no live runner for ${launch.startId}: the orphan died before it ran`);
-        need(evidence, `the proxy log has no "ended the orphaned runner ${launch.startId} (pid ${launch.pid})" line`);
+        need(evidence, `the proxy log has no "sent SIGTERM to the orphaned runner ${launch.startId} (pid ${launch.pid})" line`);
         need(pidsWith(launch.socketPath).length === 0, 'a process still names the orphan\'s socket');
         need(!fs.existsSync(launch.socketPath), 'the orphan\'s socket file is still there');
         need(readLaunchRecords().length === 0, 'a launch record is left');
@@ -519,7 +519,7 @@ async function probeRecordKill() {
         started.push({ pid: newPid, startTime: readStartTime(newPid), what: 'serve (started by pworker start)' });
         await waitFor('the child to be gone', () => pidsWith(leftover.socketPath).length === 0, { waitMs: 30_000 });
         const log = fs.readFileSync(path.join(home, 'logs', 'pworker.log'), 'utf8');
-        const reaped = crashAt === 'after-spawn' ? new RegExp(`ended the orphaned runner ${leftover.startId}`).test(log) : new RegExp(`launch record ${leftover.startId} named no live runner; removed`).test(log);
+        const reaped = crashAt === 'after-spawn' ? new RegExp(`sent SIGTERM[^\\n]* to the orphaned runner ${leftover.startId} \\(pid \\d+\\)`).test(log) : new RegExp(`launch record ${leftover.startId} named no live runner; removed`).test(log);
         if (!reaped && crashAt === 'after-spawn' && reaperFoundNothing(log, leftover.startId)) inconclusive(`the reaper found no live runner for ${leftover.startId}: the child died before it ran`);
         need(reaped, `the proxy log has no reaper line for ${leftover.startId}`);
         need(pidsWith(layout.sockets).length === 0, 'a process of the home still names the socket directory');
