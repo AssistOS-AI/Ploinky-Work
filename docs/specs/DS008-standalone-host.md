@@ -107,10 +107,10 @@ A tier entry `{ "upstream": "local-llm", "model": "<catalog id>", "runner": "<id
 | `GET /v1/local-llm/status?sinceSeq=N` | Phase, deployment, download progress, log lines since `N`, `startedBy` (`admin` or `on-demand`) |
 | `POST /v1/local-llm/preview` | `{ modelId, runnerId?, params? }`: the admission verdict, no process |
 | `POST /v1/local-llm/run` | `{ modelId, runnerId?, params?, replace?, requestId? }`: 202 `{ accepted \| duplicate, deployment }`; a repeated `requestId` is a duplicate |
-
-Without `runnerId`, `preview` and `run` use the profile's default runner, the one the gate also picks: `llama.cpp-cpu` on the `cpu` profile, `llama.cpp` on `dedicated` and `unified`. When that runner is not supported on this machine, both answer 409 `runner_unsupported`, name the reason and point at `--runner`; nothing runs.
 | `POST /v1/local-llm/stop`, `/cancel` | Stop the deployment; cancel its download (409 `not_downloading` when there is none). Neither creates the engine |
 | `POST /v1/local-llm/weights/delete`, `/models/lookup`, `/models/add`, `/models/update`, `/models/remove`, `/runners/<id>/install`, `/runners/<id>/uninstall` | The engine's operations of the same names |
+
+Without `runnerId`, `preview` and `run` use the profile's default runner, the one the gate also picks: `llama.cpp-cpu` on the `cpu` profile, `llama.cpp` on `dedicated` and `unified`. When that runner is not supported on this machine, both answer 409 `runner_unsupported`, name the reason and point at `--runner`; nothing runs.
 
 Errors are `{ error: { type, message } }` with the message redacted. A body that is not a JSON object is 400 `invalid_json`, one above 32 MiB is 413, an unknown model or runner is 404, a conflict (busy, in use, runner not installed, licence needed) is 409, an admission refusal is 422, a failed Hugging Face lookup is 502 and an engine that is unavailable is 503.
 
