@@ -21,6 +21,7 @@ summary: What the local-llm engine in lib/local-llm is, which hosts embed it, an
 | Hardware profiles: NVIDIA dedicated and unified memory, CPU, Vulkan (RADV, Venus, experimental APU), their detection, admission and guards | DS005 |
 | Coding conventions and layout of the engine subtree | DS006 |
 | The host, messages and limits that the engine takes as input, and the public exports | DS007 |
+| The standalone pworker host: ownership of a home, launch records, the reaper, Unix-socket runners and the host runner locks (not part of the engine; `lib/local-llm-host`) | DS008 |
 
 The runners are llama.cpp, its CPU and Vulkan builds, ik_llama.cpp, Ollama, vLLM, ExLlamaV3 with TabbyAPI, and LM Studio. LM Studio is for internal use only and sits behind an operator switch. A runner is an adapter plus data: the controller has no per-runner branches.
 

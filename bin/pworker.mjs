@@ -460,6 +460,7 @@ async function main() {
     const { serve } = await import('../lib/server.mjs');
     const proxy = await serve({ port: option('port'), host: option('host') });
     if (proxy?.already) process.exitCode = 3;
+    if (proxy?.conflict) process.exitCode = 4;
     return;
   }
   if (command === 'start') { await startProxy(); console.log('Proxy started.'); return; }

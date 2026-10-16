@@ -10,3 +10,4 @@
 | [DS005-hardware-profiles](DS005-hardware-profiles.md) | NVIDIA dedicated and unified memory, CPU fallback, discrete AMD Vulkan, experimental shared-memory AMD APU and Apple Venus profiles, their detection, admission and memory guards. |
 | [DS006-engine-coding-style](DS006-engine-coding-style.md) | Language, layout, conventions and tests of the engine subtree. |
 | [DS007-host-limits-and-messages](DS007-host-limits-and-messages.md) | The host, messages and limits a host gives the engine, every field, key and hook, and the public exports. |
+| [DS008-standalone-host](DS008-standalone-host.md) | The local-llm host of a pworker home: layout, ownership, launch records and the reaper, Unix-socket runners, the host runner registry and locks, and the host API. |

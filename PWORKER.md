@@ -125,7 +125,7 @@ Example: `{ tier: 'small', template: 'Classify this text: ${input}', batch: true
 
 ## Local model engine
 
-`lib/local-llm` is an engine that runs one open-weight model at a time through on-demand runner processes (llama.cpp and its CPU and Vulkan builds, ik_llama.cpp, Ollama, vLLM, TabbyAPI, LM Studio). It is a library for programs that embed it; the `pworker` CLI does not call it yet. It keeps the code style of its origin (see [DS006](docs/specs/DS006-engine-coding-style.md)) and is specified in [docs/specs](docs/specs/matrix.md).
+`lib/local-llm` is an engine that runs one open-weight model at a time through on-demand runner processes (llama.cpp and its CPU and Vulkan builds, ik_llama.cpp, Ollama, vLLM, TabbyAPI, LM Studio). It is a library for programs that embed it. `pworker serve` hosts one engine per home on Linux through `lib/local-llm-host` ([DS008](docs/specs/DS008-standalone-host.md)): the home is owned by one process, runners listen on Unix sockets under `<home>/r`, and a runner an earlier process left behind is ended when the next one starts. The commands and the `local-llm` provider that use it come next. It keeps the code style of its origin (see [DS006](docs/specs/DS006-engine-coding-style.md)) and is specified in [docs/specs](docs/specs/matrix.md).
 
 | Subpath | Stability | Use |
 | --- | --- | --- |
