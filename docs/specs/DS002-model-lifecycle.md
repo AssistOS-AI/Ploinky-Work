@@ -164,3 +164,19 @@ node --input-type=module -e 'import fs from "node:fs"; import { exportModelMetad
 ```
 
 For registry export, pass seed:false and an array of entries. Applying the returned models to backed-up state is a separate operator action. Old agents reject v4 seed envelopes, so downgrade needs their matching shipped v3 seed or a reviewed v3 export. Older readers may hide Venus-bearing registry entries but preserve their raw objects during unrelated saves, allowing visibility after upgrade.
+
+### Download binding on macOS
+
+macOS cannot say where an open descriptor points: there is no `/proc/self/fd`. The download binder therefore has one strategy per platform (`platform.confirmOpened` when the platform has it, the descriptor's path otherwise), and the guarantee on macOS is weaker. It is weaker in one stated way and stronger in none.
+
+| Step | Linux | macOS |
+| --- | --- | --- |
+| Opening | `O_NOFOLLOW \| O_NONBLOCK`, `fstat` must show a regular file | the same |
+| Which file was opened | `readlink /proc/self/fd/<fd>` must equal the expected path under the anchored real root | the stat binder: the handle's `fstat` is a regular file; `lstat` of the anchored root has the device and inode it was anchored with; `lstat` of every directory between the root and the file is a real directory, not a link; `lstat` of the final path is a regular file, not a link, with the handle's device and inode. Anything else is not bound (`UNSAFE_PATH`, or a rejected candidate) |
+| Before a file is created | nothing (the check after the create catches a link) | `platform.beforeCreate`: every directory from the private root (when it holds the anchored root) or the anchored root down to the file's parent must be a real directory owned by the user with no group or other write bit, or the Run is refused with `UNSAFE_PATH` before `O_CREAT`, so a swapped parent cannot leave an empty file outside the store |
+| Workspace-shared roots | walked through a checked directory descriptor, `openat` by `/proc/self/fd/<root>/…` | off: `anchorRoot(…, { untrusted: true })` returns null, so the walk finds nothing, and the `openat` path is unreachable (it throws) |
+| Another platform | n/a | `platformFor` refuses every platform but `linux` and `darwin` |
+
+The hashing, the second hash of a staging file, the record identity and the link rules above are the same on both platforms, because they work on the descriptor and on `fstat`.
+
+**What the macOS binder does not stop.** It proves that, when it runs, the path names the object the descriptor holds. It does not prove the path named that object when it was opened, and it does not watch the path afterwards. A process of the same user that swaps a directory component and puts the original back between the open and the check, or hard-links the opened file into the expected path, is not seen. The create-path checks above narrow who can do this to the user's own processes: no other user can write a directory of the store, and the store is not shared with other agents. If the private directory is writable by others, or the user's `umask` makes new directories group-writable (`002`), the Run is refused rather than trusted; set the `umask` to `022` and remove the extra permission.

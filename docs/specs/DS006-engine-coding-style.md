@@ -27,6 +27,7 @@ lib/local-llm/
   index.mjs            public entry: createLocalLlmController and the re-exports (DS007)
   chat.mjs             pure helpers of a chat responder
   host.mjs             defineHost, linuxPlatform
+  darwinPlatform.mjs   darwinPlatform, platformFor (the macOS strategies and the choice of platform)
   limits.mjs           the hook contract and its identity default
   messages.mjs         message keys and neutral defaults
   errors.mjs           LocalLlmError, serializeError
@@ -36,6 +37,7 @@ lib/local-llm/
   runners/             one adapter per runner, and the table built from a host
   tools/runnerInstallCheck.mjs   the install check, also runnable as a script
 test/local-llm/        the engine tests and their fixtures
+test/local-llm-darwin/ tests of the macOS readers and locks of a standalone host (lib/local-llm-darwin)
 test/local-llm-host/   tests of a standalone host
 docs/specs/            these specifications
 ```
@@ -59,7 +61,7 @@ The catalog and the locks are JSON, never YAML, formatted with 2-space indentati
 
 ### Tests
 
-Tests use `node:test` and `node:assert/strict` with no external framework, one file per area, and need no GPU, container runtime or network: hardware, downloads, runners, signals and time are injected. They run with `npm test`, which names the groups `test/*.test.mjs`, `test/local-llm/*.test.mjs` and `test/local-llm-host/*.test.mjs` explicitly so no group is skipped silently. Tests that exercise Linux-only mechanisms (`/proc/self/fd`, abstract sockets, `/proc/<pid>/oom_score_adj`) skip with a stated reason on other platforms; nothing else skips. A test that passes a hook or a platform stand-in names what it stands in for. Characterization tests pin today's exact behavior and change only with a deliberate change, which the commit names.
+Tests use `node:test` and `node:assert/strict` with no external framework, one file per area, and need no GPU, container runtime or network: hardware, downloads, runners, signals and time are injected. They run with `npm test`, which names the groups `test/*.test.mjs`, `test/local-llm/*.test.mjs`, `test/local-llm-darwin/*.test.mjs` and `test/local-llm-host/*.test.mjs` explicitly so no group is skipped silently. Tests that exercise Linux-only mechanisms (`/proc/self/fd`, abstract sockets, `/proc/<pid>/oom_score_adj`) skip with a stated reason on other platforms; nothing else skips. The macOS tests inject their platform, their `exec` and their captured tool output, so they run on Linux as well as on macOS and never skip. A test that passes a hook or a platform stand-in names what it stands in for. Characterization tests pin today's exact behavior and change only with a deliberate change, which the commit names.
 
 ### File size
 

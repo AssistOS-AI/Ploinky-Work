@@ -42,3 +42,14 @@ No file below `lib/local-llm` may name a container runtime, a gateway, a path of
 ### Where the other specifications live
 
 DS001 is the agent contract (manifest, tools, authorization, the chat endpoint, drain). It stays in the local-llms repository with the hardware-limits content that the hooks of DS007 carry out of the engine. The documents here carry the engine's own text from local-llms at `34f8f498`; their wording note says how the agent's names map to engine names.
+
+### macOS and the standalone Metal scope
+
+The engine also runs on macOS when its host gives it the macOS pieces: `darwinPlatform()` (DS007, the download binder of DS002), readers for the hardware snapshot, the memory and the memory pressure level, and a runner lock for the Mac (DS004). `lib/local-llm-darwin` holds the readers and the locks as host-side files that the engine never imports; they enter as the `readHardwareSnapshot`, `readMemory` and `readPressure` seams and as `imageRunnerLockFile`. A platform other than Linux and macOS is refused (`platformFor`), not guessed.
+
+| Host | Profile | Runners offered | Not offered |
+| --- | --- | --- | --- |
+| macOS on Apple Silicon (`darwin-arm64`) | `metal`, fixed by the host (DS005) | `llama.cpp`, the Metal build, installed from the Mac lock | ik_llama.cpp, Ollama, vLLM, ExLlamaV3 with TabbyAPI, LM Studio, the Vulkan, Venus and APU profiles, workspace-shared weights |
+| macOS on Intel (`darwin-x64`) | `cpu`, fixed by the host | `llama.cpp-cpu`, installed from the Mac lock | the same list. Not verified on hardware |
+
+The Linux behavior is unchanged: `test/local-llm/agent-unchanged-metal.test.mjs` pins the eight runner ids, the default ports and the overview of the dedicated, unified, cpu, vulkan, venus and apu profiles, which stay deep-equal whether or not a catalog carries `metal` metadata. The Metal constants are provisional (DS005) and the inference smoke on a real model is run by the operator, so a Metal deployment is unit-tested and light-checked here, not certified.
