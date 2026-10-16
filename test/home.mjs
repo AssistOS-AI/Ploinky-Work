@@ -7,4 +7,7 @@ import path from 'node:path';
 if (!process.env.PWORKER_HOME || !path.resolve(process.env.PWORKER_HOME).startsWith(fs.realpathSync(os.tmpdir()))) {
   process.env.PWORKER_HOME = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'pworker-test-home-'));
 }
+// A test that resolves "~/.pworker" without a PWORKER_HOME (an `env: {}` in a test fixture) lands in this temporary folder, never in the
+// real home of whoever runs the suite: the local-llm host creates directories and binds a port under the home it is given.
+process.env.HOME = process.env.PWORKER_HOME;
 for (const key of Object.keys(process.env)) if (/_API_KEY$|^PWORKER_TOKEN$|^PWORKER_URL$|^PWORKER_CONFIG$|_BASE_URL$|^HF_TOKEN$/.test(key)) delete process.env[key];
