@@ -255,12 +255,22 @@ test('on demand: a second request for the same model while the gate\'s own start
     const inner = fakeAdapter();
     const adapter = Object.freeze({ ...inner, async start(ctx) { starts += 1; await loading; return inner.start(ctx); } });
     const { host } = await startHost(t, { adapter });
-    const gate = createLocalLlmGate({ host, settings: onDemand({ startWaitMs: 300 }), pollMs: 10 });
+    // A fake clock, so the outcome does not depend on how busy the machine is: while `advancing`, every poll sleep moves it
+    // by its own length (the first request runs out of startWaitMs); afterwards it stands still, so the second request can
+    // only end by the load finishing.
+    let clock = Date.now();
+    let advancing = true;
+    const timers = {
+        setTimeout: (fn, ms) => { if (ms === 10 && advancing) clock += ms; return setTimeout(fn, 1); },
+        clearTimeout: (id) => clearTimeout(id),
+    };
+    const gate = createLocalLlmGate({ host, settings: onDemand({ startWaitMs: 300 }), now: () => clock, timers, pollMs: 10 });
     const first = await gate.ensure(ENTRY);
     assert.equal(first.ok, false);
     assert.match(first.reason, /start timeout/);
     const deploymentId = host.current().state.deployment.id;
     // The second request arrives while the load goes on; the load finishes shortly after.
+    advancing = false;
     setTimeout(() => release(), 50);
     const second = await gate.ensure(ENTRY);
     assert.equal(second.ok, true, `the second request waits for the load: ${second.reason}`);
