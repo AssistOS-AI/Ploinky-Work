@@ -1,13 +1,13 @@
 ---
 title: DS008-standalone-host
-summary: The local-llm host of a pworker home (lib/local-llm-host): its layout, the ownership of a home, the launch records and the reaper, the Unix-socket runners, the host runner registry and locks, and the API the gate and the routes use.
+summary: The local-llm host of a pworker home (lib/local-llm-host): its layout, the ownership of a home, the launch records and the reaper, the Unix-socket runners, the host runner registry and locks, the gate and admin routes of the local-llm provider, the pworker models commands, and the host API.
 ---
 
 # DS008 Standalone Host
 
 ## Introduction
 
-`pworker serve` runs the engine of `lib/local-llm` for one Pworker home. The code that makes that safe lives in `lib/local-llm-host`, apart from the engine, because it belongs to pworker and not to every host: it decides where the files of the engine are, who may run the engine for a home, how a runner an earlier process left behind is found and ended, and which runners pworker offers. This release covers Linux. On another platform the host reports itself unsupported and creates nothing (the macOS host is a later phase). The engine's side of the same design is the `host.listen` input of DS007.
+`pworker serve` runs the engine of `lib/local-llm` for one Pworker home (the home of the server: `config.taskHome`, else the parent of its data folder, which for `pworker serve` is `PWORKER_HOME`). The code that makes that safe lives in `lib/local-llm-host`, apart from the engine, because it belongs to pworker and not to every host: it decides where the files of the engine are, who may run the engine for a home, how a runner an earlier process left behind is found and ended, and which runners pworker offers. This release covers Linux. On another platform the host reports itself unsupported and creates nothing (the macOS host is a later phase). The engine's side of the same design is the `host.listen` input of DS007.
 
 ## Core Content
 
@@ -31,13 +31,13 @@ A home is owned by the process that holds an exclusive loopback TCP listener on 
 | --- | --- |
 | The port | A function of the realpath of the home: 20000 plus a SHA-256 value modulo 12768, so it lies in 20000-32767, below the Linux (32768-60999) and macOS (49152-65535) ephemeral ranges and away from the proxy's 18080 and the 196xx ports. There is no fallback port |
 | The grant | A successful bind on `127.0.0.1` with no `reusePort` and without `exclusive: false`. `EADDRINUSE` means held: the controller is not created |
-| The handshake | The owner answers every connection with one JSON line (a tag, its pid and the home) and closes it. After a failed bind the contender reads that line, only to word the refusal: `owner_held` (a pworker of this home, with its pid), `owner_port_collision` (a pworker of another home that hashes to the same port) or `owner_port_taken` (anything else, including silence). The handshake never grants ownership |
+| The handshake | The owner answers every connection with one JSON line (a tag, its pid and the home) and closes it. After a failed bind the contender reads that line, only to word the refusal: `owner_held` (a pworker of this home, with its pid), `owner_port_collision` (a pworker of another home that hashes to the same port) or `owner_port_taken` (anything else, including silence). A connection that is refused, or closed without a byte, means the holder left between the failed bind and the handshake: the contender binds again (up to 40 times, 25 ms apart) before it calls the holder unrelated. The handshake never grants ownership |
 | `owner.json` | Written in place after the bind, for people. Nothing reads it to decide anything, and no code path moves, renames or removes it (`test/local-llm-host/ownership.test.mjs` scans the source and traces the file system calls) |
 | Child processes | The listener has close-on-exec, so a runner does not inherit it: after `SIGKILL` of the owner the next contender acquires at once, although the runner is still alive |
 | Release | After the controller has drained (`host.drain()`), when the process closes, or when it dies |
 | A wildcard holder on macOS | On macOS a program listening on `0.0.0.0:<port>` does not stop a bind on `127.0.0.1:<port>` (observed). Two pworker processes bind the same address, so they still exclude each other; only an unrelated wildcard holder goes unnoticed there |
 
-`pworker serve` acquires the home before it listens, and waits up to 45 s for a predecessor that is still draining. If another pworker still owns the home, serve exits with `already` (exit code 3). Any other refusal (a port held by another program, an unusable socket directory) leaves the proxy running with the engine unavailable: the refusal is logged at start and every use of the engine reports it.
+`pworker serve` acquires the home before it listens, and waits up to 45 s for a predecessor that is still draining. If another pworker still owns the home, serve exits with `already` (exit code 3). Any other refusal (a port held by another program, an unusable socket directory) leaves the proxy running with the engine unavailable: the refusal is logged at start, is part of `GET /v1/local` (`local-llm.ownership.refusal`) and of `pworker models status`, and every use of the engine reports it. `host.drain()` called while an acquisition is still waiting for the home cancels it: nothing is bound or reaped after the shutdown request. A proxy that starts is waited for by `startProxy` for `START_WAIT_MS` (the 45 s wait for a predecessor plus 15 s) and by an autostarting client for 75 s; `startProxy` fails at once when the process exits without answering (exit 4: its port is taken by another program).
 
 ### Launch records and the reaper
 
@@ -76,11 +76,51 @@ Runners listen on a Unix socket, not on a TCP port (the engine side is `host.lis
 
 The locks are `lib/local-llm-host/locks/runners.lock.host-linux-{amd64,arm64}.json`, passed to the engine as its image lock, because the engine offers an agent-lock entry on the cpu profile only. The seed catalog is `lib/local-llm-host/catalog/models.json`. Both are explicit inputs: the engine has no default for either.
 
+The runner reports the version of the host lock (`b11295` for `llama.cpp`; the agent's image pins another build, which the agent path keeps).
+
 The engine's environment holds `PATH` (the system directories and the directory of `nvidia-smi`), `HOME`, `LANG` and `HF_TOKEN` when there is one; nothing else, so a `CUDA_MPS_*` variable or a provider key of the process never reaches a runner.
+
+### The local-llm provider
+
+`config.default.json` has a provider `local-llm` of `kind: "local-llm"`, enabled and in no tier. At most one such provider may exist, and it cannot have a `start` block (`createCore` refuses otherwise). Each provider kind has its own boot, status and action in the core: `boot` only starts `start` servers, `GET /v1/local` and `/stats` add the engine's row (`gate.status()`, which never creates the engine), `POST /v1/local/local-llm/stop` stops the deployment, and a start is refused with the command to use (`pworker models run <id>`).
+
+A tier entry `{ "upstream": "local-llm", "model": "<catalog id>", "runner": "<id>" }` asks the gate (`gate.ensure({ model, runner })`) before the request is sent. The answer is `{ ok: true, target }` or `{ ok: false, reason }`, and a refusal takes the path of an unavailable local server: the entry is logged as not sent (503), the request falls to the next entry of the chain (`x-pworker-fallback-reason: unavailable`), and without one it is a `503 local_unavailable`.
+
+| Rule | Detail |
+| --- | --- |
+| The base | `pworker models run` starts the single deployment. The gate uses a deployment that is ready for the requested model (and runner, when the entry names one) and never replaces or idle-stops one an admin started |
+| On demand | With `localLlm.onDemand.enabled` the gate may start a model itself: only when its weights are complete and its runner is installed (a request never downloads; a run that finds its weights gone and starts fetching them is cancelled), with one start shared by all requests that arrive meanwhile, and a deployment it started is replaced only while nothing is running or queued for the provider. `idleStopMs` (default 15 min) stops a deployment the gate started, again only when nothing runs or waits. `startWaitMs` (default 120 s) bounds the wait for readiness |
+| The forward | The request is sent over the target's Unix socket (`httpFetch(url, { socketPath })`) with the per-start key as the bearer token. The client's `Authorization` is never forwarded, and `body.model` becomes the runner's chat model; the request log keeps the catalog id. Streamed answers pass through unchanged |
+| The cache | The identity of a cached answer is `local-llm:<model>:<runner>:<runner version>:<sha256 of the weights>`. It is known without the engine only when the entry names a runner, or a deployment of the model is ready; otherwise nothing is read or stored, and a `strict` request is a miss |
+| `/v1/models` | `GET /u/local-llm/v1/models` is built fresh from the seed catalog, the user's models and the deployment on every call; there is no time-to-live |
+| Secrets | The Hugging Face token and every per-start key are added to the secrets the proxy removes from its logs and error texts |
+
+### Admin routes
+
+`/v1/local-llm/*` are answered before the request admission and the `POST /v1/*` forwarder, behind the Host/Origin guard and the optional `PWORKER_TOKEN` (no other credential).
+
+| Route | Answer |
+| --- | --- |
+| `GET /v1/local-llm` | The overview: profile, hardware, runners, models with their weights and admission, the deployment, and `unsupportedRunners` (id and reason). When the engine cannot be had (disabled, unsupported, owned elsewhere) it answers 200 with `available: false` and the refusal |
+| `GET /v1/local-llm/status?sinceSeq=N` | Phase, deployment, download progress, log lines since `N`, `startedBy` (`admin` or `on-demand`) |
+| `POST /v1/local-llm/preview` | `{ modelId, runnerId?, params? }`: the admission verdict, no process |
+| `POST /v1/local-llm/run` | `{ modelId, runnerId?, params?, replace?, requestId? }`: 202 `{ accepted \| duplicate, deployment }`; a repeated `requestId` is a duplicate |
+| `POST /v1/local-llm/stop`, `/cancel` | Stop the deployment; cancel its download (409 `not_downloading` when there is none). Neither creates the engine |
+| `POST /v1/local-llm/weights/delete`, `/models/lookup`, `/models/add`, `/models/update`, `/models/remove`, `/runners/<id>/install`, `/runners/<id>/uninstall` | The engine's operations of the same names |
+
+Errors are `{ error: { type, message } }` with the message redacted. A body that is not a JSON object is 400 `invalid_json`, one above 32 MiB is 413, an unknown model or runner is 404, a conflict (busy, in use, runner not installed, licence needed) is 409, an admission refusal is 422, a failed Hugging Face lookup is 502 and an engine that is unavailable is 503.
+
+### Commands
+
+`lib/pworker/models-cli.mjs` runs the engine verbs of `pworker models` against these routes: `catalog`, `runners`, `lookup`, `add`, `update`, `remove`, `preview`, `run [--detach]`, `stop`, `status [--follow] [--json]`, `cancel`, `delete-weights`, `runner install|uninstall` and `hf-token`. `models run` polls the status every second and shows the phase, bytes, rate and time left (a line that updates in place on a terminal, a line on each change otherwise); it exits 0 when the model is ready, 1 when it fails or pauses, and 130 when interrupted (the download goes on). `models stop NAME` and `models start NAME` are not engine verbs: they keep calling `/v1/local/NAME/(stop|start)`. `models hf-token` writes `keys/huggingface.env` as one line (`HF_TOKEN="..."`), through a temporary file created 0600 and renamed over the old one, so a replacement is 0600 whatever the old mode was; the token is read with hidden input or from stdin when it is not a terminal, and is never printed or logged. It does not restart the proxy: the engine reads the token when it is created, so the command says to run `pworker stop` and `pworker start`.
+
+### Tests that touch a home
+
+No test creates directories, binds an owner port or reaps in a home it does not own. Nothing in the gate, the core, `/v1/local`, `/stats`, `/v1/models` or the stop routes creates the engine (`test/local-llm-host/proxy-gate.test.mjs` runs them against a file system and a network that refuse every change, with a negative control); a server builds its host on its own home; `test/home.mjs` gives every test a scratch `PWORKER_HOME` and points `HOME` at it; and each test of the host uses its own temporary home.
 
 ### The host API
 
-`lib/local-llm-host/host.mjs` documents it at its top. In short: `acquire({ waitMs })`, `controller()`, `current()`, `drain()`, `describe()` (which never throws: an unusable socket directory is reported as `socketDirProblem`), `engineEnvironment()` and `redact(text)`. A failure to read the launch records at acquire is logged and does not undo the ownership. The server creates one host per home (`server.localLlm`), passes it to the core as `localLlm`, and `close()` awaits `drain()`, so a process that exits leaves no runner and no ownership behind. The gate and the `/v1/local-llm/*` routes use `await host.controller()`.
+`lib/local-llm-host/host.mjs` documents it at its top. In short: `acquire({ waitMs })`, `controller()`, `current()`, `drain()`, `describe()` (which never throws: an unusable socket directory is reported as `socketDirProblem`), `engineEnvironment()`, `redact(text)` and `secretValues()`. A failure to read the launch records at acquire is logged and does not undo the ownership. The server creates one host per home (`server.localLlm`), passes it to the core as `localLlm`, and `close()` awaits `drain()`, so a process that exits leaves no runner and no ownership behind. The gate and the `/v1/local-llm/*` routes use `await host.controller()`.
 
 ## Decisions and Rationale
 
