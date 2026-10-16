@@ -16,8 +16,9 @@ import { resolveUpstream } from '../lib/settings.mjs';
 import { HELP } from '../lib/pworker/help.mjs';
 import { liveServer, readServerRecord } from '../lib/server.mjs';
 import { fileURLToPath } from 'node:url';
-import { readUserConfig as adminReadUserConfig, saveUserConfig as adminSaveUserConfig, saveModelLimits as adminSaveModelLimits, proxyPid, startProxy as adminStartProxy, stopProxy as adminStopProxy, restartProxy as adminRestartProxy } from '../lib/pworker/admin.mjs';
+import { readUserConfig as adminReadUserConfig, saveUserConfig as adminSaveUserConfig, saveModelLimits as adminSaveModelLimits, proxyPid, startProxy as adminStartProxy, stopProxyResult as adminStopProxyResult, restartProxy as adminRestartProxy } from '../lib/pworker/admin.mjs';
 import { readRecords, summarize, formatSummary, parseSince } from '../lib/metrics.mjs';
+import { isEngineCommand, runEngineVerb } from '../lib/pworker/models-cli.mjs';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -75,7 +76,11 @@ const saveUserConfig = (c) => adminSaveUserConfig(c);
 // matching, so it works with npm link, other launchers and on every platform. The process control lives in lib/pworker/admin.mjs.
 const runningPid = () => proxyPid();
 const startProxy = () => adminStartProxy();
-const stopProxy = () => adminStopProxy();
+/** What `pworker stop` says: the proxy stopped, was not running, or is still draining (it exits only after its local model is stopped). */
+const stopMessage = async () => {
+  const result = await adminStopProxyResult();
+  return result.state === 'stopped' ? 'Proxy stopped.' : result.state === 'still-running' ? `The proxy (pid ${result.pid}) was told to stop but is still running after 45 s; it exits once its local model is stopped. Run pworker stop again later.` : 'The proxy is not running.';
+};
 const restartProxy = () => adminRestartProxy();
 
 function publicJob(job) {
@@ -181,6 +186,7 @@ async function connectProvider(screen) {
     const local = await localStates();
     const choices = Object.entries(config.providers ?? {}).filter(([name]) => !name.startsWith('_')).map(([name, provider]) => {
       if (provider.start) return { label: `${name} · local ${provider.start.alias ?? ''} · ${local[name]?.running ? 'running' : 'stopped'}`, value: `local:${name}` };
+      if (provider.kind === 'local-llm') return { label: `${name} · local engine ${local[name]?.modelId ?? ''} · ${local[name]?.running ? 'running' : 'stopped'}`, value: `local:${name}` };
       const key = resolveUpstream(name, provider).key;
       return { label: `${name} · ${key || provider.noKey ? 'connected' : 'API key needed'}`, value: `api:${name}` };
     });
@@ -190,6 +196,7 @@ async function connectProvider(screen) {
     try {
       if (selected.startsWith('local:')) {
         const name = selected.slice(6);
+        if (!local[name]?.running && config.providers[name]?.kind === 'local-llm') throw new Error(`${name} is the local-llm engine; start a model with: pworker models run <id>`);
         if (!local[name]?.running) {
           note(`Starting ${name}...`);
           const result = await client().model(name, 'start');
@@ -421,7 +428,7 @@ async function interactive(currentWorkingDirectory) {
       ]);
       if (!choice || choice === 'exit') return;
       try {
-        if (choice === 'stop') { note((await stopProxy()) ? 'Proxy stopped.' : 'The proxy is not running.'); return; }
+        if (choice === 'stop') { note(await stopMessage()); return; }
         if (choice === 'stats') { printStats({ since: '24h' }); continue; }
         if (choice === 'connect') {
           const connected = await connectProvider(screen);
@@ -464,8 +471,17 @@ async function main() {
     return;
   }
   if (command === 'start') { await startProxy(); console.log('Proxy started.'); return; }
-  if (command === 'stop') { console.log((await stopProxy()) ? 'Proxy stopped.' : 'The proxy is not running.'); return; }
+  if (command === 'stop') { const message = await stopMessage(); console.log(message); if (message.includes('still running')) process.exitCode = 1; return; }
   if (command === 'stats' && !args.includes('--proxy')) { printStats(); return; }
+  // The engine verbs of `models` (catalog, run, status, ...). `hf-token` only writes a file and never needs the proxy; the others start it
+  // when none runs. `models start|stop NAME` is not an engine verb: it goes on to the local servers below.
+  if (isEngineCommand(args)) {
+    if (args[1] !== 'hf-token') await startProxy();
+    const abort = new AbortController();
+    process.once('SIGINT', () => abort.abort());
+    process.exitCode = await runEngineVerb({ args, client: client(), io: { out: (text) => stdout.write(text), err: (text) => process.stderr.write(text), stdin, stdout, isTTY: Boolean(stdout.isTTY), signal: abort.signal, home } });
+    return;
+  }
   if (['run', '--async', 'queue', 'flush', 'stats', 'models', 'tier'].includes(command)) await startProxy();
   if (command === 'stats') { json(await client().stats()); return; }
   if (command === 'models') {
@@ -555,6 +571,6 @@ async function main() {
     if (failed.length || results.some((r) => !r.ok)) process.exitCode = 1;
     return;
   }
-  console.log('pworker [run <task.json|task.md|request|-> --input text|JSON [--cwd DIR] [--async]] | --status [TASK_ID] | queue <task> --input ... [--cwd DIR] | queue list|clear | flush [--async] | start | stop | serve | stats [--since 1h|24h|7d] [--provider P] [--by hour|day] [--json] [--proxy] | models [start|stop <local>] | provider <name> --endpoint URL --key KEY --rpm N | tier <name> --provider P --model ID [--batch]');
+  console.log('pworker [run <task.json|task.md|request|-> --input text|JSON [--cwd DIR] [--async]] | --status [TASK_ID] | queue <task> --input ... [--cwd DIR] | queue list|clear | flush [--async] | start | stop | serve | stats [--since 1h|24h|7d] [--provider P] [--by hour|day] [--json] [--proxy] | models [start|stop <local>|catalog|runners|run|stop|status|...] | provider <name> --endpoint URL --key KEY --rpm N | tier <name> --provider P --model ID [--batch]');
 }
 main().catch((e) => { console.error(e.message); process.exitCode = 1; });
