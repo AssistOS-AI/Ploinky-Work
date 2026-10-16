@@ -194,3 +194,19 @@ test('`pworker provider local-llm --endpoint ...` is refused and the engine\'s p
     const written = fs.existsSync(config) ? JSON.parse(fs.readFileSync(config, 'utf8')) : {};
     assert.equal(written.providers?.['local-llm'], undefined, 'no user override of the engine provider was saved');
 });
+
+test('every custom-provider save path refuses to overwrite the local-llm engine provider (the shared check behind the verb, the menu and the admin save)', async (t) => {
+    const home = scratch(t);
+    const { providerSpec, assertCustomProviderAllowed } = await import('../../lib/pworker/providers.mjs');
+    const { saveCustomProvider } = await import('../../lib/pworker/admin.mjs');
+    const engine = loadLayers().config.providers['local-llm'];
+    assert.equal(engine?.kind, 'local-llm', 'the default configuration carries the engine provider');
+    assert.throws(() => assertCustomProviderAllowed('local-llm', engine), /local-llm engine of this machine/);
+    // The menu's path: name typed, then providerSpec with the configured entry as the prior.
+    assert.throws(() => providerSpec('local-llm', 'http://127.0.0.1:9/v1', '', 60, engine), /local-llm engine of this machine/);
+    const env = { ...process.env, PWORKER_HOME: home };
+    await assert.rejects(saveCustomProvider('local-llm', { endpoint: 'http://127.0.0.1:9/v1', validate: false, env }), /local-llm engine of this machine/);
+    const config = path.join(home, 'config.json');
+    const written = fs.existsSync(config) ? JSON.parse(fs.readFileSync(config, 'utf8')) : {};
+    assert.equal(written.providers?.['local-llm'], undefined, 'nothing was saved over the engine provider');
+});

@@ -11,7 +11,7 @@ import { pworkerHome, serverHome } from '../lib/settings.mjs';
 import { Pworker } from '../lib/pworker/task.mjs';
 import { jobStore } from '../lib/pworker/jobs.mjs';
 import { selectMenu, promptChat, promptField } from '../lib/pworker/menu.mjs';
-import { connectedProviders, fetchModelCatalog, formatModelLabel, isModelEligibleForTier, modelExclusionReason, normalizeModelCatalog, providerSpec, sortModelCatalog } from '../lib/pworker/providers.mjs';
+import { connectedProviders, fetchModelCatalog, formatModelLabel, isModelEligibleForTier, modelExclusionReason, normalizeModelCatalog, providerSpec, assertCustomProviderAllowed, sortModelCatalog } from '../lib/pworker/providers.mjs';
 import { resolveUpstream } from '../lib/settings.mjs';
 import { HELP } from '../lib/pworker/help.mjs';
 import { liveServer, readServerRecord } from '../lib/server.mjs';
@@ -209,7 +209,7 @@ async function connectProvider(screen) {
       if (selected === 'custom') {
         const name = await promptField(screen, 'Provider name');
         if (name == null) continue;
-        if (config.providers?.[name]?.start) throw new Error('A managed local provider cannot be replaced here');
+        assertCustomProviderAllowed(name, config.providers?.[name]);
         const endpoint = await promptField(screen, 'Base endpoint URL');
         if (endpoint == null) continue;
         const key = await promptField(screen, 'API key (leave empty for a keyless local endpoint)', { secret: true, allowEmpty: true });
@@ -500,8 +500,7 @@ async function main() {
   if (command === 'provider') {
     const name = args[1], key = option('key', '');
     const prior = loadLayers().config.providers?.[name] ?? {};
-    if (prior.start) throw new Error('Use the local model menu to start a managed local provider');
-    if (prior.kind === 'local-llm') throw new Error(`${name} is the local-llm engine of this machine, not an endpoint; manage its models with \`pworker models\``);
+    assertCustomProviderAllowed(name, prior);
     const spec = providerSpec(name, option('endpoint'), key, option('rpm', 60), prior);
     const models = await fetchModelCatalog(spec, { key });
     saveProvider(name, spec, key); await restartProxy();
