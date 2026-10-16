@@ -143,7 +143,7 @@ An upstream with a `start` block (see the `local`, `localsuper` and `localnano` 
 
 | `start` key | Meaning |
 | --- | --- |
-| `bin`, `gguf`, `alias`, `args` | A `llama-server` over a GGUF file: `bin` is a path or a command name on `PATH`; the proxy adds `-m`, `--host 127.0.0.1`, `--port` (from the upstream's `baseUrl`) and `-a` (`alias`, default the upstream name) before `args` |
+| `bin`, `gguf`, `alias`, `args` | A `llama-server` over a GGUF file: `bin` is a path or a command name on `PATH`; the proxy adds `-m`, `--host 127.0.0.1`, `--port` (from the upstream's `baseUrl`) and `-a` (`alias`, default the upstream name) before `args` (entries of `args` are passed as strings, so a number works) |
 | `script`, `requires`, `args` | A Node script run with the proxy's Node binary and `--port`, followed by `args`; every file in `requires` must exist |
 | `locks`, `requireFreeGpu` | A start is refused while a lock file exists, and, unless `requireFreeGpu` is `false`, while another program has a compute process on the GPU |
 | `startTimeoutMs` | How long to wait for `/health` after the spawn (default 120000). A server that exits, or does not answer in time, is stopped and the start is refused with the reason in `/stats` (`local.<name>.last_refusal`) |

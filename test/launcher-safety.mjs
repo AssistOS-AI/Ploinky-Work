@@ -11,14 +11,14 @@ import { fileURLToPath } from 'node:url';
 // to show that the guard catches it and that nothing is signalled.
 const realKill = process.kill;
 export const guardHits = [];
+// The guard itself, exported so a test can assert that it is the installed process.kill (a guard that is not installed fails closed).
+export function killGuard(pid, sig) {
+  guardHits.push([pid, sig]);
+  process.stderr.write(`LAUNCHER GUARD: blocked process.kill(${pid}, ${sig})\n`); // visible even when the test fails for another reason first
+  throw Object.assign(new Error(`process.kill(${pid}, ${sig}) is blocked in the launcher tests`), { code: 'EPERM' });
+}
 export function installKillGuard() {
-  before(() => {
-    process.kill = function blockedKill(pid, sig) {
-      guardHits.push([pid, sig]);
-      process.stderr.write(`LAUNCHER GUARD: blocked process.kill(${pid}, ${sig})\n`); // visible even when the test fails for another reason first
-      throw Object.assign(new Error(`process.kill(${pid}, ${sig}) is blocked in the launcher tests`), { code: 'EPERM' });
-    };
-  });
+  before(() => { process.kill = killGuard; });
   after(() => { process.kill = realKill; });
   afterEach(() => { assert.deepEqual(guardHits.splice(0), [], 'a launcher test reached the process.kill guard (no killImpl injected)'); });
 }

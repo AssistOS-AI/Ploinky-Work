@@ -7,7 +7,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createProxy } from '../lib/core.mjs';
-import { installKillGuard, guardHits, launcherHarness, FAKE_BIN, FAKE_GGUF } from './launcher-safety.mjs';
+import { installKillGuard, killGuard, guardHits, launcherHarness, FAKE_BIN, FAKE_GGUF } from './launcher-safety.mjs';
 
 installKillGuard();
 
@@ -746,6 +746,7 @@ test('local: the idle stop never stops a server with requests in flight or queue
     busy = false;
     await new Promise((r) => setTimeout(r, 150));
     assert.equal(terms(), 1, 'an idle server is stopped');
+    assert.deepEqual(h.signals[0], [-1, 'SIGTERM'], 'the idle stop signals the process group');
     assert.deepEqual(h.fallbackKills, []);
   } finally { await st.stop(); rmSync(logDir, { recursive: true, force: true }); }
 });
@@ -766,12 +767,13 @@ test('local: a server is spawned as its own process group with direct-to-file st
   let running = false;
   const spawn = (cmd, argv, opts) => { calls.push({ cmd, argv, opts }); running = true; return h.fake(Number(argv[argv.indexOf('--port') + 1]), { onExit: () => { running = false; } }); };
   const baseDir = mkdtempSync(join(tmpdir(), 'pworker-base-'));
-  const t = await starterOn(h, { port: 1906, spawn, fetchImpl: async () => ({ ok: running }), baseDir, start: startOf({ alias: 'a1', args: ['-ngl', '9'] }) });
+  const t = await starterOn(h, { port: 1906, spawn, fetchImpl: async () => ({ ok: running }), baseDir, start: startOf({ alias: 'a1', args: ['-ngl', 9] }) });
   try {
     assert.equal(await t.st.ensure(), true);
     const [{ cmd, argv, opts }] = calls;
     assert.equal(cmd, FAKE_BIN);
-    assert.deepEqual(argv, ['-m', FAKE_GGUF, '--host', '127.0.0.1', '--port', '1906', '-a', 'a1', '-ngl', '9']);
+    assert.deepEqual(argv, ['-m', FAKE_GGUF, '--host', '127.0.0.1', '--port', '1906', '-a', 'a1', '-ngl', '9'], 'a numeric start.args entry reaches spawn as a string');
+    assert.ok(argv.every((a) => typeof a === 'string'));
     assert.equal(opts.detached, true, 'the runner leads its own process group');
     assert.equal(opts.stdio[0], 'ignore');
     assert.ok(Number.isInteger(opts.stdio[1]) && opts.stdio[1] === opts.stdio[2], 'stdout and stderr are one file descriptor of the log file, not pipes');
@@ -780,6 +782,7 @@ test('local: a server is spawned as its own process group with direct-to-file st
     assert.deepEqual(t.st.status(), { managed: true, pid: 1906, last_refusal: null });
     await t.st.stop();
     assert.deepEqual(h.signals, [[-1906, 'SIGTERM'], [-1906, 'SIGKILL']]);
+    assert.deepEqual(h.fallbackKills, [], 'the group signals went through killImpl, not the child handle');
     assert.deepEqual(t.st.status(), { managed: false, pid: null, last_refusal: null });
   } finally { await t.st.stop(); rmSync(t.logDir, { recursive: true, force: true }); rmSync(baseDir, { recursive: true, force: true }); }
 });
@@ -789,10 +792,10 @@ test('local: a script server runs with this Node binary and --port', async () =>
   const calls = [];
   let running = false;
   const spawn = (cmd, argv, opts) => { calls.push({ cmd, argv }); running = true; return h.fake(1907, { onExit: () => { running = false; } }); };
-  const t = await starterOn(h, { port: 1907, spawn, fetchImpl: async () => ({ ok: running }), start: { script: FAKE_GGUF, args: ['--x'] } });
+  const t = await starterOn(h, { port: 1907, spawn, fetchImpl: async () => ({ ok: running }), start: { script: FAKE_GGUF, args: ['--x', 7] } });
   try {
     assert.equal(await t.st.ensure(), true);
-    assert.deepEqual(calls, [{ cmd: process.execPath, argv: [FAKE_GGUF, '--port', '1907', '--x'] }]);
+    assert.deepEqual(calls, [{ cmd: process.execPath, argv: [FAKE_GGUF, '--port', '1907', '--x', '7'] }]);
   } finally { await t.st.stop(); rmSync(t.logDir, { recursive: true, force: true }); }
 });
 
@@ -860,16 +863,19 @@ test('launcher safety (negative control): a starter built without killImpl reach
   const { createLocalStarter } = await import('../lib/local.mjs');
   const h = launcherHarness();
   let running = false;
-  const child = h.fake(1, { onExit: () => { running = false; } });
+  // A PID above the pid maximum of Linux (4194304) and of macOS (99999): if the guard were ever missing, the signal ends in ESRCH, never in a real process.
+  const PID = 4194304 + 12345;
+  const child = h.fake(PID, { onExit: () => { running = false; } });
   const logDir = mkdtempSync(join(tmpdir(), 'pworker-neg-'));
   const st = createLocalStarter({ name: 'neg', baseUrl: 'http://127.0.0.1:1904', start: { bin: FAKE_BIN, gguf: FAKE_GGUF, requireFreeGpu: false, logFile: join(logDir, 'neg.log') } },
     { spawn: () => { running = true; return child; }, fetchImpl: async () => ({ ok: running }), gpuPids: () => [] });
   try {
+    assert.equal(process.kill, killGuard, 'the process.kill guard is installed (the control fails closed without it)');
     assert.equal(await st.ensure(), true);
     const stopping = st.stop();
-    assert.deepEqual(guardHits, [[-1, 'SIGTERM']], 'the default process.kill was reached and blocked');
+    assert.deepEqual(guardHits, [[-PID, 'SIGTERM']], 'the default process.kill was reached and blocked');
     assert.deepEqual(h.signals, [], 'no signal was recorded through an injected killImpl');
-    assert.deepEqual(h.fallbackKills, [[1, 'SIGTERM']], 'the launcher fell back to the fake child handle');
+    assert.deepEqual(h.fallbackKills, [[PID, 'SIGTERM']], 'the launcher fell back to the fake child handle');
     child.deliver('SIGTERM');
     await stopping;
     assert.deepEqual(h.signals, [], 'still nothing recorded through killImpl');
