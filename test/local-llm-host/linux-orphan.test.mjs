@@ -18,7 +18,8 @@ import { freePort, scratch, until } from './fixtures/engine.mjs';
 const OWNER_SIM = fileURLToPath(new URL('./fixtures/owner-sim.mjs', import.meta.url));
 const skip = process.platform !== 'linux' && 'needs a real /proc (Linux only); the identity and signal logic runs on a fake /proc in reaper.test.mjs and host.test.mjs';
 
-const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+// A zombie that nothing has reaped yet (a container whose init does not wait) is gone for this purpose.
+const alive = (pid) => { const stat = readStat('/proc', pid); return stat !== null && stat.state !== 'Z' && stat.state !== 'X'; };
 
 function startOwner(t, { home, ownerPort, crashAt = null }) {
     const env = { ...process.env, ...(crashAt ? { [CRASH_ENV]: crashAt } : {}) };

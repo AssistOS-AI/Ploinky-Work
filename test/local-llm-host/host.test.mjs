@@ -15,7 +15,7 @@ import { LAUNCH_SCHEMA, readRecords } from '../../lib/local-llm-host/launch.mjs'
 import { ownerPortFor } from '../../lib/local-llm-host/ownership.mjs';
 import { CRASH_ENV, createRunnerStarter, envCrashHook } from '../../lib/local-llm-host/starter.mjs';
 import { createLaunchRecorder } from '../../lib/local-llm-host/launch.mjs';
-import { MODEL, SNAPSHOT, fakeAdapter, freePort, runModel, scratch, until } from './fixtures/engine.mjs';
+import { GIB, MIB, MODEL, SNAPSHOT, fakeAdapter, freePort, runModel, scratch, until } from './fixtures/engine.mjs';
 import { recordingKill, removeProc, runnerArgv, writeProc } from './fixtures/proc.mjs';
 
 /** A host on a fresh home with a fake /proc, a free owner port and the stand-in runner. */
@@ -402,4 +402,28 @@ test('the engine\'s environment is filtered: PATH with the directory of nvidia-s
     const bare = createLocalLlmHost({ config: {}, home: scratch(t), env: { PATH: '/usr/bin' }, platformName: 'linux', which: () => null, homeDir: '/home/fallback' });
     assert.deepEqual(bare.engineEnvironment(), { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: '/home/fallback', LANG: 'C.UTF-8' });
     assert.equal(bare.redact('nothing to hide'), 'nothing to hide');
+});
+
+test('through the controller the host lock makes the CUDA build installable on an NVIDIA profile and the CPU build on the cpu profile, from the seed catalog alone', async (t) => {
+    const snapshot = (gpu) => async () => ({
+        gpu: { available: gpu, name: 'Test GPU', totalBytes: 6144 * MIB, usedBytes: 144 * MIB, freeBytes: 6000 * MIB, processes: [] },
+        memory: { totalBytes: 31 * GIB, availableBytes: 24 * GIB }, disk: { freeBytes: 300 * GIB, totalBytes: 500 * GIB }, cpus: 8,
+    });
+    const overviewOf = async (profile, which) => {
+        const { host } = await makeHost(t, { withRunner: false, extra: { arch: 'x64', which, controllerOptions: { profile, snapshot: snapshot(profile !== 'cpu') } } });
+        return (await (await host.controller()).overview());
+    };
+    const cuda = await overviewOf('dedicated', () => '/usr/bin/nvidia-smi');
+    const runner = (overview, id) => overview.runners.find((entry) => entry.id === id);
+    assert.deepEqual(cuda.models.map((model) => model.id), [MODEL], 'the seed catalog is the one pinned model');
+    assert.equal(runner(cuda, 'llama.cpp').supported, true);
+    assert.equal(runner(cuda, 'llama.cpp').install.version, 'b11295');
+    assert.equal(runner(cuda, 'llama.cpp').install.files, 2, 'the CUDA build and its runtime');
+    assert.equal(runner(cuda, 'llama.cpp').install.totalBytes, 171347739 + 594377809);
+    assert.equal(runner(cuda, 'llama.cpp-cpu'), undefined, 'the CPU build is for the cpu profile');
+    const cpu = await overviewOf('cpu', () => null);
+    assert.equal(runner(cpu, 'llama.cpp').supported, false);
+    assert.equal(runner(cpu, 'llama.cpp-cpu').supported, true);
+    assert.equal(runner(cpu, 'llama.cpp-cpu').install.totalBytes, 17531126);
+    assert.equal(runner(cpu, 'llama.cpp-cpu').installed, false, 'nothing is installed, and nothing was downloaded to find out');
 });
