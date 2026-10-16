@@ -101,8 +101,10 @@ test('invariant: only the proxy core sends model requests to providers', () => {
   }
   assert.deepEqual(senders, ['lib/core.mjs']);
   const core = fs.readFileSync(path.join(root, 'lib/core.mjs'), 'utf8');
-  assert.equal(core.match(/fetchImpl\(up\.baseUrl \+ upstreamPath/g)?.length, 1, 'one send site, inside forward()');
-  assert.match(core.slice(core.indexOf('async function forward('), core.indexOf('fetchImpl(up.baseUrl + upstreamPath')), /limiter\.schedule\(/, 'the send site runs inside limiter.schedule');
+  // The one send site serves a provider (its fetch and base URL) and the local-llm engine (its fetch and the target's base URL, over its Unix socket).
+  assert.equal(core.match(/fetchVia\(\(target \? target\.baseUrl : up\.baseUrl\) \+ upstreamPath/g)?.length, 1, 'one send site, inside forward()');
+  assert.equal(core.match(/const fetchVia = target \? engineFetchImpl : fetchImpl;/g)?.length, 1, 'the send site chooses between the provider fetch and the engine fetch only');
+  assert.match(core.slice(core.indexOf('async function forward('), core.indexOf('fetchVia((target ? target.baseUrl : up.baseUrl) + upstreamPath')), /limiter\.schedule\(/, 'the send site runs inside limiter.schedule');
   // Clients (CLI, detached workers, the library) reach models only through the proxy's HTTP API.
   for (const file of ['lib/client.mjs', 'bin/pworker.mjs', 'lib/pworker/task.mjs']) assert.doesNotMatch(fs.readFileSync(path.join(root, file), 'utf8'), /createCore|createProxy/, file);
 });
