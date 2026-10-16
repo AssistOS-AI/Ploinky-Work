@@ -20,7 +20,29 @@ import { LAUNCH_SCHEMA, readRecords } from '../../lib/local-llm-host/launch.mjs'
 import { darwinPlatform } from '../../lib/local-llm/darwinPlatform.mjs';
 import { defineHost } from '../../lib/local-llm/host.mjs';
 import { createRunners } from '../../lib/local-llm/runners/index.mjs';
-import { freePort, scratch } from './fixtures/engine.mjs';
+import { freePort } from './fixtures/engine.mjs';
+
+// The product rule holds every directory on the way to the home to its holder, `/tmp` and the ancestors of the machine's TMPDIR
+// included, and those differ from machine to machine (a TMPDIR under a group-writable, non-sticky directory is common on Linux). So
+// each test builds its homes below a directory of its own, made here with mode 0700, and hands it to the host as `homeCheckRoot`:
+// the walk starts there and trusts it, and everything below it is checked as in production. What depends on the real `/` is tested
+// on a fake file system (memFs) or by the real-layout probe script.
+const roots = new WeakMap();
+function rootOf(t) {
+    if (!roots.has(t)) {
+        const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'dh-'));
+        fs.chmodSync(dir, 0o700);
+        t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+        roots.set(t, dir);
+    }
+    return roots.get(t);
+}
+/** A fresh 0700 directory below the test's root. */
+function scratch(t) {
+    const dir = fs.mkdtempSync(path.join(rootOf(t), 'h-'));
+    fs.chmodSync(dir, 0o700);
+    return dir;
+}
 
 const fixture = (name) => fs.readFileSync(new URL(`./fixtures/darwin/${name}`, import.meta.url), 'utf8');
 const T0_EPOCH = '1792122134';
@@ -54,7 +76,7 @@ async function macHost(t, { arch = 'arm64', home = scratch(t), extra = {} } = {}
     const ownerPort = extra.ownerPort ?? await freePort();
     const host = createLocalLlmHost({
         config: {}, home, env: { PATH: '/usr/bin:/bin', HOME: '/Users/test', LANG: 'en_US.UTF-8' }, platformName: 'darwin', arch, ownerPort,
-        darwinExec: capturedExec(), procs: NO_PROCS, netImpl: wildcardFreeNet, log: (line) => logs.push(line), ...extra,
+        darwinExec: capturedExec(), procs: NO_PROCS, netImpl: wildcardFreeNet, homeCheckRoot: rootOf(t), log: (line) => logs.push(line), ...extra,
     });
     t.after(() => host.drain().catch(() => {}));
     return { host, home, logs, ownerPort };
@@ -335,7 +357,7 @@ function fsWithOwners(owners) {
 }
 
 const UID = process.getuid();
-const walk = (home, extra = {}) => checkHomePath(home, { uid: UID, ...extra });
+const walk = (t, home, extra = {}) => checkHomePath(home, { uid: UID, root: rootOf(t), ...extra });
 const refused = (pattern) => (error) => error.code === 'invalid_host' && pattern.test(error.message);
 
 test('checkHomePath: two links in a row through a holder others can write are refused (the second link\'s holder is the first link\'s target, not the link)', async (t) => {
@@ -345,7 +367,7 @@ test('checkHomePath: two links in a row through a holder others can write are re
     fs.symlinkSync(real, path.join(loose, 'L2'));
     fs.symlinkSync(loose, path.join(top, 'L1'));
     const home = path.join(top, 'L1', 'L2');
-    assert.throws(() => walk(home), refused(/cannot be used: .*w, which holds .*L2, can be written by its group or by others and is not sticky \(mode 0777\)/));
+    assert.throws(() => walk(t, home), refused(/cannot be used: .*w, which holds .*L2, can be written by its group or by others and is not sticky \(mode 0777\)/));
     const { host } = await macHost(t, { home });
     assert.equal((await refusal(host)).code, 'invalid_host');
     assert.deepEqual(fs.readdirSync(real), [], 'nothing was created through the links');
@@ -355,7 +377,7 @@ test('checkHomePath: two links in a row through a holder others can write are re
     const home2 = dirAt(tidy, 'real');
     fs.symlinkSync(home2, path.join(target, 'L2'));
     fs.symlinkSync(target, path.join(tidy, 'L1'));
-    assert.doesNotThrow(() => walk(path.join(tidy, 'L1', 'L2')));
+    assert.doesNotThrow(() => walk(t, path.join(tidy, 'L1', 'L2')));
 });
 
 test('checkHomePath: a link in a holder that others can write is refused, naming the link, its owner and mode, and the holder; a sticky holder or the user\'s own directory is accepted', async (t) => {
@@ -365,7 +387,7 @@ test('checkHomePath: a link in a holder that others can write is refused, naming
         const real = dirAt(top, 'real');
         const link = path.join(holder, 'store');
         fs.symlinkSync(real, link);
-        assert.throws(() => walk(link), refused(new RegExp(`${holder.replace(/[/.]/g, '\\$&')}, which holds ${link.replace(/[/.]/g, '\\$&')}, can be written by its group or by others and is not sticky`)), mode.toString(8));
+        assert.throws(() => walk(t, link), refused(new RegExp(`${holder.replace(/[/.]/g, '\\$&')}, which holds ${link.replace(/[/.]/g, '\\$&')}, can be written by its group or by others and is not sticky`)), mode.toString(8));
         const { host } = await macHost(t, { home: link });
         const error = await refusal(host);
         assert.equal(error.code, 'invalid_host');
@@ -385,40 +407,35 @@ test('checkHomePath: a link in a holder that others can write is refused, naming
     }
 });
 
-test('checkHomePath: a link or a directory that another user owns is refused even in a sticky holder, because its owner can retarget or rename it', () => {
-    const top = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'chp-'));
-    try {
-        const sticky = dirAt(top, 'sticky', 0o1777);
-        const real = dirAt(top, 'real');
-        const link = path.join(sticky, 'L');
-        fs.symlinkSync(real, link);
-        const own = dirAt(sticky, 'dir');
-        assert.doesNotThrow(() => walk(link));
-        assert.doesNotThrow(() => walk(own));
-        assert.throws(() => walk(link, { fsApi: fsWithOwners(new Map([[link, UID + 4242]])) }), refused(/L, a symbolic link in .*sticky, is owned by user \d+ \(mode 0\d{3}\), not by this user \(\d+\) or root/));
-        assert.throws(() => walk(own, { fsApi: fsWithOwners(new Map([[own, UID + 4242]])) }), refused(/dir, a directory in .*sticky, is owned by user \d+/));
-        // A directory of another user on the way is refused, and so is a first holder (`/`) of another user; root's is fine.
-        assert.throws(() => walk(own, { fsApi: fsWithOwners(new Map([[sticky, UID + 4242]])) }), refused(/sticky, a directory in .*, is owned by user \d+/));
-        assert.throws(() => walk(own, { fsApi: fsWithOwners(new Map([['/', UID + 4242]])) }), refused(/^.*\/, which holds \/[^/]+, is owned by user \d+, not by this user/));
-        const everyoneIsRoot = { ...fs, lstatSync: (file, options) => Object.assign(Object.create(Object.getPrototypeOf(fs.lstatSync(file, options))), fs.lstatSync(file, options), { uid: 0 }) };
-        assert.doesNotThrow(() => walk(own, { uid: UID + 1, fsApi: everyoneIsRoot }), 'root-owned files and holders are accepted whoever the user is');
-        assert.throws(() => walk(own, { uid: UID + 1 }), refused(/is owned by user/), 'and the user\'s own are not when the user is someone else');
-    } finally {
-        fs.rmSync(top, { recursive: true, force: true });
-    }
+test('checkHomePath: a link or a directory that another user owns is refused even in a sticky holder, because its owner can retarget or rename it', (t) => {
+    const top = scratch(t);
+    const sticky = dirAt(top, 'sticky', 0o1777);
+    const real = dirAt(top, 'real');
+    const link = path.join(sticky, 'L');
+    fs.symlinkSync(real, link);
+    const own = dirAt(sticky, 'dir');
+    assert.doesNotThrow(() => walk(t, link));
+    assert.doesNotThrow(() => walk(t, own));
+    assert.throws(() => walk(t, link, { fsApi: fsWithOwners(new Map([[link, UID + 4242]])) }), refused(/L, a symbolic link in .*sticky, is owned by user \d+ \(mode 0\d{3}\), not by this user \(\d+\) or root/));
+    assert.throws(() => walk(t, own, { fsApi: fsWithOwners(new Map([[own, UID + 4242]])) }), refused(/dir, a directory in .*sticky, is owned by user \d+/));
+    // A directory of another user on the way is refused, root's is fine.
+    assert.throws(() => walk(t, own, { fsApi: fsWithOwners(new Map([[sticky, UID + 4242]])) }), refused(/sticky, a directory in .*, is owned by user \d+/));
+    const everyoneIsRoot = { ...fs, lstatSync: (file, options) => Object.assign(Object.create(Object.getPrototypeOf(fs.lstatSync(file, options))), fs.lstatSync(file, options), { uid: 0 }) };
+    assert.doesNotThrow(() => walk(t, own, { uid: UID + 1, fsApi: everyoneIsRoot }), 'root-owned files and holders are accepted whoever the user is');
+    assert.throws(() => walk(t, own, { uid: UID + 1 }), refused(/is owned by user/), 'and the user\'s own are not when the user is someone else');
 });
 
 test('checkHomePath: a real directory is held to the same rule: in a holder others can write and that is not sticky it is refused, in a sticky one it is accepted', async (t) => {
     const top = scratch(t);
     const loose = dirAt(top, 'loose', 0o777);
     const home = dirAt(loose, 'home');
-    assert.throws(() => walk(home), refused(/loose, which holds .*home, can be written by its group or by others and is not sticky/));
+    assert.throws(() => walk(t, home), refused(/loose, which holds .*home, can be written by its group or by others and is not sticky/));
     const { host } = await macHost(t, { home });
     assert.equal((await refusal(host)).code, 'invalid_host');
     assert.deepEqual(fs.readdirSync(home), [], 'nothing was created in the home');
     const sticky = dirAt(top, 'sticky', 0o1777);
     const stickyHome = dirAt(sticky, 'home');
-    assert.doesNotThrow(() => walk(stickyHome));
+    assert.doesNotThrow(() => walk(t, stickyHome));
     const { host: accepted } = await macHost(t, { home: stickyHome });
     assert.equal((await accepted.acquire()).owned, true);
     await accepted.drain();
@@ -429,7 +446,7 @@ test('checkHomePath: a relative link and `..` are resolved the way the kernel do
     const a = dirAt(top, 'a');
     const real = dirAt(top, 'b');
     fs.symlinkSync('../b', path.join(a, 'L'));
-    assert.doesNotThrow(() => walk(path.join(a, 'L')));
+    assert.doesNotThrow(() => walk(t, path.join(a, 'L')));
     const { host } = await macHost(t, { home: path.join(a, 'L') });
     assert.equal((await host.acquire()).owned, true);
     assert.equal(bits(path.join(real, 'local-llm')), 0o700);
@@ -443,25 +460,25 @@ test('checkHomePath: a relative link and `..` are resolved the way the kernel do
     fs.writeFileSync(path.join(top, 'h'), 'a file, in the lexical reading');
     const kernelReading = dirAt(safe, 'h');
     assert.equal(fs.statSync(path.join(top, 'M')).ino, fs.statSync(kernelReading).ino, 'the kernel reads M as safe/h');
-    assert.doesNotThrow(() => walk(path.join(top, 'M')));
+    assert.doesNotThrow(() => walk(t, path.join(top, 'M')));
     fs.rmSync(path.join(top, 'h'));
     fs.rmSync(kernelReading, { recursive: true });
     dirAt(top, 'h');
     fs.writeFileSync(path.join(safe, 'h'), 'a file, in the kernel reading');
-    assert.throws(() => walk(path.join(top, 'M')), refused(/neither a directory nor a symbolic link/));
+    assert.throws(() => walk(t, path.join(top, 'M')), refused(/neither a directory nor a symbolic link/));
     // A home that itself has a `..` is not walked, because the host's paths and the kernel would read it differently.
-    assert.throws(() => walk(`${top}/N/../h`), refused(/'\.\.' component/));
+    assert.throws(() => walk(t, `${top}/N/../h`), refused(/'\.\.' component/));
     // `.` and repeated separators are nothing.
-    assert.doesNotThrow(() => walk(`${top}//./b/.`));
+    assert.doesNotThrow(() => walk(t, `${top}//./b/.`));
 });
 
 test('checkHomePath: a loop of links is refused after 40 expansions, a dangling link is not a directory, and a missing home is allowed only when it is not made yet', async (t) => {
     const top = scratch(t);
     fs.symlinkSync(path.join(top, 'b'), path.join(top, 'a'));
     fs.symlinkSync(path.join(top, 'a'), path.join(top, 'b'));
-    assert.throws(() => walk(path.join(top, 'a')), refused(/more than 40 symbolic links/));
+    assert.throws(() => walk(t, path.join(top, 'a')), refused(/more than 40 symbolic links/));
     fs.symlinkSync('self', path.join(top, 'self'));
-    assert.throws(() => walk(path.join(top, 'self', 'x')), refused(/more than 40 symbolic links/));
+    assert.throws(() => walk(t, path.join(top, 'self', 'x')), refused(/more than 40 symbolic links/));
     // 40 links in a chain are fine, 41 are not.
     const chain = dirAt(top, 'chain');
     const end = dirAt(chain, 'end');
@@ -471,27 +488,86 @@ test('checkHomePath: a loop of links is refused after 40 expansions, a dangling 
         fs.symlinkSync(previous, link);
         previous = link;
     }
-    assert.doesNotThrow(() => walk(previous));
+    assert.doesNotThrow(() => walk(t, previous));
     const over = path.join(chain, 'l40');
     fs.symlinkSync(previous, over);
-    assert.throws(() => walk(over), refused(/more than 40 symbolic links/));
+    assert.throws(() => walk(t, over), refused(/more than 40 symbolic links/));
     // Missing parts.
     const missing = path.join(top, 'not', 'yet');
-    assert.throws(() => walk(missing), refused(/cannot be read \(ENOENT\)/));
-    assert.doesNotThrow(() => walk(missing, { allowMissing: true }));
+    assert.throws(() => walk(t, missing), refused(/cannot be read \(ENOENT\)/));
+    assert.doesNotThrow(() => walk(t, missing, { allowMissing: true }));
     const loose = dirAt(top, 'loose2', 0o777);
-    assert.throws(() => walk(path.join(loose, 'new', 'home'), { allowMissing: true }), refused(/loose2, which holds .*new, can be written by its group or by others/), 'what is missing would be made in a loose holder');
+    assert.throws(() => walk(t, path.join(loose, 'new', 'home'), { allowMissing: true }), refused(/loose2, which holds .*new, can be written by its group or by others/), 'what is missing would be made in a loose holder');
     const file = path.join(top, 'file');
     fs.writeFileSync(file, 'x');
-    assert.throws(() => walk(file), refused(/neither a directory nor a symbolic link/));
-    assert.throws(() => walk(path.join(top, 'dangling-to-nowhere')), refused(/ENOENT/));
+    assert.throws(() => walk(t, file), refused(/neither a directory nor a symbolic link/));
+    assert.throws(() => walk(t, path.join(top, 'dangling-to-nowhere')), refused(/ENOENT/));
     fs.symlinkSync(path.join(top, 'nowhere'), path.join(top, 'dangling'));
-    assert.throws(() => walk(path.join(top, 'dangling')), refused(/nowhere. cannot be read \(ENOENT\)|nowhere cannot be read \(ENOENT\)/));
-    assert.throws(() => walk(path.join(top, 'chain'), { uid: null }), refused(/user id is unknown/));
+    assert.throws(() => walk(t, path.join(top, 'dangling')), refused(/nowhere. cannot be read \(ENOENT\)|nowhere cannot be read \(ENOENT\)/));
+    assert.throws(() => walk(t, path.join(top, 'chain'), { uid: null }), refused(/user id is unknown/));
     // A home that is not made yet under a loose holder is refused by the host before anything is made.
     const { host } = await macHost(t, { home: path.join(loose, 'newhome') });
     assert.equal((await refusal(host)).code, 'invalid_host');
     assert.deepEqual(fs.readdirSync(loose), [], 'the home was not made in the loose holder');
+});
+
+// A file system in memory: { path: { type: 'dir' | 'link', uid, mode, target } }, with only what the walk reads.
+function memFs(entries) {
+    const stat = (spec) => ({ uid: spec.uid ?? 0, mode: spec.mode ?? 0o755, isSymbolicLink: () => spec.type === 'link', isDirectory: () => spec.type === 'dir' });
+    return {
+        lstatSync(file) {
+            if (!entries[file]) throw Object.assign(new Error(`ENOENT: ${file}`), { code: 'ENOENT' });
+            return stat(entries[file]);
+        },
+        readlinkSync: (file) => entries[file].target,
+    };
+}
+const dir = (uid = 0, mode = 0o755) => ({ type: 'dir', uid, mode });
+const link = (target, uid = 0) => ({ type: 'link', uid, mode: 0o755, target });
+
+test('checkHomePath from the real root `/`, on a fake file system laid out like a Mac: /var and /tmp are root-owned links, and the usual homes pass', () => {
+    const me = 501;
+    const entries = {
+        '/': dir(), '/Users': dir(), '/Users/me': dir(me, 0o750), '/Users/me/pw': dir(me, 0o700),
+        '/var': link('private/var'), '/tmp': link('private/tmp'), '/private': dir(), '/private/var': dir(), '/private/var/folders': dir(),
+        '/private/var/folders/zz': dir(me, 0o755), '/private/var/folders/zz/T': dir(me, 0o700), '/private/var/folders/zz/T/home': dir(me, 0o700),
+        '/private/tmp': dir(0, 0o1777), '/private/tmp/x': dir(me, 0o700),
+    };
+    const fsApi = memFs(entries);
+    const check = (home, extra = {}) => checkHomePath(home, { fsApi, uid: me, ...extra });
+    for (const home of ['/Users/me/pw', '/var/folders/zz/T/home', '/tmp/x', '/private/tmp/x']) assert.doesNotThrow(() => check(home), home);
+    // The same layout, one rule broken at a time.
+    const broken = (change) => memFs({ ...entries, ...change });
+    assert.throws(() => check('/Users/me/pw', { fsApi: broken({ '/': dir(0, 0o777) }) }), refused(/\/, which holds \/Users, can be written by its group or by others and is not sticky \(mode 0777\)/));
+    assert.doesNotThrow(() => check('/Users/me/pw', { fsApi: broken({ '/': dir(0, 0o1777) }) }));
+    assert.throws(() => check('/Users/me/pw', { fsApi: broken({ '/Users': dir(0, 0o775) }) }), refused(/\/Users, which holds \/Users\/me, can be written/));
+    assert.throws(() => check('/Users/me/pw', { fsApi: broken({ '/Users/me': dir(me, 0o770) }) }), refused(/\/Users\/me, which holds \/Users\/me\/pw, can be written/));
+    assert.throws(() => check('/Users/me/pw', { fsApi: broken({ '/Users': dir(777) }) }), refused(/\/Users, a directory in \/, is owned by user 777/));
+    assert.throws(() => check('/Users/me/pw', { fsApi: broken({ '/': dir(777) }) }), refused(/\/, which holds \/Users, is owned by user 777, not by this user/));
+    assert.throws(() => check('/tmp/x', { fsApi: broken({ '/private/tmp': dir(0, 0o777) }) }), refused(/\/private\/tmp, which holds \/private\/tmp\/x, can be written/));
+    assert.throws(() => check('/tmp/x', { fsApi: broken({ '/tmp': link('private/tmp', 777) }) }), refused(/\/tmp, a symbolic link in \/, is owned by user 777/));
+    // A link that points out of a loose directory does not make the loose directory safe.
+    assert.throws(() => check('/Users/me/via/pw', { fsApi: memFs({ ...entries, '/Users/me/via': link('/loose/dir'), '/loose': dir(0, 0o777), '/loose/dir': dir(me), '/loose/dir/pw': dir(me) }) }), refused(/\/loose, which holds \/loose\/dir/));
+});
+
+test('checkHomePath `root`: the walk starts at the directory it is given and trusts it, a home outside it is refused, and an absolute link target outside it is walked from `/`', () => {
+    const me = 501;
+    const entries = { '/': dir(), '/a': dir(me, 0o777), '/a/b': dir(me, 0o700), '/a/b/home': dir(me, 0o700), '/a/b/out': link('/elsewhere/real'), '/a/b/in': link('/a/b/home'),
+        '/elsewhere': dir(0, 0o777), '/elsewhere/real': dir(me, 0o700) };
+    const fsApi = memFs(entries);
+    const check = (home, extra = {}) => checkHomePath(home, { fsApi, uid: me, ...extra });
+    // The loose /a is trusted as the root; it is a refused holder when the walk starts at `/`.
+    assert.doesNotThrow(() => check('/a/b/home', { root: '/a' }));
+    assert.throws(() => check('/a/b/home'), refused(/\/a, which holds \/a\/b, can be written/));
+    assert.throws(() => check('/a/b/home', { root: '/other' }), refused(/not below \/other/));
+    assert.throws(() => check('/another/home', { root: '/a' }), refused(/not below \/a, where the check of its path starts/));
+    assert.throws(() => check('/ab/home', { root: '/a' }), refused(/not below/), 'a sibling that shares a prefix is not below');
+    for (const root of ['relative', '/a/', '/a/../a', '']) assert.throws(() => check('/a/b/home', { root }), refused(/not an absolute normalized path/), JSON.stringify(root));
+    // An absolute link target below the root continues from the root; one outside it is walked from `/`, every ancestor checked.
+    assert.doesNotThrow(() => check('/a/b/in', { root: '/a' }));
+    assert.throws(() => check('/a/b/out', { root: '/a' }), refused(/\/elsewhere, which holds \/elsewhere\/real, can be written/));
+    // The home itself being the root leaves nothing to check below it.
+    assert.doesNotThrow(() => check('/a', { root: '/a' }));
 });
 
 test('the check runs on macOS only: on Linux a loose home, a home in a loose holder and a linked layout directory are accepted as they always were', async (t) => {
