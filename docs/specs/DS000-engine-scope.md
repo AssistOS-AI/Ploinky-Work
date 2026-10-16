@@ -18,10 +18,10 @@ summary: What the local-llm engine in lib/local-llm is, which hosts embed it, an
 | Catalog, registry, downloads, the deployment state machine, restart behavior | DS002 |
 | The hardware snapshot, admission, runner isolation, memory estimates | DS003 |
 | Runner locks, the verified cache, runnable copies, the install check | DS004 |
-| Hardware profiles: NVIDIA dedicated and unified memory, CPU, Vulkan (RADV, Venus, experimental APU), their detection, admission and guards | DS005 |
+| Hardware profiles: NVIDIA dedicated and unified memory, CPU, Vulkan (RADV, Venus, experimental APU), Apple Metal, their detection, admission and guards | DS005 |
 | Coding conventions and layout of the engine subtree | DS006 |
 | The host, messages and limits that the engine takes as input, and the public exports | DS007 |
-| The standalone pworker host: ownership of a home, launch records, the reaper, Unix-socket runners and the host runner locks (not part of the engine; `lib/local-llm-host`) | DS008 |
+| The standalone pworker host on Linux and macOS: ownership of a home, launch records, the reaper, Unix-socket runners, the host runner locks and the macOS profiles, readers and directory checks (not part of the engine; `lib/local-llm-host`) | DS008 |
 
 The runners are llama.cpp, its CPU and Vulkan builds, ik_llama.cpp, Ollama, vLLM, ExLlamaV3 with TabbyAPI, and LM Studio. LM Studio is for internal use only and sits behind an operator switch. A runner is an adapter plus data: the controller has no per-runner branches.
 
@@ -45,11 +45,11 @@ DS001 is the agent contract (manifest, tools, authorization, the chat endpoint, 
 
 ### macOS and the standalone Metal scope
 
-The engine also runs on macOS when its host gives it the macOS pieces: `darwinPlatform()` (DS007, the download binder of DS002), readers for the hardware snapshot, the memory and the memory pressure level, and a runner lock for the Mac (DS004). `lib/local-llm-host/darwin.mjs` and the `host-darwin` locks in `lib/local-llm-host/locks` hold the readers and the locks as host-side files that the engine never imports; they enter as the `readHardwareSnapshot`, `readMemory` and `readPressure` seams and as `imageRunnerLockFile`. A platform other than Linux and macOS is refused (`platformFor`), not guessed.
+The engine also runs on macOS when its host gives it the macOS pieces: `darwinPlatform()` (DS007, the download binder of DS002), readers for the hardware snapshot, the memory and the memory pressure level, and a runner lock for the Mac (DS004). `lib/local-llm-host/darwin.mjs` and the `host-darwin` locks in `lib/local-llm-host/locks` hold the readers and the locks as host-side files that the engine never imports; they enter as the `readHardwareSnapshot`, `readMemory` and `readPressure` seams and as `imageRunnerLockFile`. A platform other than Linux and macOS is refused (`platformFor`), not guessed. `pworker serve` is the host that supplies the macOS pieces (DS008): it fixes the profile by architecture, checks the directories of the home, probes the Metal device through the installed runner, and recovers orphaned runners through `ps`.
 
 | Host | Profile | Runners offered | Not offered |
 | --- | --- | --- | --- |
 | macOS on Apple Silicon (`darwin-arm64`) | `metal`, fixed by the host (DS005) | `llama.cpp`, the Metal build, installed from the Mac lock | ik_llama.cpp, Ollama, vLLM, ExLlamaV3 with TabbyAPI, LM Studio, the Vulkan, Venus and APU profiles, workspace-shared weights |
-| macOS on Intel (`darwin-x64`) | `cpu`, fixed by the host | `llama.cpp-cpu`, installed from the Mac lock | the same list. Not verified on hardware |
+| macOS on Intel (`darwin-x64`) | `cpu`, fixed by the host; guarded by the kernel pressure level like `metal` (`pressureScale`, DS007) | `llama.cpp-cpu`, installed from the Mac lock | the same list. Not verified on hardware |
 
-The Linux behavior is unchanged: `test/local-llm/agent-unchanged-metal.test.mjs` pins the eight runner ids, the default ports and the overview of the dedicated, unified, cpu, vulkan, venus and apu profiles, which stay deep-equal whether or not a catalog carries `metal` metadata. The Metal constants are provisional (DS005) and the inference smoke on a real model is run by the operator, so a Metal deployment is unit-tested and light-checked here, not certified.
+The Linux behavior is unchanged: `test/local-llm/agent-unchanged-metal.test.mjs` pins the eight runner ids, the default ports and the overview of the dedicated, unified, cpu, vulkan, venus and apu profiles, which stay deep-equal whether or not a catalog carries `metal` metadata. The Metal constants are provisional (DS005) and the inference smoke on a real model is run by the operator, so a Metal deployment is unit-tested and light-checked here, not certified. Pending: the Metal inference smoke on a real model (the operator's, at pressure level 1), a run of `darwin-x64` on hardware, and a measurement for the Metal constants.

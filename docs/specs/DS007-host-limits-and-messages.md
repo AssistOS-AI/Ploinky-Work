@@ -93,10 +93,11 @@ The overview key `gatewayModel` keeps its place and holds `gatewayModelName` (nu
 | `setOomScoreAdj(pid, value, { fsApi })` | Makes a process the out-of-memory killer's first choice | writes `<procDir>/<pid>/oom_score_adj` |
 | `tarFlags(into, strip)` | The extraction flags of the runner installer | `['-C', into, '--strip-components=<strip>', '--no-same-owner', '--touch']` |
 | `socketPathMax` | The longest Unix socket path in bytes (`sun_path` less its terminator); optional, 107 when absent | `107` |
+| `pressureScale` | Optional. What `readPressure` returns for the guard: absent is a PSI share (Linux); `'level'` is the kernel's memory pressure level (1, 2, 4), which puts the `cpu` profile under the same level guard as `metal` (DS005) | absent |
 
 ### The macOS platform (`darwinPlatform`) and `platformFor`
 
-`darwinPlatform({ privateRoot = null })` is frozen and has the members of `linuxPlatform()` that `defineHost` requires, with the macOS values below, plus four optional strategies that the engine uses only when a platform has them (a platform written for the Linux members alone keeps working). `platformFor(name = process.platform, options)` returns `linuxPlatform(options)` for `linux`, `darwinPlatform(options)` for `darwin`, and throws `LocalLlmError('unsupported_platform')` for any other name: the engine fails closed rather than run a download binder that was not written for the platform. Both functions are exported by `pworker/local-llm`. The binder that results is described in DS002.
+`darwinPlatform({ privateRoot = null })` is frozen and has the members of `linuxPlatform()` that `defineHost` requires, with the macOS values below, plus six optional members that the engine uses only when a platform has them (`confirmOpened`, `beforeCreate`, `untrustedRoots`, `performanceCores`, `socketPathMax` and `pressureScale`) (a platform written for the Linux members alone keeps working). `platformFor(name = process.platform, options)` returns `linuxPlatform(options)` for `linux`, `darwinPlatform(options)` for `darwin`, and throws `LocalLlmError('unsupported_platform')` for any other name: the engine fails closed rather than run a download binder that was not written for the platform. Both functions are exported by `pworker/local-llm`. The binder that results is described in DS002.
 
 | Member | Meaning | macOS value |
 | --- | --- | --- |
@@ -111,6 +112,10 @@ The overview key `gatewayModel` keeps its place and holds `gatewayModelName` (nu
 | `beforeCreate(fsApi, anchor, file)` | Optional. Called before a file is created or a partial file is opened for appending; throws `UNSAFE_PATH` to refuse | every directory from `privateRoot` (when it holds the root) or the anchored root down to the parent must be a real directory owned by the user with no group or other write bit |
 | `untrustedRoots` | Optional. `false` makes `anchorRoot` return null for an untrusted root, so a shared root is never walked | `false` |
 | `performanceCores()` | Optional. The high-performance cores, or null; the llama-server runners use it for their default threads before counting cores themselves | `hw.perflevel0.physicalcpu` from `sysctl`, or null |
+| `socketPathMax` | The longest Unix socket path in bytes. `sizeof(sockaddr_un.sun_path)` is 104 on macOS, one byte of it the terminator | `103` |
+| `pressureScale` | See the table above | `'level'`: `readPressure` returns the kernel's level, so the `cpu` profile of an Intel Mac is guarded like `metal` |
+
+The macOS readers of the hardware snapshot, the memory and the memory pressure level are not part of the platform: they are the controller's `readHardwareSnapshot`, `readMemory` and `readPressure` seams, and the engine's defaults read `/proc`. A host on macOS passes them (the standalone host does, DS008) or the Linux defaults find nothing and stop the runner at once. The `profile` seam fixes the hardware profile (`metal` or `cpu`) in place of the probe.
 
 ### The messages (`defineMessages`)
 
