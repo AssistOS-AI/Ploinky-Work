@@ -34,6 +34,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { strictLibraryCheck } from '../../lib/local-llm-host/elf.mjs';
+import { detectGpu } from './gpu-detect.mjs';
 
 const ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const BIN = path.join(ROOT, 'bin', 'pworker.mjs');
@@ -118,10 +119,13 @@ function run(command, commandArgs, options = {}) {
     return { status: result.status, stdout: (result.stdout ?? '').trim(), stderr: (result.stderr ?? '').trim(), error: result.error };
 }
 const smi = run('nvidia-smi', ['--query-gpu=name,driver_version', '--format=csv']);
-const gpuPresent = !smi.error && smi.status === 0 && smi.stdout.split('\n').length > 1;
-const runnerId = args.values.runner ?? (gpuPresent ? 'llama.cpp' : 'llama.cpp-cpu');
 const gpuSetting = args.values['expect-gpu'] ?? 'auto';
 if (!['auto', 'yes', 'no'].includes(gpuSetting)) refuse(`Unknown --expect-gpu ${gpuSetting}; use auto, yes or no.`);
+const smiAnswered = !smi.error && smi.status === 0 && smi.stdout.split('\n').length > 1;
+const gpu = detectGpu({ smiAnswered, setting: gpuSetting });
+if (gpu.problem) refuse(`FAILED: ${gpu.problem}`, 1);
+const gpuPresent = gpu.gpuPresent;
+const runnerId = args.values.runner ?? (gpuPresent ? 'llama.cpp' : 'llama.cpp-cpu');
 const expectGpu = gpuSetting === 'auto' ? (runnerId === 'llama.cpp' && gpuPresent) : gpuSetting === 'yes';
 
 const ownsHome = !args.values.home;

@@ -37,6 +37,18 @@ test('a bad option or probe is refused before anything starts, even with the var
     assert.equal(fs.existsSync(out), false);
 });
 
+test('the smoke script fails, and does not fall back to the CPU, when an NVIDIA device exists but nvidia-smi does not answer', async () => {
+    const { detectGpu } = await import('../live/gpu-detect.mjs');
+    const exists = (candidate) => candidate === '/proc/driver/nvidia';
+    const broken = detectGpu({ smiAnswered: false, setting: 'auto', exists });
+    assert.equal(broken.gpuPresent, false);
+    assert.match(broken.problem, /nvidia-smi did not answer; refusing to fall back to the CPU/);
+    assert.match(detectGpu({ smiAnswered: false, setting: 'auto', exists: (candidate) => candidate === '/dev/nvidia0' }).problem, /\/dev\/nvidia0/);
+    assert.deepEqual(detectGpu({ smiAnswered: false, setting: 'auto', exists: () => false }), { gpuPresent: false, problem: null }, 'a machine without NVIDIA runs on the CPU');
+    assert.deepEqual(detectGpu({ smiAnswered: false, setting: 'no', exists }), { gpuPresent: false, problem: null }, 'the CPU run on purpose');
+    assert.deepEqual(detectGpu({ smiAnswered: true, setting: 'auto', exists }), { gpuPresent: true, problem: null });
+});
+
 test('npm test does not run the live scripts', () => {
     const script = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).scripts.test;
     assert.ok(!/live/.test(script), script);
