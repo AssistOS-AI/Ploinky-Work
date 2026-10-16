@@ -1,7 +1,7 @@
 // The metal profile (DS005): admission against the captured Mac and against fabricated ones, the launch, the pure guard
 // verdict and the guard inside a controller. The constants are provisional, so the expected figures are written out here
 // and a change to a constant must change this file too. The captured Mac's figures come from the macOS readers
-// (lib/local-llm-darwin) fed with the output captured on a 16 GiB M1; no system tool runs.
+// (lib/local-llm-host/darwin.mjs) fed with the output captured on a 16 GiB M1; no system tool runs.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -14,7 +14,7 @@ import { loadSeedCatalog } from '../../lib/local-llm/controller/catalog.mjs';
 import { metalGuardVerdict } from '../../lib/local-llm/controller/metalGuard.mjs';
 import { METAL, PROFILES, cpuFloorBytes, cpuHostReserveBytes } from '../../lib/local-llm/controller/profiles.mjs';
 import { catalogProfileOf } from '../../lib/local-llm/controller/vulkan.mjs';
-import { readDarwinMemory, readDarwinPressure } from '../../lib/local-llm-darwin/darwin.mjs';
+import { readDarwinMemory, readDarwinPressure } from '../../lib/local-llm-host/darwin.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
 import { createController, getRunner } from './fixtures/host.mjs';
 
@@ -24,7 +24,7 @@ const seed = loadSeedCatalog(SEED_CATALOG_FILE);
 const tiny = seed.find((model) => model.id === 'qwen2.5-0.5b-instruct-q4_k_m');
 const large = seed.find((model) => model.id === 'qwen3-4b-instruct-2507-q4_k_m');
 const runner = getRunner('llama.cpp');
-const fixture = (name) => fs.readFileSync(new URL(`../local-llm-darwin/fixtures/${name}`, import.meta.url), 'utf8');
+const fixture = (name) => fs.readFileSync(new URL(`../local-llm-host/fixtures/darwin/${name}`, import.meta.url), 'utf8');
 const MTL0_TOTAL = 12_712_935_424;
 
 // ------------------------------------------------------------------ the captured Mac
@@ -424,7 +424,7 @@ test('metal-profile: on a Mac host (no executables, the arm64 lock as the image 
     const { createRunners } = await import('../../lib/local-llm/runners/index.mjs');
     const dataDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'local-llm-metal-host-'));
     t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
-    const lockFile = fileURLToPath(new URL('../../lib/local-llm-darwin/locks/runners.lock.darwin-arm64.json', import.meta.url));
+    const lockFile = fileURLToPath(new URL('../../lib/local-llm-host/locks/runners.lock.host-darwin-arm64.json', import.meta.url));
     const host = defineHost({ dataDir, runRoot: path.join(dataDir, 'run'), platform: darwinPlatform(), imageRunnerLockFile: lockFile });
     assert.deepEqual(host.executables, {});
     let downloads = 0;

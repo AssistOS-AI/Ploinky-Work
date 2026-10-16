@@ -45,7 +45,7 @@ DS001 is the agent contract (manifest, tools, authorization, the chat endpoint, 
 
 ### macOS and the standalone Metal scope
 
-The engine also runs on macOS when its host gives it the macOS pieces: `darwinPlatform()` (DS007, the download binder of DS002), readers for the hardware snapshot, the memory and the memory pressure level, and a runner lock for the Mac (DS004). `lib/local-llm-darwin` holds the readers and the locks as host-side files that the engine never imports; they enter as the `readHardwareSnapshot`, `readMemory` and `readPressure` seams and as `imageRunnerLockFile`. A platform other than Linux and macOS is refused (`platformFor`), not guessed.
+The engine also runs on macOS when its host gives it the macOS pieces: `darwinPlatform()` (DS007, the download binder of DS002), readers for the hardware snapshot, the memory and the memory pressure level, and a runner lock for the Mac (DS004). `lib/local-llm-host/darwin.mjs` and the `host-darwin` locks in `lib/local-llm-host/locks` hold the readers and the locks as host-side files that the engine never imports; they enter as the `readHardwareSnapshot`, `readMemory` and `readPressure` seams and as `imageRunnerLockFile`. A platform other than Linux and macOS is refused (`platformFor`), not guessed.
 
 | Host | Profile | Runners offered | Not offered |
 | --- | --- | --- | --- |

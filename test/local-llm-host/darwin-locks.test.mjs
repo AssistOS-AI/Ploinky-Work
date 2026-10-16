@@ -1,4 +1,4 @@
-// The runner locks of the macOS hosts (lib/local-llm-darwin/locks): each one loads through the engine's validator with the
+// The runner locks of the macOS hosts (lib/local-llm-host/locks): each one loads through the engine's validator with the
 // launch file required, and pins the llama.cpp b11295 release asset by size and sha256. The numbers are written out: they
 // were checked on 2026-10-16 by downloading each asset, hashing it, and reading the GitHub release's own listing.
 import assert from 'node:assert/strict';
@@ -10,9 +10,9 @@ import { loadRunnerLock, loadRunnerLocks, validateRunnerLock } from '../../lib/l
 import { createRunners } from '../../lib/local-llm/runners/index.mjs';
 import { defineHost } from '../../lib/local-llm/host.mjs';
 
-const lockFile = (name) => fileURLToPath(new URL(`../../lib/local-llm-darwin/locks/${name}`, import.meta.url));
-const ARM64 = lockFile('runners.lock.darwin-arm64.json');
-const AMD64 = lockFile('runners.lock.darwin-amd64.json');
+const lockFile = (name) => fileURLToPath(new URL(`../../lib/local-llm-host/locks/${name}`, import.meta.url));
+const ARM64 = lockFile('runners.lock.host-darwin-arm64.json');
+const AMD64 = lockFile('runners.lock.host-darwin-amd64.json');
 
 const EXPECTED = [
     [ARM64, 'llama.cpp', 'llama-b11295-bin-macos-arm64.tar.gz', 11_817_829, '1a0c5f60a3f2532a6d81c783bb18f11bac2925bc16dd605896b13fbabf4c7a56'],

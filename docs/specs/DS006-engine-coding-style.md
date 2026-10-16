@@ -37,8 +37,7 @@ lib/local-llm/
   runners/             one adapter per runner, and the table built from a host
   tools/runnerInstallCheck.mjs   the install check, also runnable as a script
 test/local-llm/        the engine tests and their fixtures
-test/local-llm-darwin/ tests of the macOS readers and locks of a standalone host (lib/local-llm-darwin)
-test/local-llm-host/   tests of a standalone host
+test/local-llm-host/   tests of a standalone host, its macOS readers and locks included
 docs/specs/            these specifications
 ```
 

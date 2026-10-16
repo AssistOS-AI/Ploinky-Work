@@ -1,4 +1,4 @@
-// The macOS readers (lib/local-llm-darwin): the snapshot, memory and pressure figures and the process identity, from
+// The macOS readers (lib/local-llm-host/darwin.mjs): the snapshot, memory and pressure figures and the process identity, from
 // output captured on a 16 GiB Apple M1 (16 KiB pages, llama.cpp b11295) and from fakes. Nothing here runs a system
 // tool, so the file runs on Linux and on macOS alike. Expected numbers are written out, not computed by the parser's
 // own formula.
@@ -17,9 +17,9 @@ import {
     readDarwinPressure,
     readDarwinSnapshot,
     readProcessIdentity,
-} from '../../lib/local-llm-darwin/darwin.mjs';
+} from '../../lib/local-llm-host/darwin.mjs';
 
-const fixture = (name) => fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8');
+const fixture = (name) => fs.readFileSync(new URL(`./fixtures/darwin/${name}`, import.meta.url), 'utf8');
 const VM_STAT = fixture('vm_stat.txt');
 const VM_STAT_4K = fixture('vm_stat-4k.txt');
 // What `sysctl hw.memsize kern.memorystatus_level ... vm.swapusage` prints on that Mac.
