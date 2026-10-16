@@ -182,6 +182,20 @@ test('run without runnerId uses llama.cpp-cpu on the cpu profile and llama.cpp o
     assert.deepEqual(named.calls, [['run', 'llama.cpp']], 'a runner the caller names is passed through untouched');
 });
 
+test('run without runnerId uses llama.cpp on the metal profile, and on a Vulkan profile refuses with the Vulkan build\'s own reason', async () => {
+    const metal = defaultRunnerRoutes({ profile: 'metal', runners: BOTH });
+    assert.equal((await metal.call('run', { modelId: MODEL }))[0], 202);
+    assert.deepEqual(metal.calls.filter(([name]) => name === 'run'), [['run', 'llama.cpp']]);
+    for (const profile of ['vulkan', 'venus', 'apu']) {
+        const { calls, call } = defaultRunnerRoutes({ profile, runners: [...BOTH, { id: 'llama.cpp-vulkan', supported: false, unsupportedReason: 'llama.cpp (Vulkan build) is not offered by the standalone pworker on macOS in this release.' }] });
+        const [status, answer] = await call('run', { modelId: MODEL });
+        assert.equal(status, 409, profile);
+        assert.match(answer.error.message, /default runner llama\.cpp-vulkan cannot be used here/, profile);
+        assert.doesNotMatch(answer.error.message, /CUDA|NVIDIA/, profile);
+        assert.equal(calls.some(([name]) => name === 'run'), false, profile);
+    }
+});
+
 test('preview without runnerId asks the engine about the default runner', async () => {
     const { calls, call } = defaultRunnerRoutes({ profile: 'cpu', runners: BOTH });
     const [status] = await call('preview', { modelId: MODEL });

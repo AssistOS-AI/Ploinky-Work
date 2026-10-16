@@ -160,14 +160,20 @@ test('a disabled engine and an unsupported platform create nothing and say why',
     await assert.rejects(disabled.controller(), { code: 'local_llm_disabled' });
     assert.deepEqual(fs.readdirSync(disabledHome), []);
 
-    const macHome = scratch(t);
-    const mac = createLocalLlmHost({ config: {}, home: macHome, env: {}, platformName: 'darwin' });
-    const result = await mac.acquire();
-    assert.equal(result.owned, false);
-    assert.match(result.reason, /not supported on darwin/);
-    await assert.rejects(mac.controller(), { code: 'local_llm_unsupported' });
-    assert.equal(mac.describe().supported.ok, false);
-    assert.deepEqual(fs.readdirSync(macHome), [], 'no directory and no listener');
+    // A platform without a host (and a Mac of an architecture without one) is unsupported; macOS on arm64 and x64 is supported.
+    for (const [platformName, arch, message] of [['freebsd', 'x64', /not supported on freebsd/], ['darwin', 'ia32', /not supported on darwin-ia32/], ['win32', 'x64', /not supported on win32/]]) {
+        const otherHome = scratch(t);
+        const other = createLocalLlmHost({ config: {}, home: otherHome, env: {}, platformName, arch });
+        const result = await other.acquire();
+        assert.equal(result.owned, false, platformName);
+        assert.match(result.reason, message);
+        await assert.rejects(other.controller(), { code: 'local_llm_unsupported' });
+        assert.equal(other.describe().supported.ok, false);
+        assert.deepEqual(fs.readdirSync(otherHome), [], 'no directory and no listener');
+    }
+    for (const arch of ['arm64', 'x64']) {
+        assert.deepEqual(createLocalLlmHost({ config: {}, home: scratch(t), env: {}, platformName: 'darwin', arch }).supported, { ok: true, reason: null }, arch);
+    }
 });
 
 test('socketDir: the default is made 0700 whatever the umask, an existing wrong one is refused, and so are a symlink, another owner and a relative override', (t) => {
@@ -423,7 +429,7 @@ test('through the controller the host lock makes the CUDA build installable on a
     };
     const cuda = await overviewOf('dedicated', () => '/usr/bin/nvidia-smi');
     const runner = (overview, id) => overview.runners.find((entry) => entry.id === id);
-    assert.deepEqual(cuda.models.map((model) => model.id), [MODEL], 'the seed catalog is the one pinned model');
+    assert.deepEqual(cuda.models.map((model) => model.id), [MODEL, 'qwen3-0.6b'], 'the seed catalog is the two pinned models');
     assert.equal(runner(cuda, 'llama.cpp').supported, true);
     assert.equal(runner(cuda, 'llama.cpp').install.version, 'b11295');
     assert.equal(runner(cuda, 'llama.cpp').install.files, 2, 'the CUDA build and its runtime');

@@ -29,8 +29,8 @@ test('without a model ready and without on-demand the gate refuses with the comm
 test('a refusal says why when the host is disabled, unsupported or has no model id to look for', async (t) => {
     const { host } = await startHost(t, { config: { localLlm: { enabled: false } } });
     assert.match((await createLocalLlmGate({ host }).ensure(ENTRY)).reason, /disabled/);
-    const unsupported = (await import('../../lib/local-llm-host/host.mjs')).createLocalLlmHost({ home: scratch(t), platformName: 'darwin' });
-    assert.match((await createLocalLlmGate({ host: unsupported }).ensure(ENTRY)).reason, /not supported on darwin/);
+    const unsupported = (await import('../../lib/local-llm-host/host.mjs')).createLocalLlmHost({ home: scratch(t), platformName: 'freebsd' });
+    assert.match((await createLocalLlmGate({ host: unsupported }).ensure(ENTRY)).reason, /not supported on freebsd/);
     assert.match((await createLocalLlmGate({ host: null }).ensure(ENTRY)).reason, /not available/);
     const running = await startHost(t);
     assert.match((await createLocalLlmGate({ host: running.host }).ensure({})).reason, /model id is required/);
@@ -170,11 +170,15 @@ test('the engine\'s cache identity names the model, the runner, its version and 
     assert.equal(gate.identity(MODEL), null, 'the stand-in runner has no pinned version');
 });
 
-test('the default runner is the CUDA build on an NVIDIA profile and the CPU build otherwise', () => {
+test('the default runner is llama.cpp on an NVIDIA or Metal profile, the CPU build on the cpu profile, and the Vulkan build on a Vulkan profile', () => {
     assert.equal(defaultRunnerFor('dedicated'), 'llama.cpp');
     assert.equal(defaultRunnerFor('unified'), 'llama.cpp');
+    assert.equal(defaultRunnerFor('metal'), 'llama.cpp');
     assert.equal(defaultRunnerFor('cpu'), 'llama.cpp-cpu');
     assert.equal(defaultRunnerFor(null), 'llama.cpp-cpu');
+    assert.equal(defaultRunnerFor(undefined), 'llama.cpp-cpu');
+    // A standalone host lists the Vulkan build as unsupported, so a default that names it refuses with its own reason, not a CUDA one.
+    for (const profile of ['vulkan', 'venus', 'apu']) assert.equal(defaultRunnerFor(profile), 'llama.cpp-vulkan', profile);
 });
 
 test('on demand: once a replace of the gate\'s own deployment is decided, a request for the deployment being replaced is refused, never forwarded to the dying runner', async (t) => {

@@ -38,6 +38,49 @@
           }
         }
       }
+    },
+    {
+      "id": "qwen3-0.6b",
+      "displayName": "Qwen3 0.6B (Q8_0)",
+      "description": "A small dense chat model with thinking and non-thinking modes; light enough for the CPU of a laptop or the GPU of a Mac, and a quick check that a machine can serve a model.",
+      "license": "Apache-2.0",
+      "architecture": "dense",
+      "totalParams": "0.6B",
+      "activeParams": "0.6B",
+      "contextLength": 40960,
+      "profiles": [
+        "cpu",
+        "dedicated",
+        "unified"
+      ],
+      "sources": {
+        "gguf": {
+          "type": "huggingface",
+          "repo": "Qwen/Qwen3-0.6B-GGUF",
+          "file": "Qwen3-0.6B-Q8_0.gguf",
+          "revision": "23749fefcc72300e3a2ad315e1317431b06b590a",
+          "commit": "23749fefcc72300e3a2ad315e1317431b06b590a",
+          "size": 639446688,
+          "sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+          "quantization": "Q8_0"
+        }
+      },
+      "memory": {
+        "layers": 28,
+        "kvBytesPerToken": 114688
+      },
+      "recommended": {
+        "cpu": {
+          "llama.cpp": {
+            "ctxSize": 4096
+          }
+        },
+        "metal": {
+          "llama.cpp": {
+            "ctxSize": 2048
+          }
+        }
+      }
     }
   ]
 }

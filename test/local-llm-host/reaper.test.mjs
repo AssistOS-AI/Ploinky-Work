@@ -243,15 +243,15 @@ test('a tampered record cannot make the reaper delete a file that is not one of 
     assert.deepEqual(kill.calls, []);
 });
 
-test('where the platform has no /proc the reaper does nothing and says so, and leaves every record', async (t) => {
+test('on a platform with no process table the reaper does nothing and says so, and leaves every record', async (t) => {
     const w = world(t);
     writeRecord(w, '0e0e0e0e', { phase: 'intent' });
     const kill = recordingKill();
-    const result = await reap(w, { killImpl: kill, platformName: 'darwin' });
+    const result = await reap(w, { killImpl: kill, platformName: 'freebsd' });
     assert.deepEqual(kill.calls, []);
     assert.equal(result.reaped.length, 0);
     assert.equal(fs.existsSync(path.join(w.launchDir, '0e0e0e0e.json')), true);
-    assert.ok(w.logs.some((line) => /not available on darwin/.test(line)));
+    assert.ok(w.logs.some((line) => /not available on freebsd/.test(line)));
 });
 
 test('record validation accepts exactly the two phases it writes', () => {
@@ -284,13 +284,13 @@ test('a record is written durably: temporary file, fsync, rename, fsync of the d
     assert.equal(readRecords(w.launchDir).length, 1);
 });
 
-test('the recorder keeps the pid and start time it reads from /proc, and null where there is no /proc', (t) => {
+test('the recorder keeps the pid and start time it reads from /proc, and null where there is no process table', (t) => {
     const w = world(t);
     writeProc(w.procDir, { pid: 4900, startTime: '6000', argv: ['x'] });
     const recorder = createLaunchRecorder({ dir: w.launchDir, procDir: w.procDir, platformName: 'linux' });
     recorder.spawned({ startId: '10101010', socketPath: socketOf(w, '10101010'), pid: 4900 });
     assert.deepEqual(readRecords(w.launchDir)[0].record, { startId: '10101010', socketPath: socketOf(w, '10101010'), phase: 'spawned', pid: 4900, startTime: '6000' });
-    const mac = createLaunchRecorder({ dir: w.launchDir, procDir: w.procDir, platformName: 'darwin' });
+    const mac = createLaunchRecorder({ dir: w.launchDir, procDir: w.procDir, platformName: 'freebsd' });
     mac.spawned({ startId: '10101011', socketPath: socketOf(w, '10101011'), pid: 4900 });
     assert.equal(readRecords(w.launchDir).find((entry) => entry.record.startId === '10101011').record.startTime, null);
     assert.throws(() => recorder.intent({ startId: '../../x', socketPath: '/x' }), /Invalid start id/);
