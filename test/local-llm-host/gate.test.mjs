@@ -178,10 +178,13 @@ test('the default runner is the CUDA build on an NVIDIA profile and the CPU buil
 });
 
 test('on demand: once a replace of the gate\'s own deployment is decided, a request for the deployment being replaced is refused, never forwarded to the dying runner', async (t) => {
+    let release = () => {};
+    // Hooks run first-registered first: this release is registered before the host's drain, so a failed assertion cannot leave the
+    // drain waiting for a stalled start (a hang instead of a failure).
+    t.after(() => release());
     const { host: real, counter } = await startHost(t);
     // The replace for another model is decided (nothing is busy) and stalls while it asks the engine what it could start.
     let hold = Promise.resolve();
-    let release = () => {};
     const slow = (controller) => controller && Object.create(controller, { overview: { value: async (...args) => { await hold; return controller.overview(...args); } } });
     const host = Object.create(real, { current: { value: () => slow(real.current()) }, controller: { value: async () => slow(await real.controller()) } });
     const gate = createLocalLlmGate({ host, settings: onDemand(), pollMs: 10 });
@@ -209,6 +212,7 @@ test('on demand: once a replace of the gate\'s own deployment is decided, a requ
 test('on demand: a start that is still loading when startWaitMs expires is armed for the idle stop', async (t) => {
     let release;
     const loading = new Promise((resolve) => { release = resolve; });
+    t.after(() => release());
     const { fakeAdapter } = await import('./fixtures/engine.mjs');
     const inner = fakeAdapter();
     const adapter = Object.freeze({ ...inner, async start(ctx) { await loading; return inner.start(ctx); } });
@@ -227,7 +231,6 @@ test('on demand: a start that is still loading when startWaitMs expires is armed
         clearTimeout: (id) => { armed.delete(id); },
     };
     const gate = createLocalLlmGate({ host, settings: onDemand({ idleStopMs: 1000, startWaitMs: 100 }), now: () => clock, timers, pollMs: 10 });
-    t.after(() => release());
     const timedOut = await gate.ensure(ENTRY);
     assert.equal(timedOut.ok, false);
     assert.match(timedOut.reason, /start timeout/);
