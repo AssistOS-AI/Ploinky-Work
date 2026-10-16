@@ -14,7 +14,7 @@ import { METAL } from '../../lib/local-llm/controller/profiles.mjs';
 import { catalogProfileOf } from '../../lib/local-llm/controller/vulkan.mjs';
 import { LocalLlmError } from '../../lib/local-llm/errors.mjs';
 import { validateRunnerLock } from '../../lib/local-llm/controller/runnerLock.mjs';
-import { SEED_CATALOG_FILE, checkPrivateDirs, createLocalLlmHost, hostLockFile, hostLockVersion } from '../../lib/local-llm-host/host.mjs';
+import { SEED_CATALOG_FILE, checkHomeLinks, checkPrivateDirs, createLocalLlmHost, hostLockFile, hostLockVersion } from '../../lib/local-llm-host/host.mjs';
 import { LAUNCH_SCHEMA, readRecords } from '../../lib/local-llm-host/launch.mjs';
 import { darwinPlatform } from '../../lib/local-llm/darwinPlatform.mjs';
 import { defineHost } from '../../lib/local-llm/host.mjs';
@@ -310,6 +310,81 @@ test('a home that is a link to a real directory is resolved first and accepted; 
         assert.equal((await other.acquire()).owned, true, mode.toString(8));
         await other.drain();
     }
+});
+
+// A holder directory at `mode` (whatever the umask is) with a link in it to a fresh real 0700 home; returns { holder, link, real }.
+function linkedHome(t, mode, { name = 'store' } = {}) {
+    const holder = scratch(t);
+    fs.chmodSync(holder, mode);
+    const real = scratch(t);
+    const link = path.join(holder, name);
+    fs.symlinkSync(real, link);
+    return { holder, link, real };
+}
+
+test('a home that is a link inside a directory others can write and that is not sticky is refused, naming the link, its holder and the real path; nothing is created', async (t) => {
+    for (const mode of [0o777, 0o775, 0o772]) {
+        const { holder, link, real } = linkedHome(t, mode);
+        const { host } = await macHost(t, { home: link });
+        const error = await refusal(host);
+        assert.equal(error.code, 'invalid_host', mode.toString(8));
+        assert.ok(error.message.includes(link) && error.message.includes(holder), error.message);
+        assert.match(error.message, /can be written by its group or by others and is not sticky/);
+        assert.ok(error.message.includes(`Set PWORKER_HOME to the real path ${real}`), error.message);
+        assert.deepEqual(fs.readdirSync(real), [], `${mode.toString(8)}: nothing was created through the link`);
+        await assert.rejects(host.acquire(), { code: 'invalid_host' }, 'the refusal is remembered');
+    }
+    // A link in the middle of the path counts as well: the home is below it.
+    const middle = linkedHome(t, 0o777);
+    fs.mkdirSync(path.join(middle.real, 'sub'), { mode: 0o700 });
+    const { host: below } = await macHost(t, { home: path.join(middle.link, 'sub') });
+    assert.equal((await refusal(below)).code, 'invalid_host');
+    assert.deepEqual(fs.readdirSync(path.join(middle.real, 'sub')), []);
+});
+
+test('a home link in a sticky holder (mode 1777) or in a directory only the user can write is accepted; a holder of another user is not', async (t) => {
+    for (const mode of [0o1777, 0o1775, 0o755, 0o750, 0o700]) {
+        const { link, real } = linkedHome(t, mode);
+        const { host } = await macHost(t, { home: link });
+        assert.equal((await host.acquire()).owned, true, mode.toString(8));
+        assert.equal(bits(path.join(real, 'local-llm')), 0o700, mode.toString(8));
+        await host.drain();
+    }
+    // The holder is the user's own for the file system, but this process says it is another user: the link could be replaced.
+    const { link } = linkedHome(t, 0o755);
+    const { host: other } = await macHost(t, { home: link, extra: { uid: process.getuid() + 1 } });
+    const error = await refusal(other);
+    assert.equal(error.code, 'invalid_host');
+    assert.match(error.message, /is owned by user \d+, not by this user \(\d+\) or root/);
+});
+
+test('only links are checked: a real home inside a directory others can write is accepted as it was, and Linux accepts a home link in such a directory', async (t) => {
+    const holder = scratch(t);
+    fs.chmodSync(holder, 0o777);
+    const home = path.join(holder, 'home');
+    fs.mkdirSync(home, { mode: 0o700 });
+    const { host } = await macHost(t, { home });
+    assert.equal((await host.acquire()).owned, true);
+    await host.drain();
+    const { link, real } = linkedHome(t, 0o777);
+    const linux = createLocalLlmHost({ config: {}, home: link, env: {}, platformName: 'linux', arch: 'x64', ownerPort: await freePort(), procDir: path.join(real, 'no-proc') });
+    t.after(() => linux.drain().catch(() => {}));
+    assert.equal((await linux.acquire()).owned, true);
+});
+
+test('checkHomeLinks: the holder may be the user or root, a dangling link is left to the walk of the resolved home, and a missing path is not a link', (t) => {
+    const uid = process.getuid();
+    const { link, holder } = linkedHome(t, 0o755);
+    assert.doesNotThrow(() => checkHomeLinks(link, { uid }));
+    assert.doesNotThrow(() => checkHomeLinks(path.join(holder, 'missing', 'deeper'), { uid }));
+    // A holder owned by root is accepted whoever the user is (/ holds /var and /tmp).
+    assert.doesNotThrow(() => checkHomeLinks('/var/tmp', { uid }));
+    assert.throws(() => checkHomeLinks(link, { uid: null }), /user id is unknown/);
+    const dangling = path.join(holder, 'dangling');
+    fs.symlinkSync(path.join(holder, 'nowhere'), dangling);
+    assert.doesNotThrow(() => checkHomeLinks(dangling, { uid }));
+    fs.chmodSync(holder, 0o777);
+    assert.throws(() => checkHomeLinks(dangling, { uid }), (error) => error.code === 'invalid_host' && /Set PWORKER_HOME to the real path\./.test(error.message));
 });
 
 test('the check runs on macOS only: on Linux a loose home and a linked layout directory are accepted as they always were', async (t) => {
