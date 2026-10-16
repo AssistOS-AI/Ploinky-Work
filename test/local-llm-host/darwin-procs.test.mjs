@@ -95,6 +95,8 @@ test('ps rows: pid, group, the first letter of the state, the start as UTC epoch
     assert.match(rows[0].stat.startTime, /^\d+$/, 'what validateRecord accepts as a start time');
     // A process that is exiting prints `?NEs` and `(node)` (seen on macOS while a runner dies): it is read, as dead, not refused.
     assert.deepEqual(parsePsRows(row(42395, 42395, '?NEs', T0, '(node)')), [{ pid: 42395, stat: { state: 'X', pgrp: 42395, startTime: T0_EPOCH }, command: '(node)' }]);
+    // A state with no letter and no E flag is not understood: the output is unreadable, never "dead".
+    assert.equal(parsePsRows(row(42395, 42395, '?s', T0, '/runner --host /r/abcd1234.sock')), null);
 });
 
 test('ps rows: a line that is not a row continues the command before it; garbage, a first line that is not a row, and an impossible start are refused', () => {
