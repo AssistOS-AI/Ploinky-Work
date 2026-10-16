@@ -6,9 +6,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import net from 'node:net';
 import test from 'node:test';
 
-import { createDarwinProcs, parsePsRows } from '../../lib/local-llm-host/darwinProcs.mjs';
+import { ProcessUnreadable, createDarwinProcs, parsePsRows } from '../../lib/local-llm-host/darwinProcs.mjs';
 import { LAUNCH_SCHEMA, createLaunchRecorder, readRecords } from '../../lib/local-llm-host/launch.mjs';
 import { listensOn } from '../../lib/local-llm-host/procfs.mjs';
 import { reapOrphans } from '../../lib/local-llm-host/reaper.mjs';
@@ -27,8 +28,13 @@ function fakePs(initial = {}) {
     const table = new Map(Object.entries(initial).map(([pid, spec]) => [Number(pid), { pgid: Number(pid), state: 'S', start: T0, ...spec }]));
     const calls = [];
     let garbage = null;
+    const failures = { A: null, p: null };
     const exec = (file, args, options) => {
         calls.push({ file, args, options });
+        // A failure of the run (`-A`: the listing, `-p`: one pid), as execFileSync raises it.
+        const failure = failures[args.includes('-A') ? 'A' : 'p'];
+        // `onlyPid` limits a `-p` failure to one pid.
+        if (failure && (failure.onlyPid === undefined || String(failure.onlyPid) === args.at(-1))) throw Object.assign(new Error('Command failed: ps'), { ...failure, onlyPid: undefined });
         if (garbage !== null) return garbage;
         const wanted = args.includes('-p') ? [Number(args.at(-1))] : [...table.keys()];
         const text = wanted.filter((pid) => table.has(pid)).map((pid) => { const p = table.get(pid); return row(pid, p.pgid, p.state, p.start, p.command); }).join('');
@@ -36,7 +42,7 @@ function fakePs(initial = {}) {
         if (!text && args.includes('-p')) throw Object.assign(new Error('Command failed: ps'), { status: 1, stdout: '' });
         return text;
     };
-    return { table, calls, exec, say: (text) => { garbage = text; } };
+    return { table, calls, exec, say: (text) => { garbage = text; }, failWith: (which, failure) => { failures[which] = failure; } };
 }
 
 /** A kill that records its calls; a SIGTERM or SIGKILL to -pgid removes the whole group, to a pid just that process. */
@@ -63,6 +69,13 @@ function world(t) {
     return { ...dirs, logs, log: (line) => logs.push(line) };
 }
 
+/** A real socket file at `file`, kept open until the test ends. */
+async function realSocketFile(t, file) {
+    const server = net.createServer();
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(file, resolve); });
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+}
+
 const socketOf = (w, startId) => path.join(w.socketDir, `${startId}.sock`);
 const writeRecord = (w, startId, body) => fs.writeFileSync(path.join(w.launchDir, `${startId}.json`), `${JSON.stringify({ schema: LAUNCH_SCHEMA, startId, socketPath: socketOf(w, startId), ...body })}\n`);
 const reap = (w, ps, extra = {}) => reapOrphans({
@@ -80,6 +93,8 @@ test('ps rows: pid, group, the first letter of the state, the start as UTC epoch
         { pid: 30811, stat: { state: 'S', pgrp: 30811, startTime: T1_EPOCH }, command: '/bin/zsh -c a  b' },
     ]);
     assert.match(rows[0].stat.startTime, /^\d+$/, 'what validateRecord accepts as a start time');
+    // A process that is exiting prints `?NEs` and `(node)` (seen on macOS while a runner dies): it is read, as dead, not refused.
+    assert.deepEqual(parsePsRows(row(42395, 42395, '?NEs', T0, '(node)')), [{ pid: 42395, stat: { state: 'X', pgrp: 42395, startTime: T0_EPOCH }, command: '(node)' }]);
 });
 
 test('ps rows: a line that is not a row continues the command before it; garbage, a first line that is not a row, and an impossible start are refused', () => {
@@ -143,25 +158,60 @@ test('the table runs /bin/ps -ww by absolute path with a fixed environment, and 
     }
 });
 
-test('a listing that cannot be understood throws; a single read that cannot be understood is null', () => {
+test('a listing that cannot be understood throws; a single read that cannot be understood is unreadable, not gone', () => {
     const ps = fakePs({ 1: { command: 'launchd' } });
     const procs = createDarwinProcs({ exec: ps.exec });
     for (const text of ['', 'garbage\n', 'ps: error\n']) {
         ps.say(text);
         assert.throws(() => procs.listAll(), /did not list the processes/, JSON.stringify(text));
         assert.throws(() => procs.listPids(), /did not list the processes/);
-        assert.equal(procs.readStat(1), null);
-        assert.equal(procs.readCmdline(1), null);
+        assert.throws(() => procs.readStat(1), ProcessUnreadable, JSON.stringify(text));
+        assert.throws(() => procs.readCmdline(1), ProcessUnreadable);
     }
     // ps that cannot run at all.
     const broken = createDarwinProcs({ exec: () => { throw Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }); } });
     assert.throws(() => broken.listAll(), /did not list/);
-    assert.equal(broken.readStat(5), null);
+    assert.throws(() => broken.readStat(5), ProcessUnreadable);
     // A row for another pid than the one asked, or an unparsable start, is not an answer.
     ps.say(row(2, 2, 'S', T0, 'other'));
-    assert.equal(procs.readStat(1), null);
+    assert.throws(() => procs.readStat(1), ProcessUnreadable);
     ps.say(row(1, 1, 'S', 'Fri Feb 30 03:42:14 2026', 'launchd'));
-    assert.equal(procs.readStat(1), null);
+    assert.throws(() => procs.readStat(1), ProcessUnreadable);
+});
+
+test('only ps -p exiting 1 with nothing printed means "no such process"; every other failure is unreadable and its partial output is never used', () => {
+    const ps = fakePs({ 4100: { command: 'a --host /r/aaaaaaaa.sock' } });
+    const partial = row(4100, 4100, 'S', T0, 'a --host /r/aaaaaaaa.sock');
+    const procs = createDarwinProcs({ exec: ps.exec });
+    // The one answer that means gone: status 1, stdout empty, no code, no signal (what a missing pid gives).
+    assert.equal(procs.readStat(99), null);
+    assert.equal(procs.readCmdline(99), null);
+    // A listing is never "gone": even that answer for -A is a listing that cannot be read.
+    ps.failWith('A', { status: 1, stdout: '' });
+    assert.throws(() => procs.listAll(), /did not list the processes/);
+    // A timeout with partial output of a real, complete-looking row: the listing is refused, not accepted as the whole table.
+    ps.failWith('A', { code: 'ETIMEDOUT', signal: 'SIGTERM', stdout: partial });
+    assert.throws(() => procs.listAll(), /ps. failed \(signal SIGTERM\)/);
+    assert.throws(() => procs.listPids(), /did not list the processes/);
+    ps.failWith('A', { code: 'ENOBUFS', stdout: partial });
+    assert.throws(() => procs.listAll(), /ENOBUFS/);
+    ps.failWith('A', { status: 2, stdout: partial });
+    assert.throws(() => procs.listAll(), /exit status 2/);
+    ps.failWith('A', { status: 1, stdout: partial });
+    assert.throws(() => procs.listAll(), /did not list the processes/, 'status 1 with output is not "no such process"');
+    // The single read: every shape other than the one answer is unreadable.
+    const unreadable = [
+        { code: 'EAGAIN', stdout: '' }, { code: 'ENOENT' }, { code: 'ETIMEDOUT', signal: 'SIGTERM', stdout: partial }, { signal: 'SIGKILL', status: null, stdout: '' },
+        { status: 2, stdout: '' }, { status: 1, stdout: partial }, { status: 1, code: 'EAGAIN', stdout: '' }, { status: 1 }, { status: 1, stdout: Buffer.from('x') },
+    ];
+    for (const failure of unreadable) {
+        ps.failWith('p', failure);
+        assert.throws(() => procs.readStat(4100), ProcessUnreadable, JSON.stringify(failure));
+        assert.throws(() => procs.readCmdline(4100), ProcessUnreadable, JSON.stringify(failure));
+    }
+    // Buffers are accepted for the empty case.
+    ps.failWith('p', { status: 1, stdout: Buffer.alloc(0) });
+    assert.equal(procs.readStat(4100), null);
 });
 
 // ------------------------------------------------------------------ the reaper on the table
@@ -262,16 +312,97 @@ test('members of the group that outlive the leader are ended one by one, each on
     assert.equal(ps.table.has(4602), true, 'a member whose start time changed is not signalled');
 });
 
-test('a ps that cannot be read stops the reaper before any signal and leaves the record', async (t) => {
+test('a ps that prints nothing readable signals nothing and leaves the record: a spawned record is unknown, an intent record stops the reaper', async (t) => {
     const w = world(t);
     const sock = socketOf(w, '13131313');
     const ps = fakePs({ 4700: { command: runnerCommand(sock) } });
     writeRecord(w, '13131313', { phase: 'spawned', pid: 4700, startTime: T0_EPOCH });
     ps.say('ps: cannot run\n');
     const kill = groupKill(ps);
+    const result = await reap(w, ps, { killImpl: kill });
+    assert.deepEqual(kill.calls, []);
+    assert.deepEqual(result.reaped, []);
+    assert.equal(result.skipped.length, 1);
+    assert.equal(readRecords(w.launchDir).length, 1, 'the record stays for the next start');
+    writeRecord(w, '1b1b1b1b', { phase: 'intent' });
     await assert.rejects(reap(w, ps, { killImpl: kill }), /did not list the processes/);
     assert.deepEqual(kill.calls, []);
-    assert.equal(readRecords(w.launchDir).length, 1, 'the record stays for the next start');
+    assert.equal(readRecords(w.launchDir).length, 2);
+});
+
+test('a listing that timed out with partial output stops the reaper before any signal, and the record and socket stay', async (t) => {
+    const w = world(t);
+    const sock = socketOf(w, '17171717');
+    await realSocketFile(t, sock);
+    const ps = fakePs({ 4710: { command: runnerCommand(sock) } });
+    writeRecord(w, '17171717', { phase: 'intent' });
+    // The runner is in the partial listing, but the listing is not accepted as complete.
+    ps.failWith('A', { code: 'ETIMEDOUT', signal: 'SIGTERM', stdout: row(4710, 4710, 'S', T0, runnerCommand(sock)) });
+    const kill = groupKill(ps);
+    await assert.rejects(reap(w, ps, { killImpl: kill }), /did not list the processes/);
+    assert.deepEqual(kill.calls, []);
+    assert.equal(readRecords(w.launchDir).length, 1);
+    assert.equal(fs.existsSync(sock), true);
+});
+
+test('a ps -p that fails while the listing shows the runner is unknown, not gone: no signal, the record and the socket stay, and the log says so', async (t) => {
+    const w = world(t);
+    const sock = socketOf(w, '18181818');
+    await realSocketFile(t, sock);
+    const ps = fakePs({ 4720: { command: runnerCommand(sock) } });
+    writeRecord(w, '18181818', { phase: 'spawned', pid: 4720, startTime: T0_EPOCH });
+    ps.failWith('p', { code: 'EAGAIN', stdout: '' });
+    const kill = groupKill(ps);
+    const result = await reap(w, ps, { killImpl: kill });
+    assert.deepEqual(kill.calls, []);
+    assert.deepEqual(result.reaped, []);
+    assert.equal(result.skipped.length, 1);
+    assert.match(result.skipped[0].reason, /^unknown: process 4720 could not be read: .ps. failed \(EAGAIN\)/);
+    assert.equal(readRecords(w.launchDir).length, 1, 'the record stays');
+    assert.equal(fs.existsSync(sock), true, 'the socket stays');
+    assert.equal(ps.table.has(4720), true);
+    assert.ok(w.logs.some((line) => /runner 18181818 could not be looked at .*launch record and socket are kept and no further signal is sent/.test(line)), w.logs.join('\n'));
+    // The same record is dealt with at the next start, once ps answers: the runner is ended and everything goes.
+    ps.failWith('p', null);
+    const next = await reap(w, ps, { killImpl: kill });
+    assert.deepEqual(next.reaped, ['18181818']);
+    assert.deepEqual(kill.calls, [[-4720, 'SIGTERM']]);
+    assert.deepEqual(readRecords(w.launchDir), []);
+});
+
+test('a read that fails after SIGTERM does not turn into "gone": the record and the socket stay, and there is no SIGKILL', async (t) => {
+    const w = world(t);
+    const sock = socketOf(w, '19191919');
+    await realSocketFile(t, sock);
+    const ps = fakePs({ 4730: { command: runnerCommand(sock) } });
+    writeRecord(w, '19191919', { phase: 'spawned', pid: 4730, startTime: T0_EPOCH });
+    const calls = [];
+    // The runner takes the signal and ps fails from then on.
+    const kill = (pid, signal) => { calls.push([pid, signal]); ps.failWith('p', { signal: 'SIGKILL', status: null, stdout: '' }); };
+    const result = await reap(w, ps, { killImpl: kill });
+    assert.deepEqual(calls, [[-4730, 'SIGTERM']]);
+    assert.deepEqual(result.reaped, []);
+    assert.equal(readRecords(w.launchDir).length, 1);
+    assert.equal(fs.existsSync(sock), true);
+    assert.ok(w.logs.some((line) => /runner 19191919 could not be looked at/.test(line)));
+    assert.equal(w.logs.some((line) => /it is gone/.test(line)), false, 'no "it is gone" line');
+});
+
+test('a group member that cannot be read after the leader is gone is left, and the record stays', async (t) => {
+    const w = world(t);
+    const sock = socketOf(w, '1a1a1a1a');
+    await realSocketFile(t, sock);
+    const ps = fakePs({ 4740: { command: runnerCommand(sock) }, 4741: { pgid: 4740, command: 'worker' } });
+    writeRecord(w, '1a1a1a1a', { phase: 'spawned', pid: 4740, startTime: T0_EPOCH });
+    ps.failWith('p', { onlyPid: 4741, code: 'EAGAIN', stdout: '' });
+    const calls = [];
+    const kill = (pid, signal) => { calls.push([pid, signal]); if (pid === -4740) ps.table.delete(4740); };
+    const result = await reap(w, ps, { killImpl: kill });
+    assert.deepEqual(calls, [[-4740, 'SIGTERM']]);
+    assert.deepEqual(result.reaped, []);
+    assert.equal(readRecords(w.launchDir).length, 1);
+    assert.equal(fs.existsSync(sock), true);
+    assert.equal(ps.table.has(4741), true);
 });
 
 test('a malformed record is set aside on macOS too, and no process is looked at', async (t) => {
@@ -299,4 +430,8 @@ test('on macOS the recorder keeps the start time ps reports as epoch seconds, an
     assert.equal(byId['15151516'].startTime, null, 'a pid ps does not know');
     // The record the Mac writes is the record its reaper trusts.
     assert.equal(byId['15151515'].pid, 4800);
+    // A ps that fails does not stop the record from being written: it has no start time, as before.
+    ps.failWith('p', { code: 'EAGAIN', stdout: '' });
+    recorder.spawned({ startId: '15151517', socketPath: socketOf(w, '15151517'), pid: 4800 });
+    assert.equal(readRecords(w.launchDir).find((entry) => entry.record.startId === '15151517').record.startTime, null);
 });

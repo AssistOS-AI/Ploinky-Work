@@ -93,7 +93,6 @@ The overview key `gatewayModel` keeps its place and holds `gatewayModelName` (nu
 | `setOomScoreAdj(pid, value, { fsApi })` | Makes a process the out-of-memory killer's first choice | writes `<procDir>/<pid>/oom_score_adj` |
 | `tarFlags(into, strip)` | The extraction flags of the runner installer | `['-C', into, '--strip-components=<strip>', '--no-same-owner', '--touch']` |
 | `socketPathMax` | The longest Unix socket path in bytes (`sun_path` less its terminator); optional, 107 when absent | `107` |
-| `pressureScale` | Optional. What `readPressure` returns for the guard: absent is a PSI share (Linux); `'level'` is the kernel's memory pressure level (1, 2, 4), which puts the `cpu` profile under the same level guard as `metal` (DS005) | absent |
 
 ### The macOS platform (`darwinPlatform`) and `platformFor`
 
@@ -113,7 +112,7 @@ The overview key `gatewayModel` keeps its place and holds `gatewayModelName` (nu
 | `untrustedRoots` | Optional. `false` makes `anchorRoot` return null for an untrusted root, so a shared root is never walked | `false` |
 | `performanceCores()` | Optional. The high-performance cores, or null; the llama-server runners use it for their default threads before counting cores themselves | `hw.perflevel0.physicalcpu` from `sysctl`, or null |
 | `socketPathMax` | The longest Unix socket path in bytes. `sizeof(sockaddr_un.sun_path)` is 104 on macOS, one byte of it the terminator | `103` |
-| `pressureScale` | See the table above | `'level'`: `readPressure` returns the kernel's level, so the `cpu` profile of an Intel Mac is guarded like `metal` |
+| `pressureScale` | Optional; absent (Linux) means `readPressure` returns a PSI share | `'level'`: `readPressure` returns the kernel's level, so the `cpu` profile of an Intel Mac is guarded like `metal` |
 
 The macOS readers of the hardware snapshot, the memory and the memory pressure level are not part of the platform: they are the controller's `readHardwareSnapshot`, `readMemory` and `readPressure` seams, and the engine's defaults read `/proc`. A host on macOS passes them (the standalone host does, DS008) or the Linux defaults find nothing and stop the runner at once. The `profile` seam fixes the hardware profile (`metal` or `cpu`) in place of the probe.
 
