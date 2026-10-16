@@ -76,6 +76,7 @@ The overview key `gatewayModel` keeps its place and holds `gatewayModelName` (nu
 | `toolPath` | `/usr/local/bin:/usr/bin:/bin` | The `PATH` of the processes the engine starts |
 | `gpuAccess` | null: never reported | `{ report(env) -> { unavailable, reason }, source }`: why the host has no GPU device. The engine passes `reason` through `plainDiagnosticText(reason, 300)` and words it with `gpuAccessReported`; `source` is the diagnostic source tag |
 | `platform` | `linuxPlatform()` | The operating-system strategies (below) |
+| `listen` | null: a runner listens on loopback TCP, on the port its adapter names, exactly as before | `{ socketDir, pathHint? }`: a runner listens on the Unix socket `<socketDir>/<8 hex>.sock` of its start and has no TCP port. `socketDir` is an absolute path with no `:` or `,`. The engine checks the byte length of the socket path against `platform.socketPathMax` before it downloads or launches anything and refuses with `socket_path_too_long`, which names the limit; `pathHint` is the host's own advice, appended to that message. Only a runner that declares `listensOnSocket` (llama.cpp's own server) can start on such a host; any other is refused with `runner_unavailable`. The host creates and checks `socketDir` (owner, mode 0700, not a link); the engine does not touch it |
 
 ### The platform (`linuxPlatform`)
 
@@ -91,6 +92,7 @@ The overview key `gatewayModel` keeps its place and holds `gatewayModelName` (nu
 | `unreadableReason` | The text appended to `UNSAFE_PATH` when the descriptor's path cannot be read | `<procDir>/self/fd is not readable` |
 | `setOomScoreAdj(pid, value, { fsApi })` | Makes a process the out-of-memory killer's first choice | writes `<procDir>/<pid>/oom_score_adj` |
 | `tarFlags(into, strip)` | The extraction flags of the runner installer | `['-C', into, '--strip-components=<strip>', '--no-same-owner', '--touch']` |
+| `socketPathMax` | The longest Unix socket path in bytes (`sun_path` less its terminator); optional, 107 when absent | `107` |
 
 ### The messages (`defineMessages`)
 
@@ -147,6 +149,9 @@ A hook that throws propagates, except `guardSample`, whose throw the engine coun
 | --- | --- |
 | `env` | Passed by reference. The switches `LOCAL_LLM_AMD_APU`, `LOCAL_LLM_VLLM_UNIFIED`, `LOCAL_LLM_LMSTUDIO`, `LOCAL_LLM_APU_GUARD_FLOOR_BYTES` and the `HF_TOKEN` token are engine reads at call time. The engine reads no path from the environment: every path comes from the host |
 | `killImpl` | The signal function of a runner stop (`process.kill` by default). A test passes a recording fake. `startRunnerProcess` also takes `platform` |
+| `startRunner` | Starts a runner process (`startRunnerProcess` by default). On a Unix-socket host (`host.listen`) its options carry `listen: { startId, socketPath }`, so a host can record the start before the process exists |
+| `socketFetchImpl`, `startIdFactory` | The fetch of a Unix-socket start's readiness probes (`httpFetch` with `socketPath` by default; global `fetch` cannot reach a socket) and the generator of the 8-hex start id |
+| `chatTarget()` | The ready runner's address. A TCP start answers `baseUrl: 'http://127.0.0.1:<port>'`, as before. A Unix-socket start answers `baseUrl: 'http://localhost'` and `socketPath`, which a caller passes to `httpFetch`; the base URL then only names the request path |
 | Hardware reaper | `createHardwareQueryReaper()` keeps the queries a stop killed but that have not exited. One reaper belongs to one controller; `readGpu` and `readSnapshot` take it as `reaper` and the drain waits on it |
 | Missing files | `loadSeedCatalog(file)`, `loadRunnerLock(file)` and `loadRunnerLocks({ image, agent })` refuse an undefined argument with `missing_file`; null means "none"; an `ENOENT` on a given path is an empty lock |
 | `.tar.zst` | `installRunner` and a Run that must rebuild a runnable copy are refused with `zstd_unsupported` where `zlib.createZstdDecompress` is missing, before any state is written or any byte is fetched (DS004) |
