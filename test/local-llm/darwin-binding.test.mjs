@@ -2,12 +2,14 @@
 // directory below it and the final path. The tests run on the real file system with the platform injected, so they run
 // on Linux and on macOS alike; nothing here reads /proc.
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
 import { darwinPlatform, platformFor } from '../../lib/local-llm/darwinPlatform.mjs';
+import { downloadArtifact, downloadFile, downloadSnapshotFile, snapshotPaths, verifyArtifact } from '../../lib/local-llm/controller/downloader.mjs';
 import { anchorRoot, anchorStore, createBound, openBound, openPartialBound, walkShared } from '../../lib/local-llm/controller/workspaceReuse.mjs';
 import { linuxPlatform } from '../../lib/local-llm/host.mjs';
 
@@ -20,11 +22,15 @@ function scratch(t) {
     return dir;
 }
 
-// A directory with an explicit mode, whatever the umask is.
+// A directory with an explicit mode on every level it creates, whatever the umask is.
 function directory(...parts) {
     const dir = path.join(...parts);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.chmodSync(dir, 0o755);
+    const missing = [];
+    for (let current = dir; !fs.existsSync(current); current = path.dirname(current)) missing.unshift(current);
+    for (const level of missing) {
+        fs.mkdirSync(level);
+        fs.chmodSync(level, 0o755);
+    }
     return dir;
 }
 
@@ -248,4 +254,118 @@ test('darwin-binding: a handle that is not a regular file is not bound', async (
         await handle.close();
     }
     await assert.rejects(darwinPlatform().confirmOpened(fs, handle, path.join(sub, 'x'), null), unsafe);
+});
+
+// ------------------------------------------------------------------ the whole download, not only the open
+
+const PAYLOAD = Buffer.from('tiny model bytes '.repeat(64));
+const ARTIFACT = Object.freeze({
+    source: 'huggingface', repo: 'owner/repo', file: 'm.gguf', revision: 'main', commit: 'c'.repeat(40),
+    size: PAYLOAD.length, sha256: crypto.createHash('sha256').update(PAYLOAD).digest('hex'),
+});
+const bigDisk = async () => ({ bavail: 1e12, bsize: 1 });
+
+// A fetch that counts its calls and answers with the payload (honoring a Range header).
+function countingFetch() {
+    const calls = [];
+    const fetchImpl = async (url, init = {}) => {
+        calls.push(String(url));
+        const range = /^bytes=(\d+)-$/.exec(init.headers?.Range ?? init.headers?.range ?? '');
+        const start = range ? Number(range[1]) : 0;
+        const headers = { 'content-length': String(PAYLOAD.length - start) };
+        if (range) headers['content-range'] = `bytes ${start}-${PAYLOAD.length - 1}/${PAYLOAD.length}`;
+        return new Response(PAYLOAD.subarray(start), { status: range ? 206 : 200, headers });
+    };
+    return { calls, fetchImpl };
+}
+
+// What is under `dir`, with the type and the mode, so a test can say that nothing was added, removed or changed.
+function listing(dir) {
+    const out = [];
+    const walk = (current) => {
+        for (const name of fs.readdirSync(current).sort()) {
+            const full = path.join(current, name);
+            const stats = fs.lstatSync(full);
+            out.push(`${path.relative(dir, full)} ${stats.isDirectory() ? 'dir' : `file ${stats.size}`}`);
+            if (stats.isDirectory()) walk(full);
+        }
+    };
+    walk(dir);
+    return out;
+}
+
+test('darwin-binding: downloadArtifact refuses a commit directory others can write before it removes, writes or fetches anything', async (t) => {
+    const root = directory(scratch(t), 'models');
+    const dir = directory(root, 'owner', 'repo', ARTIFACT.commit);
+    // A stale staging file a crash left: the refusal must not remove it either.
+    fs.writeFileSync(path.join(dir, 'm.gguf.partial.copy-1'), 'stale');
+    fs.chmodSync(dir, 0o775);
+    const before = listing(root);
+    const { calls, fetchImpl } = countingFetch();
+    await assert.rejects(downloadArtifact({ artifact: ARTIFACT, root, fetchImpl, statfs: bigDisk, platform: darwinPlatform() }),
+        { code: 'UNSAFE_PATH', message: /group or by others/ });
+    assert.equal(calls.length, 0);
+    assert.deepEqual(listing(root), before, 'nothing was added, removed or changed');
+    assert.equal(fs.existsSync(path.join(dir, 'm.gguf.partial.json')), false);
+    assert.equal(fs.existsSync(path.join(dir, 'm.gguf.partial')), false);
+    // The same call with the directory at 755 downloads, so the refusal was the mode.
+    fs.chmodSync(dir, 0o755);
+    const ok = await downloadArtifact({ artifact: ARTIFACT, root, fetchImpl, statfs: bigDisk, platform: darwinPlatform() });
+    assert.equal(ok.status, 'complete');
+    assert.equal(fs.readFileSync(path.join(dir, 'm.gguf')).equals(PAYLOAD), true);
+    assert.equal(calls.length, 1);
+});
+
+test('darwin-binding: directories the download itself creates are checked before the identity record is written', async (t) => {
+    // A umask of 002 makes the directories created for the artifact group-writable; the second check refuses before any write.
+    const previous = process.umask(0o002);
+    t.after(() => process.umask(previous));
+    const root = directory(scratch(t), 'models');
+    const before = listing(root);
+    const { calls, fetchImpl } = countingFetch();
+    await assert.rejects(downloadArtifact({ artifact: ARTIFACT, root, fetchImpl, statfs: bigDisk, platform: darwinPlatform() }),
+        { code: 'UNSAFE_PATH', message: /group or by others/ });
+    assert.equal(calls.length, 0);
+    const files = listing(root).filter((entry) => entry.includes(' file '));
+    assert.deepEqual(files, [], 'no identity record, partial or staging file');
+    assert.ok(listing(root).length >= before.length);
+});
+
+test('darwin-binding: downloadFile refuses a target directory others can write, with no request and no file left', async (t) => {
+    const dir = directory(scratch(t), 'files');
+    fs.writeFileSync(path.join(dir, 'runner.whl.partial.copy-1'), 'stale');
+    fs.chmodSync(dir, 0o775);
+    const before = listing(dir);
+    const { calls, fetchImpl } = countingFetch();
+    const options = { url: 'https://github.com/example/runner/releases/download/1/runner.whl', size: PAYLOAD.length, sha256: ARTIFACT.sha256,
+        target: path.join(dir, 'runner.whl'), fetchImpl, statfs: bigDisk, platform: darwinPlatform() };
+    await assert.rejects(downloadFile(options), { code: 'UNSAFE_PATH' });
+    assert.equal(calls.length, 0);
+    assert.deepEqual(listing(dir), before);
+    fs.chmodSync(dir, 0o755);
+    assert.equal((await downloadFile(options)).bytesTransferred, PAYLOAD.length);
+    assert.equal(calls.length, 1);
+});
+
+test('darwin-binding: a snapshot file and a verify of a stored file are checked the same way', async (t) => {
+    const root = directory(scratch(t), 'hf');
+    const commit = 'd'.repeat(40);
+    const artifact = { repo: 'owner/repo', commit, file: 'config.json', size: PAYLOAD.length, sha256: ARTIFACT.sha256 };
+    const { dir, stateDir } = snapshotPaths({ root, repo: 'owner/repo', commit });
+    directory(dir);
+    directory(stateDir);
+    fs.chmodSync(stateDir, 0o775);
+    const before = listing(root);
+    const { calls, fetchImpl } = countingFetch();
+    await assert.rejects(downloadSnapshotFile({ artifact, root, fetchImpl, statfs: bigDisk, platform: darwinPlatform() }),
+        { code: 'UNSAFE_PATH' });
+    assert.equal(calls.length, 0);
+    assert.deepEqual(listing(root), before);
+    // A stored file in a directory others can write is not verified either: verifying may rewrite its record.
+    const store = directory(scratch(t), 'models');
+    const home = directory(store, 'owner', 'repo', ARTIFACT.commit);
+    fs.writeFileSync(path.join(home, 'm.gguf'), PAYLOAD);
+    fs.writeFileSync(path.join(home, 'm.gguf.json'), JSON.stringify({ ...ARTIFACT }));
+    fs.chmodSync(home, 0o775);
+    await assert.rejects(verifyArtifact({ root: store, artifact: ARTIFACT, platform: darwinPlatform() }), { code: 'UNSAFE_PATH' });
 });
