@@ -17,7 +17,8 @@ import { IDENTITY_LIMITS, LIMIT_HOOKS, defineLimits } from '../../lib/local-llm/
 import { createRunners } from '../../lib/local-llm/runners/index.mjs';
 import { createStateStore } from '../../lib/local-llm/controller/stateStore.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
-import { HOST, PLOINKY_MESSAGES, RUNNERS, createController, getRunner } from './fixtures/host.mjs';
+import { HOST, PLOINKY_MESSAGES, RUNNERS, agentLikeHost, createController, getRunner } from './fixtures/host.mjs';
+import { ggufBytes, modelPairs } from './gguf-fixture.mjs';
 import { cpuFs } from './fixtures/sharedFixtures.mjs';
 
 const MIB = 1024 * 1024;
@@ -46,11 +47,14 @@ const ENOENT = () => Object.assign(new Error('absent'), { code: 'ENOENT' });
 // ---------------------------------------------------------------- the contract and the identity default
 
 test('limits: the default is the identity of every hook, and the value is frozen', () => {
-    assert.deepEqual(LIMIT_HOOKS, ['capCores', 'observeSnapshot', 'decorateSnapshot', 'memoryPool', 'refuseProfile', 'admit', 'effective',
+    assert.deepEqual(LIMIT_HOOKS, ['capCores', 'capThreads', 'capParams', 'observeSnapshot', 'decorateSnapshot', 'memoryPool', 'refuseProfile', 'admit', 'effective',
         'refuseResourceRequest', 'overview', 'runnerEnvironment', 'guardSample', 'guardBreach', 'vllmQualification']);
     assert.ok(Object.isFrozen(IDENTITY_LIMITS));
     assert.equal(IDENTITY_LIMITS.capCores(7, { fsApi: {} }), 7);
     const snapshot = { gpu: {}, memory: { totalBytes: 1 } };
+    assert.equal(IDENTITY_LIMITS.capThreads(9, { profile: 'cpu' }), 9);
+    const params = { ctxSize: 1 };
+    assert.equal(IDENTITY_LIMITS.capParams({ runnerId: 'llama.cpp', profile: 'cpu', params, explicit: [], model: {} }), params);
     assert.equal(IDENTITY_LIMITS.observeSnapshot({ fsApi: {}, env: {} }), null);
     assert.equal(IDENTITY_LIMITS.decorateSnapshot({ snapshot, fsApi: {}, env: {} }), snapshot);
     assert.equal(IDENTITY_LIMITS.memoryPool({ totalBytes: 1, availableBytes: 1 }, snapshot, { amount: String }), null);
@@ -126,8 +130,8 @@ test('capCores: createRunners gives the limits to the thread defaults of llama.c
         assert.equal(threadsOf(launchOf(runners[id])), '38', `${id} with the capped 40 cores`);
         assert.equal(threadsOf(launchOf(RUNNERS[id])), physical, `${id} with the physical cores`);
     }
-    assert.ok(calls.every((call) => call.name === 'capCores'));
-    assert.ok(calls.length >= 2);
+    assert.ok(calls.every((call) => call.name === 'capCores' || call.name === 'capThreads'));
+    assert.ok(calls.filter((call) => call.name === 'capCores').length >= 2);
 });
 
 test('capCores: the performance class of the unified and CPU thread defaults is capped by the hook too', (t) => {
@@ -756,4 +760,212 @@ test('guard hooks: the headroom answer is compared with the floor of a dedicated
     cap = 0;
     await until(() => h.controller.state.deployment?.phase !== 'ready');
     assert.match(h.controller.state.deployment.error ?? '', /below the floor \(0\.0 GiB available, 4\.0 GiB required\)/);
+});
+
+// ---------------------------------------------------------------- capThreads and capParams
+
+test('capThreads and capParams: the identity returns its input unchanged', () => {
+    const params = Object.freeze({ ctxSize: 4096, parallel: 1, threads: null });
+    assert.equal(IDENTITY_LIMITS.capThreads(14, { profile: 'cpu' }), 14);
+    assert.equal(IDENTITY_LIMITS.capParams({ runnerId: 'llama.cpp', profile: 'cpu', params, explicit: Object.freeze(['ctxSize']), model }), params);
+});
+
+const metalHost = (performanceCores) => agentLikeHost({ platform: Object.freeze({ ...HOST.platform, performanceCores: () => performanceCores }) });
+
+test('capThreads: the default --threads of the cpu, dedicated, unified and metal launches is the hook\'s answer, and it is not called for a threads value the caller set', () => {
+    const profiles = ['cpu', 'dedicated', 'unified', 'metal'];
+    const { limits, calls } = recording({ capThreads: (threads) => Math.max(1, threads - 1) });
+    // The metal and unified defaults are the platform's performance cores; the others the physical cores (each by the engine's own function).
+    const runners = createRunners({ host: metalHost(10), messages: PLOINKY_MESSAGES, limits });
+    const plain = createRunners({ host: metalHost(10), messages: PLOINKY_MESSAGES });
+    for (const profile of profiles) {
+        const before = Number(threadsOf(launchOf(plain['llama.cpp'], profile)));
+        const after = Number(threadsOf(launchOf(runners['llama.cpp'], profile)));
+        assert.ok(before > 1, `${profile}: ${before}`);
+        assert.equal(after, before - 1, `${profile}: the hook lowered the default`);
+    }
+    assert.equal(threadsOf(launchOf(plain['llama.cpp'], 'metal')), '10', 'the Metal default is the performance cores of the platform');
+    assert.deepEqual(calls.filter((call) => call.name === 'capThreads').map((call) => call.args[1]), profiles.map((profile) => ({ profile })));
+    assert.equal(calls.filter((call) => call.name === 'capThreads').at(-1).args[0], 10, 'the hook gets the resolved default, the performance cores on metal');
+    // A threads parameter the caller set is the caller's: the hook is not asked.
+    const before = calls.length;
+    const explicit = runners['llama.cpp'].buildLaunch({ artifactPath: '/m/q.gguf', params: { threads: 7 }, port: 18080, apiKey: 'k'.repeat(43),
+        model: { id: 'm', displayName: 'M' }, runnerDir: '/x/run/llama.cpp/b1', profile: 'metal' });
+    assert.equal(threadsOf(explicit), '7');
+    assert.equal(calls.length, before);
+});
+
+test('capThreads: LM Studio\'s default threads go through the hook with the dedicated profile, and a threads value the caller set does not', async (t) => {
+    const loadedThreads = async (params) => {
+        const { limits, calls } = recording({ capThreads: () => 3 });
+        const runner = createRunners({ host: HOST, messages: PLOINKY_MESSAGES, limits }).lmstudio;
+        const runDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'limits-lms-'));
+        t.after(() => fs.rmSync(runDir, { recursive: true, force: true }));
+        const loads = [];
+        const ctx = { runnerDir: runDir, model: loadSeedCatalog(SEED_CATALOG_FILE).find((entry) => entry.id === 'gpt-oss-20b'), params, port: 18084,
+            weights: { path: '/data/models/gpt-oss-20b-MXFP4.gguf' }, launch: () => ({ running: true }), waitForHttp: async () => {},
+            async exec(step) { if (step.args[1] === 'load') loads.push(JSON.parse(step.args[2])); return step.args[0] === 'ps' ? [] : { modelKey: 'k', identifier: 'i' }; } };
+        const procDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'limits-lms-proc-'));
+        t.after(() => fs.rmSync(procDir, { recursive: true, force: true }));
+        // The start fails after the load, when it finds no engine process; the load is what is read.
+        await runner.start(ctx, { procDir, kill: () => {}, node: '/usr/bin/node' }).catch(() => {});
+        const override = loads[0].config.llamaCppArgumentsOverride.overrideParameters.find((entry) => entry.key === '--threads');
+        return { threads: override.value, calls: calls.filter((call) => call.name === 'capThreads') };
+    };
+    const byDefault = await loadedThreads({});
+    assert.equal(byDefault.threads, '3', 'the hook\'s answer is what the load asks for');
+    assert.equal(byDefault.calls.length, 1);
+    assert.equal(byDefault.calls[0].args[1].profile, 'dedicated');
+    assert.deepEqual(byDefault.calls[0].args[1], { profile: 'dedicated' });
+    const explicit = await loadedThreads({ threads: 9 });
+    assert.equal(explicit.threads, '9');
+    assert.equal(explicit.calls.length, 0, 'a caller-set value is not passed to capThreads');
+});
+
+const caps = (overrides = {}) => recording({
+    capParams: ({ params, explicit }) => {
+        if (params.ctxSize > 1024) {
+            if (explicit.includes('ctxSize')) throw new LocalLlmError('invalid_params', `Invalid parameter ctxSize: ${params.ctxSize} is above the cap of 1024`, { field: 'ctxSize' });
+            return { ...params, ctxSize: 1024 };
+        }
+        return params;
+    },
+    ...overrides,
+});
+
+async function paramsController(t, limits, { dataDir = null, startArgs = [], registry = null, weights = null } = {}) {
+    dataDir ??= fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'limits-params-'));
+    if (!fs.existsSync(path.join(dataDir, 'weight.gguf'))) fs.writeFileSync(path.join(dataDir, 'weight.gguf'), weights ?? 'weights');
+    if (registry) {
+        fs.mkdirSync(path.join(dataDir, 'state'), { recursive: true });
+        fs.writeFileSync(path.join(dataDir, 'state', 'controller.json'), JSON.stringify({ version: 1, deployment: null, params: {}, requests: {}, registry }));
+    }
+    const memory = { totalBytes: 8 * GIB, availableBytes: 7 * GIB };
+    const seed = loadSeedCatalog(SEED_CATALOG_FILE).filter((entry) => entry.id === 'qwen2.5-0.5b-instruct-q4_k_m').map((entry) => validateModel(entry, { seed: true }));
+    const snapshot = { gpu: { available: false, state: 'absent' }, memory, disk: { freeBytes: 1e12 } };
+    const controller = createController({ dataDir, seedCatalog: seed, sharedModelsRoot: null, imageContract: {}, limits, env: { PATH: '/usr/bin' },
+        fileExists: () => true, installer: { installable: () => false }, detectRunner: () => ({ installed: true }),
+        snapshot: async () => snapshot, readMemory: () => memory, readPressure: () => 0,
+        inspect: async () => ({ state: 'complete', bytes: 7, total: 7 }),
+        download: async () => ({ status: 'complete', path: path.join(dataDir, 'weight.gguf'), bytesTransferred: 0 }),
+        dropCache: () => true, pollMs: 2, stopGraceMs: 20, fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({}) }),
+        startRunner(options) {
+            startArgs.push(options.args);
+            let resolve;
+            const handle = { pid: 9000, running: true, exited: new Promise((done) => { resolve = done; }),
+                async stop() { handle.running = false; resolve({ code: 0, signal: 'SIGTERM' }); }, async kill() { return handle.stop(); } };
+            return handle;
+        } });
+    t.after(async () => { await controller.drain(); });
+    t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+    return { controller, seed, dataDir };
+}
+const ctxOf = (args) => args[args.indexOf('--ctx-size') + 1];
+const SAVED = 'qwen2.5-0.5b-instruct-q4_k_m|llama.cpp';
+
+test('capParams: a default context is clamped, an explicit one above the cap is refused before launch, and a saved value is a default', async (t) => {
+    // The control: no hook, the cpu default of 4096.
+    const plainArgs = [];
+    const plain = await paramsController(t, undefined, { startArgs: plainArgs });
+    const id = plain.seed[0].id;
+    await plain.controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'cap-params-0001', params: {} });
+    await until(() => plainArgs.length === 1);
+    assert.equal(ctxOf(plainArgs[0]), '4096');
+
+    const probe = caps();
+    const args = [];
+    const first = await paramsController(t, probe.limits, { startArgs: args });
+    await first.controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'cap-params-0002', params: {} });
+    await until(() => args.length === 1);
+    assert.equal(ctxOf(args[0]), '1024', 'the default context is clamped, in the launch');
+    assert.equal(first.controller.state.deployment.params.ctxSize, 1024, 'and in the deployment');
+    const [context] = probe.named('capParams')[0].args;
+    assert.deepEqual({ ...context, params: undefined, model: undefined }, { runnerId: 'llama.cpp', profile: 'cpu', params: undefined, explicit: [], model: undefined });
+    assert.equal(context.params.ctxSize, 4096, 'the hook got the normalized parameters, before the cap');
+    assert.equal(context.model.id, id);
+    assert.ok(Object.isFrozen(context.explicit));
+
+    // The explicit value is told apart from the saved and the default one.
+    await first.controller.stop();
+    const asked = await first.controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'cap-params-0003', params: { ctxSize: 2048 } }).catch((error) => error);
+    assert.equal(asked.code, 'invalid_params', 'refused by Run itself, before anything is downloaded or started');
+    assert.match(asked.message, /ctxSize: 2048 is above the cap of 1024/);
+    assert.deepEqual(probe.named('capParams').at(-1).args[0].explicit, ['ctxSize']);
+    assert.equal(args.length, 1, 'nothing was started');
+    assert.equal(first.controller.state.deployment?.phase === 'error' || first.controller.state.deployment?.phase === 'ready', false);
+    await assert.rejects(first.controller.overview({ preview: { modelId: id, runnerId: 'llama.cpp', params: { ctxSize: 2048 } } }), { code: 'invalid_params' }, 'and a preview throws the refusal, not a form error');
+    // A parameter error of the runner itself stays form data in a preview.
+    const form = await first.controller.overview({ preview: { modelId: id, runnerId: 'llama.cpp', params: { ctxSize: 1 } } });
+    assert.match(form.preview.error, /ctxSize/);
+
+    // A saved value above the cap is a default: Run with no params clamps it, and saved explicit-looking 4096 does not refuse.
+    assert.equal(first.controller.state.params[SAVED].ctxSize, 4096);
+    const savedProbe = caps();
+    const second = await paramsController(t, savedProbe.limits, { dataDir: first.dataDir, startArgs: [] });
+    assert.equal(second.controller.state.params[SAVED].ctxSize, 4096, 'the saved set was loaded');
+    await second.controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'cap-params-0004' });
+    assert.equal(second.controller.state.deployment.params.ctxSize, 1024, 'the saved 4096 was clamped, not refused');
+    assert.deepEqual(savedProbe.named('capParams').at(-1).args[0].explicit, []);
+});
+
+test('capParams: removing the cap restores the earlier parameters, because Run saves the set before the cap (G5)', async (t) => {
+    const first = await paramsController(t, caps().limits, { startArgs: [] });
+    const id = first.seed[0].id;
+    await first.controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'cap-saved-0001', params: {} });
+    assert.equal(first.controller.state.deployment.params.ctxSize, 1024);
+    assert.equal(first.controller.state.params[SAVED].ctxSize, 4096, 'the Run site saved the pre-cap set');
+    await first.controller.drain();
+    // The same state with the identity limits: the earlier value is back, in the preview and the Run.
+    const args = [];
+    const later = await paramsController(t, undefined, { dataDir: first.dataDir, startArgs: args });
+    const preview = await later.controller.overview({ preview: { modelId: id, runnerId: 'llama.cpp' } });
+    assert.equal(preview.preview.params.ctxSize, 4096);
+    await later.controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'cap-saved-0002' });
+    await until(() => args.length === 1);
+    assert.equal(ctxOf(args[0]), '4096');
+});
+
+test('capParams: the renormalize site saves the pre-cap set, and the deployment and the launch use the capped one', async (t) => {
+    // A model added from a GGUF header: the stored training context is 32768 and the downloaded file says 2048, so the Run works out its parameters again.
+    const header = (context) => {
+        const bytes = ggufBytes({ kv: modelPairs({ layers: 24, heads: 14, kvHeads: 2, embedding: 896, context }) }).bytes;
+        return Buffer.concat([bytes, Buffer.alloc(Math.max(0, 65536 - bytes.length), 0xee)]);
+    };
+    const entry = validateModel({
+        id: 'trained-short', sizingSource: 'gguf-header', contextLength: 32768, memory: { layers: 24, kvBytesPerToken: 12288 },
+        sources: { gguf: { type: 'huggingface', repo: 'acme/models', file: 'small-Q4_K_M.gguf', commit: 'c'.repeat(40), size: 400 * MIB, sha256: 'a'.repeat(64) } },
+    });
+    const probe = caps();
+    const args = [];
+    const { controller } = await paramsController(t, probe.limits, { startArgs: args, registry: [entry], weights: header(2048) });
+    await controller.run({ modelId: 'trained-short', runnerId: 'llama.cpp', requestId: 'cap-renorm-0001' });
+    await until(() => ['ready', 'error'].includes(controller.state.deployment?.phase));
+    const { deployment } = controller.state;
+    assert.equal(deployment.phase, 'ready', deployment.error);
+    const called = probe.named('capParams');
+    assert.equal(called.length >= 2, true, 'the Run, and the renormalize after the header changed the training context');
+    assert.equal(called.at(-1).args[0].model.contextLength, 2048, 'the last call is the renormalize, with the verified model');
+    assert.equal(called.at(-1).args[0].params.ctxSize, 2048, 'the hook got the pre-cap set: the default lowered to the training context');
+    assert.deepEqual(called.at(-1).args[0].explicit, []);
+    assert.equal(deployment.params.ctxSize, 1024, 'the deployment has the capped set');
+    assert.equal(ctxOf(args[0]), '1024', 'and so has the launch');
+    assert.equal(controller.state.params['trained-short|llama.cpp'].ctxSize, 2048, 'the renormalize site saved the pre-cap set');
+});
+
+test('capParams: a result outside the runner\'s schema is refused as invalid parameters, and a refusal the hook throws reaches the caller as it is', async (t) => {
+    const bad = recording({ capParams: ({ params }) => ({ ...params, ctxSize: 3 }) });
+    const { controller, seed } = await paramsController(t, bad.limits, { startArgs: [] });
+    const id = seed[0].id;
+    const refused = await controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'cap-valid-0001' }).catch((error) => error);
+    assert.equal(refused.code, 'invalid_params');
+    assert.match(refused.message, /ctxSize: must be >= 512/);
+    const unknown = recording({ capParams: ({ params }) => ({ ...params, bogus: 1 }) });
+    const other = await paramsController(t, unknown.limits, { startArgs: [] });
+    assert.match((await other.controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'cap-valid-0002' }).catch((error) => error)).message, /bogus: unknown parameter/);
+    assert.equal(other.controller.state.params[SAVED], undefined, 'nothing was saved by a refused Run');
+    // A hook that returns an equal set keeps the engine's own behavior: the same values, validated.
+    const same = recording({ capParams: ({ params }) => ({ ...params }) });
+    const kept = await paramsController(t, same.limits, { startArgs: [] });
+    await kept.controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'cap-valid-0003' });
+    assert.equal(kept.controller.state.deployment.params.ctxSize, 4096);
 });

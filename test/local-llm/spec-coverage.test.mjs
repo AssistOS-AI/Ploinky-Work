@@ -41,6 +41,14 @@ test('DS007 has a row for every host field, platform member, message key and lim
     assert.deepEqual([...hookRows].sort(), [...LIMIT_HOOKS].sort());
 });
 
+test('control: DS007 text with the capParams row removed is caught by the limits-hook check', () => {
+    const without = DS007.split('\n').filter((line) => !line.startsWith('| `capParams` |')).join('\n');
+    assert.notEqual(without, DS007, 'the row exists');
+    const hookRows = namesOf(tableAfter(without, 'A hook that throws propagates'));
+    assert.ok(!hookRows.includes('capParams'));
+    assert.notDeepEqual([...hookRows].sort(), [...LIMIT_HOOKS].sort());
+});
+
 test('DS007 lists the public exports of the entry and of each stable subpath', async () => {
     const rows = tableAfter(DS007, '### Public exports');
     assert.deepEqual(rows.map((cell) => cell.replaceAll('`', '')), [

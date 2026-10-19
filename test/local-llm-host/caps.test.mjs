@@ -10,18 +10,27 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 
+import { PassThrough } from 'node:stream';
+
+import { createPworkerClient } from '../../lib/client.mjs';
+import { deepFreeze, normalizeWith } from '../../lib/local-llm/runners/params.mjs';
 import { loadSeedCatalog } from '../../lib/local-llm/controller/catalog.mjs';
 import { LocalLlmError, defineLimits, IDENTITY_LIMITS } from '../../lib/local-llm/index.mjs';
 import { capsDigest, defineCapLimits, parseCaps } from '../../lib/local-llm-host/caps.mjs';
 import { createLocalLlmGate } from '../../lib/local-llm-host/gate.mjs';
 import { admit } from '../../lib/local-llm/controller/admission.mjs';
+import { cpuDefaultThreads, defaultThreads, performanceCoreCount, physicalCoreCount } from '../../lib/local-llm/controller/hardware.mjs';
+import { darwinPlatform } from '../../lib/local-llm/darwinPlatform.mjs';
+import {
+    LLAMA_SERVER_CPU_PARAM_SCHEMA, LLAMA_SERVER_METAL_PARAM_SCHEMA, LLAMA_SERVER_PARAM_SCHEMA, LLAMA_SERVER_UNIFIED_PARAM_SCHEMA,
+} from '../../lib/local-llm/runners/llamaServer.mjs';
 import { cpuFloorBytes, cpuHostReserveBytes } from '../../lib/local-llm/controller/profiles.mjs';
 import { getRunner } from '../local-llm/fixtures/host.mjs';
 import { SEED_CATALOG_FILE, createLocalLlmHost } from '../../lib/local-llm-host/host.mjs';
 import { LAUNCH_SCHEMA } from '../../lib/local-llm-host/launch.mjs';
 import { capsLine, runEngineVerb } from '../../lib/pworker/models-cli.mjs';
 import { statusFor } from '../../lib/local-llm-host/routes.mjs';
-import { GIB, MODEL, freePort, scratch } from './fixtures/engine.mjs';
+import { GIB, MODEL, fakeAdapter, freePort, scratch } from './fixtures/engine.mjs';
 import { request, startHost, startProxy } from './fixtures/proxy.mjs';
 import { recordingKill, removeProc, runnerArgv, writeProc } from './fixtures/proc.mjs';
 
@@ -52,7 +61,14 @@ function modelOf(id, weightsGiB) {
     return model;
 }
 const SIZES = { tiny: 0.25, small: 2, six: 6, ten: 10, twelve: 12 };
-const SEED = Object.entries(SIZES).map(([id, gib]) => modelOf(id, gib));
+// Models with a known training context per slot (8192), the second recommending four slots on the cpu profile.
+const CONTEXT = 8192;
+const withContext = (model, extra = {}) => Object.assign(model, { contextLength: CONTEXT }, extra);
+const SEED = [
+    ...Object.entries(SIZES).map(([id, gib]) => modelOf(id, gib)),
+    withContext(modelOf('slots', 2)),
+    withContext(modelOf('slots-recommended', 2), { recommended: { cpu: { 'llama.cpp-cpu': { parallel: 4 } } } }),
+];
 
 /** A host on a scratch home with the real runner table, a fake machine and no process. `caps` undefined means no caps. */
 async function capsHost(t, { caps, profile, machine, killImpl, procDir, home = scratch(t) }) {
@@ -100,19 +116,32 @@ test('parseCaps refuses bad values, unknown keys and the keys of later releases,
         [{ ram: 0 }, 'ram'], [{ ram: -5 }, 'ram'], [{ ram: 1.5 }, 'ram'], [{ ram: true }, 'ram'], [{ ram: '12' }, 'ram'],
         [{ ram: '0GiB' }, 'ram'], [{ ram: '12 GB' }, 'ram'], [{ gpuMemory: 'lots' }, 'gpuMemory'], [{ gpuMemory: null }, 'gpuMemory'],
         [{ gpuMemory: Number.MAX_SAFE_INTEGER + 2 }, 'gpuMemory'], [{ bogus: 1 }, 'bogus'],
-        [{ threads: 4 }, 'threads'], [{ maxContext: 4096 }, 'maxContext'], [{ maxParallel: 2 }, 'maxParallel'], [{ mode: 'fit' }, 'mode'],
+        [{ mode: 'fit' }, 'mode'],
         [{ ram: '8GiB', mode: 'strict' }, 'mode'], [{ gpuMemory: 12 }, 'gpuMemory'], [{ ram: 1048575 }, 'ram'], [{ ram: '512KiB' }, 'ram'],
+        [{ threads: 0 }, 'threads'], [{ threads: -2 }, 'threads'], [{ threads: 1.5 }, 'threads'], [{ threads: '4' }, 'threads'], [{ threads: null }, 'threads'],
+        [{ maxParallel: 0 }, 'maxParallel'], [{ maxParallel: 2.5 }, 'maxParallel'], [{ maxParallel: true }, 'maxParallel'],
+        [{ maxContext: 0 }, 'maxContext'], [{ maxContext: 511 }, 'maxContext'], [{ maxContext: '4096' }, 'maxContext'], [{ maxContext: 4096.5 }, 'maxContext'],
     ];
     for (const [section, key] of cases) {
         assert.throws(() => parseCaps(section), (error) => error instanceof LocalLlmError && error.code === 'invalid_caps'
             && error.details.key === key && error.message.includes(key), JSON.stringify(section));
     }
-    for (const key of ['threads', 'maxContext', 'maxParallel']) {
-        assert.throws(() => parseCaps({ [key]: 2 }), (error) => /not supported yet/.test(error.message), key);
-    }
     assert.throws(() => parseCaps({ mode: 'fit' }), /not supported yet/);
+    assert.throws(() => parseCaps({ maxContext: 511 }), /smallest context a runner accepts/);
     assert.throws(() => parseCaps([]), (error) => error.code === 'invalid_caps');
     assert.throws(() => parseCaps('8GiB'), (error) => error.code === 'invalid_caps');
+});
+
+test('parseCaps accepts threads, maxContext and maxParallel as whole numbers, alone or with the sizes, and maxContext down to the smallest runner minimum', () => {
+    assert.deepEqual({ ...parseCaps({ threads: 2 }) }, { threads: 2, mode: 'refuse' });
+    assert.deepEqual({ ...parseCaps({ maxContext: 4096, maxParallel: 1 }) }, { maxContext: 4096, maxParallel: 1, mode: 'refuse' });
+    const all = parseCaps({ ram: '8GiB', threads: 4, maxContext: 8192, maxParallel: 2, mode: 'refuse' });
+    assert.equal(all.threads, 4);
+    assert.equal(all.ram.bytes, 8 * GIB);
+    // The smallest ctxSize minimum among the runner schemas pworker offers is 512; a cap at it is the lowest valid one.
+    const minimum = Math.min(...[LLAMA_SERVER_PARAM_SCHEMA, LLAMA_SERVER_UNIFIED_PARAM_SCHEMA, LLAMA_SERVER_CPU_PARAM_SCHEMA, LLAMA_SERVER_METAL_PARAM_SCHEMA].map((schema) => schema.properties.ctxSize.minimum));
+    assert.equal(parseCaps({ maxContext: minimum }).maxContext, minimum);
+    assert.throws(() => parseCaps({ maxContext: minimum - 1 }), { code: 'invalid_caps' });
 });
 
 test('a fraction is resolved against the first physical figure seen and then kept', () => {
@@ -171,6 +200,33 @@ test('defineCapLimits binds the memory pool, the memory view, the GPU share and 
     assert.ok(defineLimits({ memoryPool: limits.memoryPool }), 'the hooks are plain functions');
 });
 
+test('capThreads and capParams: a count cap lowers a default, refuses an explicit value, leaves null alone, and with no count cap they are the identity', () => {
+    const limits = defineCapLimits(parseCaps({ threads: 4, maxContext: 2048, maxParallel: 2 }));
+    assert.equal(limits.capThreads(14, { profile: 'cpu' }), 4);
+    assert.equal(limits.capThreads(3, { profile: 'metal' }), 3, 'a default under the cap is kept');
+    const params = Object.freeze({ ctxSize: 8192, parallel: 4, threads: null, batchSize: 512 });
+    assert.deepEqual(limits.capParams({ runnerId: 'llama.cpp', profile: 'dedicated', params, explicit: Object.freeze([]), model: {} }),
+        { ctxSize: 2048, parallel: 2, threads: null, batchSize: 512 }, 'defaults and saved values are lowered; threads null is left to capThreads');
+    const under = Object.freeze({ ctxSize: 1024, parallel: 1, threads: 3 });
+    assert.equal(limits.capParams({ params: under, explicit: Object.freeze(['ctxSize', 'threads']) }), under, 'values under the caps: the same object comes back');
+    for (const [key, value, cap] of [['ctxSize', 4096, 2048], ['parallel', 3, 2], ['threads', 8, 4]]) {
+        const capKey = { ctxSize: 'maxContext', parallel: 'maxParallel', threads: 'threads' }[key];
+        assert.throws(() => limits.capParams({ params: { ctxSize: 1024, parallel: 1, threads: 1, [key]: value }, explicit: Object.freeze([key]) }),
+            (error) => error instanceof LocalLlmError && error.code === 'invalid_params' && error.message.includes(`localLlm.caps.${capKey}`)
+                && error.message.includes(String(value)) && error.message.includes(String(cap)), key);
+    }
+    // A context sized for more slots than the cap allows is lowered with them: the training context is per slot.
+    assert.equal(limits.capParams({ params: { ctxSize: 8192, parallel: 4 }, explicit: Object.freeze([]), model: { contextLength: 1024 } }).ctxSize, 2048);
+    const sized = defineCapLimits(parseCaps({ maxParallel: 1 }));
+    assert.equal(sized.capParams({ params: { ctxSize: 8192, parallel: 4 }, explicit: Object.freeze([]), model: { contextLength: 2048 } }).ctxSize, 2048);
+    // With only a size cap, the two hooks are the identity.
+    const sizes = defineCapLimits(parseCaps({ ram: '8GiB' }));
+    assert.equal(sizes.capThreads(14, { profile: 'cpu' }), 14);
+    assert.equal(sizes.capParams({ params, explicit: Object.freeze(['ctxSize']) }), params);
+    assert.deepEqual(limits.overview({ snapshot: CPU_MACHINE }), { caps: { threads: 4, maxContext: 2048, maxParallel: 2 }, mode: 'refuse' });
+    assert.equal(capsLine({ limits: { budget: limits.overview({ snapshot: CPU_MACHINE }) } }), 'caps in force (localLlm.caps): threads 4, maxContext 2048, maxParallel 2; refuse mode');
+});
+
 test('capsDigest is stable for equal caps and differs for different ones', () => {
     const digest = capsDigest(parseCaps({ ram: '8GiB' }));
     assert.match(digest, /^[0-9a-f]{12}$/);
@@ -179,6 +235,9 @@ test('capsDigest is stable for equal caps and differs for different ones', () =>
     assert.notEqual(capsDigest(parseCaps({ ram: '9GiB' })), digest);
     assert.notEqual(capsDigest(parseCaps({ gpuMemory: '8GiB' })), digest, 'the key counts, not only the number');
     assert.notEqual(capsDigest(parseCaps({ ram: '8GiB', gpuMemory: '8GiB' })), digest);
+    assert.notEqual(capsDigest(parseCaps({ ram: '8GiB', threads: 2 })), digest, 'a count cap counts');
+    assert.notEqual(capsDigest(parseCaps({ threads: 2 })), capsDigest(parseCaps({ maxParallel: 2 })), 'and so does its key');
+    assert.equal(capsDigest(parseCaps({ threads: 2, mode: 'refuse' })), capsDigest(parseCaps({ threads: 2 })));
     assert.equal(capsDigest(null), null);
 });
 
@@ -208,9 +267,9 @@ test('a bad caps section is kept at creation and thrown by controller() after th
     await assert.rejects(host.controller(), { code: 'invalid_caps' }, 'and it is refused again, not remembered as a controller');
 });
 
-test('an unsupported key is refused the same way, and the host with no caps has the identity limits', async (t) => {
-    const host = await capsHost(t, { caps: { threads: 4 }, profile: 'cpu', machine: CPU_MACHINE });
-    await assert.rejects(host.controller(), (error) => error.code === 'invalid_caps' && error.details.key === 'threads' && /not supported yet/.test(error.message));
+test('mode fit is refused the same way when the host is used, and the host with no caps has the identity limits', async (t) => {
+    const host = await capsHost(t, { caps: { ram: '8GiB', mode: 'fit' }, profile: 'cpu', machine: CPU_MACHINE });
+    await assert.rejects(host.controller(), (error) => error.code === 'invalid_caps' && error.details.key === 'mode' && /not supported yet/.test(error.message));
     const plain = await capsHost(t, { profile: 'cpu', machine: CPU_MACHINE });
     assert.equal(plain.caps, null);
     assert.equal(plain.capsRefusal, null);
@@ -290,6 +349,249 @@ test('V5: the same dedicated and unified machines with no caps admit the 10 GiB 
         assert.equal(big.status, 'ok', `${profile}: ${big.reason}`);
         assert.equal((await (await host.controller()).overview()).limits?.budget, undefined, profile);
     }
+});
+
+// ---------------------------------------------------------------- V2b and V5: threads, maxContext and maxParallel on the launch
+
+const MAC_MACHINE = {
+    gpu: { available: true, backend: 'metal', name: 'Apple M1', memoryModel: 'unified', deviceCapBytes: 12 * GIB },
+    memory: { totalBytes: 16 * GIB, availableBytes: 12 * GIB, pressureLevel: 1 }, disk: DISK, cpus: 8, cores: 4,
+};
+// The captured sysctl of a 16 GiB M1, with the answer `sysctl -n hw.perflevel0.physicalcpu` gives a Mac whose performance cores number 8.
+const MAC_EXEC = ((captured) => (file, args, ...rest) => (args?.[0] === '-n' && args[1] === 'hw.perflevel0.physicalcpu' ? '8\n' : captured(file, args, ...rest)))((() => {
+    const fixture = (name) => fs.readFileSync(new URL(`./fixtures/darwin/${name}`, import.meta.url), 'utf8');
+    const known = new Map(`${fixture('sysctl.txt')}${fixture('swapusage.txt')}`.split('\n').filter(Boolean).map((line) => [line.slice(0, line.indexOf(':')), line]));
+    return (file, args) => (file === '/usr/bin/vm_stat' ? fixture('vm_stat.txt') : `${args.filter((key) => known.has(key)).map((key) => known.get(key)).join('\n')}\n`);
+})());
+
+/** A fake /proc of 16 physical cores (the sysfs of this machine is not read for cpus that are not there). */
+function sixteenCores(home) {
+    const procDir = path.join(home, 'proc');
+    fs.mkdirSync(path.join(procDir, 'self'), { recursive: true });
+    fs.writeFileSync(path.join(procDir, 'self', 'status'), 'Cpus_allowed_list:\t0-15\n');
+    fs.writeFileSync(path.join(procDir, 'cpuinfo'), Array.from({ length: 16 }, (_, cpu) => `processor\t: ${cpu}\nphysical id\t: 0\ncore id\t\t: ${cpu}\n`).join('\n'));
+    return procDir;
+}
+
+/**
+ * The default thread count the engine's own functions give on each profile, for the fake machine: what a launch with no caps and
+ * no `threads` gets. Nothing here is a hard-coded number.
+ */
+function defaultThreadsOf(profile, { procDir }) {
+    const perf = profile === 'metal' ? darwinPlatform({ exec: MAC_EXEC }).performanceCores() : performanceCoreCount({ procDir });
+    if (profile === 'metal' || profile === 'unified') return perf ?? defaultThreads(physicalCoreCount({ procDir }));
+    if (profile === 'cpu') return perf ?? cpuDefaultThreads(physicalCoreCount({ procDir }));
+    return defaultThreads(physicalCoreCount({ procDir }));
+}
+
+/**
+ * Runs `small` on a host with the real runner table and the real controller, on a fake machine, with the runner process stubbed
+ * out, and returns the llama-server argv it would have been started with (or the error the Run was refused with).
+ */
+async function launchOf(t, { caps, profile, params, modelId = 'small', home = scratch(t), drain = false }) {
+    const procDir = sixteenCores(home);
+    const metal = profile === 'metal';
+    const machine = { cpu: CPU_MACHINE, dedicated: DEDICATED_MACHINE, unified: UNIFIED_MACHINE, metal: MAC_MACHINE }[profile];
+    const started = [];
+    const weights = path.join(home, 'weights.gguf');
+    fs.writeFileSync(weights, 'weights');
+    const controllerOptions = {
+        profile, snapshot: async () => structuredClone(machine), seedCatalog: SEED, fileExists: () => true, installer: {
+            installable: () => true, lock: null, describe: async () => ({ installed: true, runnable: true, version: 'v1' }),
+            ensureRunnable: async () => ({ rebuilt: false }), entryFor: (id) => ({ id }), pathsFor: () => ({ runDir: '/run/llama.cpp/b1' }),
+        },
+        inspect: async () => ({ state: 'complete', bytes: 1 }), detectRunner: () => ({ installed: true, version: 'v1', reason: null }),
+        download: async () => ({ status: 'complete', path: weights, bytesTransferred: 0 }),
+        fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({}) }), pollMs: 2, stopGraceMs: 20,
+        startRunner(options) {
+            started.push(options.args);
+            let resolve;
+            const handle = { pid: 9000, running: true, exited: new Promise((done) => { resolve = done; }),
+                async stop() { handle.running = false; resolve({ code: 0, signal: 'SIGTERM' }); }, async kill() { return handle.stop(); } };
+            return handle;
+        },
+    };
+    const config = caps === undefined ? {} : { localLlm: { caps } };
+    const host = createLocalLlmHost({
+        config, home, env: { PATH: '/usr/bin:/bin', HOME: '/home/test', LANG: 'C.UTF-8' }, platformName: metal ? 'darwin' : 'linux', ...(metal ? { arch: 'arm64', darwinExec: MAC_EXEC } : {}),
+        procDir, ownerPort: await freePort(), which: () => '/usr/bin/nvidia-smi', controllerOptions,
+    });
+    t.after(() => host.drain().catch(() => {}));
+    await host.acquire();
+    const controller = await host.controller();
+    const result = await controller.run({ modelId, runnerId: RUNNER[profile] ?? 'llama.cpp', requestId: `caps-${profile}-${started.length}-${Math.random().toString(16).slice(2, 8)}`, params }).then(() => null, (error) => error);
+    if (result) return { error: result, procDir };
+    const deadline = Date.now() + 3000;
+    while (!started.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(started.length, 1, `the runner was started (${controller.state.deployment?.phase}: ${controller.state.deployment?.error})`);
+    // The weights path, the socket and the key are different on every start: the rest of the argv is what the cap can change.
+    const masked = started[0].map((arg, index) => (['-m', '--host', '--api-key'].includes(started[0][index - 1]) ? `<${started[0][index - 1]}>` : arg));
+    const saved = structuredClone(controller.state.params);
+    if (drain) await host.drain();
+    return { args: masked, procDir, controller, saved };
+}
+const flag = (args, name) => args[args.indexOf(name) + 1];
+const PROFILES = ['cpu', 'dedicated', 'unified', 'metal'];
+
+test('V2b: threads 2 on a 16-core fake puts --threads 2 on the launch of every profile, where no cap gives the engine default (the V5 control)', async (t) => {
+    for (const profile of PROFILES) {
+        const capped = await launchOf(t, { caps: { threads: 2 }, profile });
+        const plain = await launchOf(t, { profile });
+        const expected = defaultThreadsOf(profile, plain);
+        assert.ok(expected > 2, `${profile}: the engine default (${expected}) is above the cap, so the cap is what is seen`);
+        assert.equal(flag(plain.args, '--threads'), String(expected), `${profile}: with no caps the argv has the engine default`);
+        assert.equal(flag(capped.args, '--threads'), '2', `${profile}: the cap`);
+        // Nothing else in the argv moved.
+        const without = (args) => args.filter((arg, index) => args[index - 1] !== '--threads');
+        assert.deepEqual(without(capped.args), without(plain.args), profile);
+    }
+});
+
+test('V2b: a cap above the engine default changes nothing, and with no caps the argv is the identity argv', async (t) => {
+    for (const profile of PROFILES) {
+        const plain = await launchOf(t, { profile });
+        const roomy = await launchOf(t, { caps: { threads: 200 }, profile });
+        assert.deepEqual(roomy.args, plain.args, profile);
+    }
+});
+
+test('V2b: an explicit --param threads=8 under threads 2 is refused naming threads, and the same request with no caps launches with --threads 8', async (t) => {
+    for (const profile of PROFILES) {
+        const refused = await launchOf(t, { caps: { threads: 2 }, profile, params: { threads: 8 } });
+        assert.ok(refused.error, `${profile}: refused`);
+        assert.equal(refused.error.code, 'invalid_params');
+        assert.match(refused.error.message, /threads/);
+        assert.match(refused.error.message, /localLlm\.caps\.threads/);
+        assert.match(refused.error.message, /\b8\b/);
+        assert.match(refused.error.message, /\b2\b/);
+        const plain = await launchOf(t, { profile, params: { threads: 8 } });
+        assert.equal(flag(plain.args, '--threads'), '8', `${profile}: the control`);
+        // An explicit value at or under the cap is the caller's own and is kept.
+        const within = await launchOf(t, { caps: { threads: 2 }, profile, params: { threads: 1 } });
+        assert.equal(flag(within.args, '--threads'), '1', profile);
+    }
+});
+
+test('V2b: maxContext and maxParallel lower the default --ctx-size and -np and refuse an explicit value, where no caps give the defaults', async (t) => {
+    for (const profile of PROFILES) {
+        const flagFor = profile === 'metal' ? '-c' : '--ctx-size';
+        const plain = await launchOf(t, { profile, params: {} });
+        const plainCtx = Number(flag(plain.args, flagFor));
+        assert.ok(plainCtx > 1024, `${profile}: the default context (${plainCtx}) is above the cap`);
+        const capped = await launchOf(t, { caps: { maxContext: 1024 }, profile });
+        assert.equal(flag(capped.args, flagFor), '1024', `${profile}: the default context is lowered to the cap`);
+        const refused = await launchOf(t, { caps: { maxContext: 1024 }, profile, params: { ctxSize: 2048 } });
+        assert.equal(refused.error?.code, 'invalid_params', profile);
+        assert.match(refused.error.message, /localLlm\.caps\.maxContext/);
+        assert.match(refused.error.message, /ctxSize/);
+        assert.match(refused.error.message, /2048/);
+        assert.match(refused.error.message, /1024/);
+        const below = await launchOf(t, { caps: { maxContext: 4096 }, profile, params: { ctxSize: 1024 } });
+        assert.equal(flag(below.args, flagFor), '1024', `${profile}: an explicit value under the cap is kept`);
+        const control = await launchOf(t, { profile, params: { ctxSize: 2048 } });
+        assert.equal(flag(control.args, flagFor), '2048', `${profile}: the control`);
+
+        // parallel: the caller sets 2 slots; a cap of 1 refuses it, no cap passes it; the default of 1 is never above a cap of 1.
+        const two = await launchOf(t, { profile, params: { parallel: 2 } });
+        assert.equal(flag(two.args, '-np'), '2', `${profile}: the control`);
+        const refusedParallel = await launchOf(t, { caps: { maxParallel: 1 }, profile, params: { parallel: 2 } });
+        assert.equal(refusedParallel.error?.code, 'invalid_params', profile);
+        assert.match(refusedParallel.error.message, /localLlm\.caps\.maxParallel/);
+        assert.equal(flag((await launchOf(t, { caps: { maxParallel: 1 }, profile })).args, '-np'), '1', profile);
+    }
+});
+
+test('maxParallel lowers a saved parallel and the context sized for it, leaving the saved set unchanged; an explicit context the lowered slots cannot hold is refused naming maxParallel', async (t) => {
+    const home = scratch(t);
+    const wanted = { ctxSize: 4 * CONTEXT, parallel: 4 };
+    // An earlier Run with no caps saves four slots of the model's training context each.
+    const earlier = await launchOf(t, { profile: 'cpu', modelId: 'slots', params: wanted, home, drain: true });
+    assert.equal(flag(earlier.args, '-np'), '4');
+    assert.equal(flag(earlier.args, '--ctx-size'), String(4 * CONTEXT));
+    const key = 'slots|llama.cpp-cpu';
+    assert.deepEqual({ ctxSize: earlier.saved[key].ctxSize, parallel: earlier.saved[key].parallel }, wanted);
+    // The same home under maxParallel 1, a Run with no params: the saved values are defaults, so they are lowered, not refused.
+    const capped = await launchOf(t, { caps: { maxParallel: 1 }, profile: 'cpu', modelId: 'slots', home });
+    assert.equal(capped.controller.state.params[key].parallel, 4, 'the saved set was loaded');
+    assert.equal(flag(capped.args, '-np'), '1');
+    assert.equal(flag(capped.args, '--ctx-size'), String(CONTEXT), 'the context follows the slots down to the training context of one');
+    assert.deepEqual(capped.saved[key], earlier.saved[key], 'the saved set is unchanged');
+    // The model recommends four slots (a default); an explicit context for four is refused by the cap, not by the runner.
+    const refused = await launchOf(t, { caps: { maxParallel: 1 }, profile: 'cpu', modelId: 'slots-recommended', params: { ctxSize: 2 * CONTEXT } });
+    assert.equal(refused.error?.code, 'invalid_params');
+    assert.match(refused.error.message, /localLlm\.caps\.maxParallel/);
+    assert.ok(refused.error.message.includes(String(2 * CONTEXT)) && refused.error.message.includes(String(CONTEXT)), refused.error.message);
+    // The controls: within the lowered slots it is accepted, and with no caps the four recommended slots hold it.
+    assert.equal(flag((await launchOf(t, { caps: { maxParallel: 1 }, profile: 'cpu', modelId: 'slots-recommended', params: { ctxSize: CONTEXT } })).args, '--ctx-size'), String(CONTEXT));
+    const open = await launchOf(t, { profile: 'cpu', modelId: 'slots-recommended', params: { ctxSize: 2 * CONTEXT } });
+    assert.equal(flag(open.args, '-np'), '4');
+    assert.equal(flag(open.args, '--ctx-size'), String(2 * CONTEXT));
+});
+
+// ---------------------------------------------------------------- the refusal reaches HTTP and the CLI
+
+/** The stand-in runner with the llama-server names for the three parameters the count caps bound. */
+function cappedAdapter() {
+    const schema = deepFreeze({
+        type: 'object', additionalProperties: false,
+        properties: {
+            ctxSize: { type: 'integer', minimum: 512, maximum: 65536, default: 4096 },
+            parallel: { type: 'integer', minimum: 1, maximum: 8, default: 1 },
+            threads: { type: ['integer', 'null'], minimum: 1, maximum: 256, default: null },
+        },
+    });
+    return Object.freeze({ ...fakeAdapter(), paramSchema: schema, basicParams: Object.freeze(['ctxSize']),
+        normalizeParams: (params, { model } = {}) => normalizeWith(schema, 'fake-gguf', params, model),
+        describeContext: ({ ctxSize, parallel }) => ({ totalContext: ctxSize, perRequestContext: ctxSize, parallel, kvUnified: false }) });
+}
+
+test('a value over a count cap is a 400 invalid_params on POST /v1/local-llm/run and /preview, naming the cap; a value within it is accepted', async (t) => {
+    assert.equal(statusFor('invalid_params'), 400);
+    const proxy = await startProxy(t, { localLlm: { caps: { threads: 2, maxContext: 1024 } }, hostOptions: { adapter: cappedAdapter() } });
+    const post = (route, params) => request(proxy.base, `/v1/local-llm/${route}`, { method: 'POST', body: { modelId: MODEL, runnerId: 'fake-gguf', params } });
+    for (const route of ['run', 'preview']) {
+        const refused = await post(route, { threads: 8 });
+        assert.equal(refused.status, 400, `${route}: ${refused.text}`);
+        assert.equal(refused.body.error.type, 'invalid_params');
+        assert.match(refused.body.error.message, /localLlm\.caps\.threads/);
+        assert.match(refused.body.error.message, /\b8\b.*\b2\b/);
+        const context = await post(route, { ctxSize: 2048 });
+        assert.equal(context.status, 400, `${route}: ${context.text}`);
+        assert.match(context.body.error.message, /localLlm\.caps\.maxContext/);
+    }
+    // A value within the caps, and none at all (the defaults, ctxSize 4096 lowered to 1024), are accepted.
+    assert.equal((await post('preview', { threads: 2, ctxSize: 1024 })).status, 200);
+    const preview = await post('preview', undefined);
+    assert.equal(preview.status, 200);
+    assert.equal(preview.body.preview.params.ctxSize, 1024, 'the preview shows the capped default');
+    assert.equal(preview.body.preview.params.threads, null);
+    assert.equal((await post('run', { threads: 1 })).status, 202);
+    // The control: with no caps the same request is not refused.
+    const plain = await startProxy(t, { hostOptions: { adapter: cappedAdapter() } });
+    const open = await request(plain.base, '/v1/local-llm/preview', { method: 'POST', body: { modelId: MODEL, runnerId: 'fake-gguf', params: { threads: 8, ctxSize: 2048 } } });
+    assert.equal(open.status, 200, open.text);
+    assert.equal(open.body.preview.params.threads, 8);
+});
+
+test('pworker models run and preview print the refusal naming the cap and exit with an error; the control with no caps runs', async (t) => {
+    const proxy = await startProxy(t, { localLlm: { caps: { threads: 2 } }, hostOptions: { adapter: cappedAdapter() } });
+    const verb = (target, args) => {
+        const out = [], err = [];
+        const io = { out: (text) => out.push(text), err: (text) => err.push(text), isTTY: false, home: scratch({ after() {} }), stdin: new PassThrough(), stdout: new PassThrough() };
+        const client = createPworkerClient({ url: target.base, purpose: 'test:models-cli', autostart: false, env: {} });
+        return runEngineVerb({ args: ['models', ...args], client, io, pollMs: 20, lineMs: 0 }).then((code) => ({ code, out: out.join(''), err: err.join('') }), (error) => ({ error, out: out.join(''), err: err.join('') }));
+    };
+    for (const name of ['run', 'preview']) {
+        const refused = await verb(proxy, [name, MODEL, '--runner', 'fake-gguf', '--param', 'threads=8', ...(name === 'run' ? ['--detach'] : [])]);
+        assert.ok(refused.error, `${name}: the verb failed`);
+        assert.equal(refused.error.type ?? refused.error.code, 'invalid_params');
+        assert.match(refused.error.message, /localLlm\.caps\.threads/);
+        assert.match(refused.error.message, /\b8\b.*\b2\b/);
+    }
+    const plain = await startProxy(t, { hostOptions: { adapter: cappedAdapter() } });
+    const open = await verb(plain, ['run', MODEL, '--runner', 'fake-gguf', '--param', 'threads=8', '--detach']);
+    assert.equal(open.error, undefined);
+    assert.equal(open.code, 0);
 });
 
 // ---------------------------------------------------------------- the gate identity

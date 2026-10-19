@@ -137,20 +137,25 @@ A tier entry `{ "upstream": "local-llm", "model": "<catalog id>", "runner": "<id
 | --- | --- | --- |
 | `ram` | Bytes (a safe integer of at least 1 MiB), a string with a binary unit (`"12GiB"`, `"512MiB"`, `"1.5GiB"`), or a fraction above 0 and at most 1 of the machine's total memory (the first reading, then kept) | Admission sizes against this much host memory instead of the machine's: the cpu and Metal pool (`memoryPool`, whose refusal and warning name the cap) and the memory view of the dedicated and unified policies (`effective`) |
 | `gpuMemory` | The same forms; a fraction is of the GPU's total (dedicated) or of system memory (unified) | Dedicated: the GPU the policy sizes against is `{ totalBytes: min(total, cap), freeBytes: min(free, cap) }`. Unified: folded into the memory view, as the smaller of `ram` and `gpuMemory`. Published in the overview only when the machine has a usable NVIDIA GPU. No effect on the cpu and Metal profiles, and refused on macOS (`invalid_caps`): use `ram` there |
-| `mode` | Only `"refuse"` (the default) | A request over a cap is refused; there is no mode that shrinks it |
-| `threads`, `maxContext`, `maxParallel` | Not supported yet | Refused when the host is used, not ignored, so a cap is never silently missing |
+| `mode` | Only `"refuse"` (the default); `"fit"` is not supported yet and is refused | A request over a cap is refused; there is no mode that shrinks it |
+| `threads` | A whole number of at least 1 | An upper bound on the `--threads` the llama-server runners are started with. The default thread count is lowered to it on every profile, the Metal and high-performance-core path included (`capThreads`, DS007). A `threads` the caller sets above it is refused |
+| `maxContext` | A whole number of at least the smallest context a runner accepts (512) | An upper bound on `ctxSize` (`--ctx-size`, `-c` on Metal). A default or saved context above it is lowered to it, and one the caller sets above it is refused |
+| `maxParallel` | A whole number of at least 1 | An upper bound on `parallel` (`-np`), with the same rule |
 
-A bad section (an unknown key, a wrong type, zero or a negative size, a key that is not supported yet) is kept when the host is created and thrown as `invalid_caps`, naming the key, by `host.controller()` before the engine is created. `acquire()` is not affected, so the orphan reap still runs first. `pworker models status` prints the caps in force from `limits.budget.caps` of the overview, and so do a refused `preview`, `run` and a run that does not start.
+A bad section (an unknown key, a wrong type, zero or a negative size, `mode: "fit"`) is kept when the host is created and thrown as `invalid_caps`, naming the key, by `host.controller()` before the engine is created. `acquire()` is not affected, so the orphan reap still runs first. `pworker models status` prints the caps in force from `limits.budget.caps` of the overview, and so do a refused `preview`, `run` and a run that does not start.
 
 What a cap is, and is not:
 
 | Cap | Enforced by | Strength |
 | --- | --- | --- |
 | `gpuMemory` | Admission's estimate against the capped GPU | Sizing only. Nothing stops a runner using more GPU memory once it runs |
+| `threads`, `maxContext`, `maxParallel` | The llama-server flags `--threads`, `--ctx-size` and `-np` | Hard bounds on the flags the runner is started with: the runner cannot exceed them |
 | `ram` | Admission's estimate against the capped memory | Sizing only in this release. The memory guard is unchanged and watches the machine's available memory, not the cap, and the runners' own memory is not subtracted from the cap (a later release) |
 | GPU compute share | Nothing | Not offered |
 | llama-servers that the proxy itself starts (`upstreams.<name>.start`) | Nothing | Outside the caps: their memory is neither limited nor counted |
 | Runners that pworker does not offer (Ollama, vLLM, TabbyAPI, LM Studio, the Vulkan build) | Nothing | Not offered, so not capped |
+
+A value above a count cap is handled by where it came from (`capParams`, DS007). A default, a catalog-recommended or a saved value is lowered to the cap. A value the caller set in this request (`--ctx`, `--parallel`, `--param threads=8`, or the HTTP `params`) is refused as `invalid_params` (HTTP 400, and the CLI prints the message), naming `localLlm.caps.<key>` and both numbers, before anything is downloaded or started. A `preview` throws the same refusal instead of returning it as a form error. What a Run saves is the set before the caps, so removing a cap restores the earlier values; the deployment and its launch use the capped set. A `threads` left empty is the engine's default thread count, which `capThreads` lowers.
 
 A cap bounds what a model may plan for; the host reserve and the memory-guard floor stay those of the physical machine (the capped pool and memory view carry the physical figures beside the capped ones, DS007). A model must fit both the cap and the machine less its reserve. The unified policy has a fixed need of about 10 GiB (prompt cache, runtime and buffers) before the weights, so a `gpuMemory` under about 11 GiB admits nothing there.
 
@@ -169,7 +174,7 @@ A cap bounds what a model may plan for; the host reserve and the memory-guard fl
 
 Without `runnerId`, `preview` and `run` use the profile's default runner, the one the gate also picks: `llama.cpp-cpu` on the `cpu` profile, `llama.cpp` on `dedicated`, `unified` and `metal`, and `llama.cpp-vulkan` on `vulkan`, `venus` and `apu` (which the standalone host does not offer). When that runner is not supported on this machine, both answer 409 `runner_unsupported`, name the reason and point at `--runner`; nothing runs.
 
-Errors are `{ error: { type, message } }` with the message redacted. A body that is not a JSON object is 400 `invalid_json`, one above 32 MiB is 413, an unknown model or runner is 404, a conflict (busy, in use, runner not installed, licence needed) is 409, an admission refusal is 422, a failed Hugging Face lookup is 502 and an engine that is unavailable is 503.
+Errors are `{ error: { type, message } }` with the message redacted. A body that is not a JSON object is 400 `invalid_json`, one above 32 MiB is 413, an unknown model or runner is 404, a conflict (busy, in use, runner not installed, licence needed) is 409, an admission refusal is 422, invalid parameters (a value over a cap among them) are 400, a failed Hugging Face lookup is 502 and an engine that is unavailable is 503.
 
 ### Commands
 
