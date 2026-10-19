@@ -9,6 +9,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { admissionResult, admit, admitOllama, admitVllm } from '../../lib/local-llm/controller/admission.mjs';
+import { FIT_KEYS, MAX_FIT_STEPS, fitAdmission } from '../../lib/local-llm/controller/fit.mjs';
 import { loadSeedCatalog, validateModel } from '../../lib/local-llm/controller/catalog.mjs';
 import { cpuDefaultThreads, defaultThreads, performanceCoreCount, physicalCoreCount, readSnapshot } from '../../lib/local-llm/controller/hardware.mjs';
 import { UNIFIED, admitApuLlamaServer, cpuFloorBytes, cpuHostReserveBytes } from '../../lib/local-llm/controller/profiles.mjs';
@@ -16,6 +17,7 @@ import { linuxPlatform } from '../../lib/local-llm/host.mjs';
 import { LocalLlmError } from '../../lib/local-llm/errors.mjs';
 import { IDENTITY_LIMITS, LIMIT_HOOKS, defineLimits } from '../../lib/local-llm/limits.mjs';
 import { createRunners } from '../../lib/local-llm/runners/index.mjs';
+import { LLAMA_SERVER_PARAM_SCHEMA } from '../../lib/local-llm/runners/llamaServer.mjs';
 import { createStateStore } from '../../lib/local-llm/controller/stateStore.mjs';
 import { SEED_CATALOG_FILE } from './fixtures/seedCatalog.mjs';
 import { HOST, PLOINKY_MESSAGES, RUNNERS, agentLikeHost, createController, getRunner } from './fixtures/host.mjs';
@@ -48,7 +50,7 @@ const ENOENT = () => Object.assign(new Error('absent'), { code: 'ENOENT' });
 // ---------------------------------------------------------------- the contract and the identity default
 
 test('limits: the default is the identity of every hook, and the value is frozen', () => {
-    assert.deepEqual(LIMIT_HOOKS, ['capCores', 'capThreads', 'capParams', 'observeSnapshot', 'decorateSnapshot', 'memoryPool', 'refuseProfile', 'admit', 'effective',
+    assert.deepEqual(LIMIT_HOOKS, ['capCores', 'capThreads', 'capParams', 'fitParams', 'observeSnapshot', 'decorateSnapshot', 'memoryPool', 'refuseProfile', 'admit', 'effective',
         'refuseResourceRequest', 'overview', 'runnerEnvironment', 'guardSample', 'guardBreach', 'vllmQualification']);
     assert.ok(Object.isFrozen(IDENTITY_LIMITS));
     assert.equal(IDENTITY_LIMITS.capCores(7, { fsApi: {} }), 7);
@@ -56,6 +58,7 @@ test('limits: the default is the identity of every hook, and the value is frozen
     assert.equal(IDENTITY_LIMITS.capThreads(9, { profile: 'cpu' }), 9);
     const params = { ctxSize: 1 };
     assert.equal(IDENTITY_LIMITS.capParams({ runnerId: 'llama.cpp', profile: 'cpu', params, explicit: [], model: {} }), params);
+    assert.equal(IDENTITY_LIMITS.fitParams({ runnerId: 'llama.cpp', profile: 'dedicated' }), null);
     assert.equal(IDENTITY_LIMITS.observeSnapshot({ fsApi: {}, env: {} }), null);
     assert.equal(IDENTITY_LIMITS.decorateSnapshot({ snapshot, fsApi: {}, env: {} }), snapshot);
     assert.equal(IDENTITY_LIMITS.memoryPool({ totalBytes: 1, availableBytes: 1 }, snapshot, { amount: String }), null);
@@ -1015,7 +1018,8 @@ const caps = (overrides = {}) => recording({
     ...overrides,
 });
 
-async function paramsController(t, limits, { dataDir = null, startArgs = [], registry = null, weights = null } = {}) {
+// `machine.memory` is what the snapshot shows (a test may change it between admissions); `onDownload` runs when the weights are fetched.
+async function paramsController(t, limits, { dataDir = null, startArgs = [], registry = null, weights = null, machine = null, onDownload = null, onSnapshot = null } = {}) {
     dataDir ??= fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'limits-params-'));
     if (!fs.existsSync(path.join(dataDir, 'weight.gguf'))) fs.writeFileSync(path.join(dataDir, 'weight.gguf'), weights ?? 'weights');
     if (registry) {
@@ -1024,12 +1028,13 @@ async function paramsController(t, limits, { dataDir = null, startArgs = [], reg
     }
     const memory = { totalBytes: 8 * GIB, availableBytes: 7 * GIB };
     const seed = loadSeedCatalog(SEED_CATALOG_FILE).filter((entry) => entry.id === 'qwen2.5-0.5b-instruct-q4_k_m').map((entry) => validateModel(entry, { seed: true }));
-    const snapshot = { gpu: { available: false, state: 'absent' }, memory, disk: { freeBytes: 1e12 } };
+    machine ??= { memory };
+    const snapshot = { gpu: { available: false, state: 'absent' }, disk: { freeBytes: 1e12 } };
     const controller = createController({ dataDir, seedCatalog: seed, sharedModelsRoot: null, imageContract: {}, limits, env: { PATH: '/usr/bin' },
         fileExists: () => true, installer: { installable: () => false }, detectRunner: () => ({ installed: true }),
-        snapshot: async () => snapshot, readMemory: () => memory, readPressure: () => 0,
+        snapshot: async () => { onSnapshot?.(); return { ...snapshot, memory: machine.memory }; }, readMemory: () => memory, readPressure: () => 0,
         inspect: async () => ({ state: 'complete', bytes: 7, total: 7 }),
-        download: async () => ({ status: 'complete', path: path.join(dataDir, 'weight.gguf'), bytesTransferred: 0 }),
+        download: async () => { onDownload?.(); return { status: 'complete', path: path.join(dataDir, 'weight.gguf'), bytesTransferred: 0 }; },
         dropCache: () => true, pollMs: 2, stopGraceMs: 20, fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({}) }),
         startRunner(options) {
             startArgs.push(options.args);
@@ -1150,4 +1155,280 @@ test('capParams: a result outside the runner\'s schema is refused as invalid par
     const kept = await paramsController(t, same.limits, { startArgs: [] });
     await kept.controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'cap-valid-0003' });
     assert.equal(kept.controller.state.deployment.params.ctxSize, 4096);
+});
+
+// ---------------------------------------------------------------- fitParams: fit.mjs on its own
+
+const FIT_SCHEMA = LLAMA_SERVER_PARAM_SCHEMA;
+const SIZED = (status, reason = 'too big', estimate = {}) => admissionResult(status, reason, { weightsBytes: MIB, ...estimate });
+// A refusal about the sizes names the need, which moves with them; this one does, as the policies' reasons do.
+const needs = (set) => `Needs ${set.ctxSize} tokens and ${set.parallel} slots`;
+// The GPU need the estimate carries: it grows with the context and the slots, as the KV cache does.
+const gpuNeed = (set) => set.ctxSize * set.parallel * 1024;
+
+/** fitAdmission with an `admitWith` that records every parameter set it is asked about and answers `verdict(params)`. */
+function fitRun(params, { verdict = () => 'incompatible', explicit = [], order = FIT_KEYS, model = { id: 'm', memory: { layers: 24 } }, profile = 'dedicated', schema = FIT_SCHEMA, normalize = (value) => value, maxSteps, reason = needs, estimate = (set) => ({ gpuBytes: gpuNeed(set) }) } = {}) {
+    const asked = [];
+    const result = fitAdmission({ params, explicit, order, schema, model, profile, normalize, ...(maxSteps ? { maxSteps } : {}),
+        admitWith: (candidate) => { asked.push(candidate); return SIZED(verdict(candidate), reason(candidate), estimate(candidate)); } });
+    return { ...result, asked };
+}
+const tuple = (set) => [set.ctxSize, set.parallel];
+const START = Object.freeze({ ctxSize: 2048, parallel: 4, nGpuLayers: 99 });
+
+test('fitParams: the identity does not fit, and a hook with no order is no fit', () => {
+    assert.equal(IDENTITY_LIMITS.fitParams({ runnerId: 'llama.cpp', profile: 'dedicated' }), null);
+    assert.deepEqual([...FIT_KEYS], ['ctxSize', 'parallel'], 'the layers are never lowered');
+});
+
+test('fit: the steps are ctxSize, then parallel, each halved to its end before the next is touched, and the layers are left alone', () => {
+    const { asked, admission, params } = fitRun(START);
+    // ctxSize 2048 -> 1024 -> 512 (the schema minimum); parallel 4 -> 2 -> 1.
+    assert.deepEqual(asked.map(tuple), [[2048, 4], [1024, 4], [512, 4], [512, 2], [512, 1]]);
+    assert.ok(asked.every((set) => set.nGpuLayers === 99), 'nGpuLayers is never lowered, even when it is named in the order');
+    assert.equal(admission.status, 'incompatible');
+    assert.equal(params, START, 'a request that does not fit is refused as it was asked');
+    assert.match(admission.reason, /the smallest size tried was ctxSize 512, parallel 1\.$/, 'a refusal names the smallest size tried');
+    assert.match(admission.reason, /^Needs 2048 tokens and 4 slots Fit also tried lowering ctxSize from 2048 to 512, parallel from 4 to 1, and it still does not fit;/);
+    assert.equal(admission.fit, undefined, 'nothing is reported as lowered: nothing was');
+    assert.equal(admission.warnings.length, 0);
+});
+
+test('fit: it stops at the first set that is not incompatible, which is the largest halved size that fits', () => {
+    const { asked, admission, params } = fitRun(START, { verdict: (set) => (set.ctxSize <= 1024 ? 'ok' : 'incompatible') });
+    assert.deepEqual(asked.map(tuple), [[2048, 4], [1024, 4]]);
+    assert.equal(admission.status, 'ok');
+    assert.deepEqual(tuple(params), [1024, 4]);
+    assert.deepEqual(admission.fit, { lowered: [{ param: 'ctxSize', from: 2048, to: 1024 }] });
+    assert.match(admission.warnings.at(-1), /^Fit lowered ctxSize from 2048 to 1024 so that the model fits/);
+    assert.ok(Object.isFrozen(admission) && Object.isFrozen(admission.warnings) && Object.isFrozen(admission.fit));
+    // A result that fits as it is comes back untouched, with no fit and no warning.
+    const fits = fitRun(START, { verdict: () => 'ok' });
+    assert.equal(fits.asked.length, 1);
+    assert.equal(fits.params, START);
+    assert.equal(fits.admission.fit, undefined);
+    assert.deepEqual([...fits.admission.warnings], []);
+});
+
+test('fit: a key the caller set is never touched, and with every key set there is nothing to lower', () => {
+    const ctx = fitRun(START, { explicit: ['ctxSize'] });
+    assert.ok(ctx.asked.every((set) => set.ctxSize === 2048), 'ctxSize stays what the caller set in every candidate');
+    assert.deepEqual(ctx.asked.map(tuple).slice(0, 3), [[2048, 4], [2048, 2], [2048, 1]], 'the next key in the order is lowered instead');
+    for (const key of FIT_KEYS) {
+        const run = fitRun(START, { explicit: [key] });
+        assert.ok(run.asked.every((set) => set[key] === START[key]), key);
+    }
+    const all = fitRun(START, { explicit: [...FIT_KEYS] });
+    assert.equal(all.asked.length, 1, 'only the request as it is was admitted');
+    assert.equal(all.params, START);
+    assert.equal(all.admission.status, 'incompatible');
+    assert.equal(all.admission.reason, 'Needs 2048 tokens and 4 slots', 'with nothing to lower the refusal is left as it was');
+    assert.equal(all.admission.fit, undefined);
+});
+
+test('fit: the number of steps is bounded, by the argument and by MAX_FIT_STEPS for a schema that never lets it end', () => {
+    const three = fitRun(START, { maxSteps: 3 });
+    assert.equal(three.asked.length, 1 + 3);
+    assert.deepEqual(tuple(three.asked.at(-1)), [512, 2], 'ctxSize 1024, 512, then one step of parallel');
+    // More halvings to the minimum than the bound allows (52 for the context and 20 for the slots): the bound ends the fit.
+    const schema = { properties: { ctxSize: { minimum: 1 }, parallel: { minimum: 1 } } };
+    const endless = fitRun({ ctxSize: 2 ** 52, parallel: 2 ** 20 }, { order: ['ctxSize', 'parallel'], schema, model: {}, profile: 'cpu' });
+    assert.equal(endless.asked.length, 1 + MAX_FIT_STEPS);
+    assert.equal(endless.asked.at(-1).ctxSize, 1, 'the context reached its minimum first');
+    assert.equal(endless.asked.at(-1).parallel, 2 ** 20 / 2 ** (MAX_FIT_STEPS - 52), 'and the slots were lowered for the steps that were left');
+    assert.match(endless.admission.reason, /the smallest size tried was ctxSize 1, parallel \d+\.$/);
+});
+
+test('fit: insufficient-now is never fitted, and neither is a refusal that no size caused', () => {
+    const now = fitRun(START, { verdict: () => 'insufficient-now' });
+    assert.equal(now.asked.length, 1);
+    assert.equal(now.params, START);
+    assert.equal(now.admission.status, 'insufficient-now');
+    assert.equal(now.admission.fit, undefined);
+    // An incompatible result whose estimate has no weights (the runner, the source or the machine said no) is not about the sizes.
+    const unsized = fitAdmission({ params: START, explicit: [], order: FIT_KEYS, schema: FIT_SCHEMA, model: {}, profile: 'dedicated', normalize: (value) => value,
+        admitWith: () => admissionResult('incompatible', 'No GPU is available.', {}) });
+    assert.equal(unsized.params, START);
+    assert.equal(unsized.admission.reason, 'No GPU is available.');
+});
+
+test('fit: a refusal that no size caused is returned as it was, with the parameters as asked, even when its estimate is full', () => {
+    // The wording never moves with the sizes (a Metal device whose limit is unknown, memory that cannot be read): fit says nothing about it.
+    const run = fitRun(START, { reason: () => 'The device limit is unknown, so nothing can be sized on it.' });
+    assert.ok(run.asked.length > 1, 'it did try');
+    assert.equal(run.params, START);
+    assert.equal(run.admission.reason, 'The device limit is unknown, so nothing can be sized on it.');
+    assert.equal(run.admission.fit, undefined);
+    assert.deepEqual([...run.admission.warnings], []);
+});
+
+test('fit: the order is the hook\'s, and a key it does not name is not lowered', () => {
+    const reversed = fitRun(START, { order: ['parallel', 'ctxSize'] });
+    assert.deepEqual(reversed.asked.map(tuple).slice(0, 4), [[2048, 4], [2048, 2], [2048, 1], [1024, 1]]);
+    assert.ok(reversed.asked.every((set) => set.nGpuLayers === 99), 'the layers stay as asked');
+    const unknown = fitRun(START, { order: ['bogus', 'ctxSize'] });
+    assert.ok(unknown.asked.every((set) => set.parallel === 4 && set.nGpuLayers === 99));
+    const layers = fitRun(START, { order: ['nGpuLayers'] });
+    assert.equal(layers.asked.length, 1, 'the layers are not a key fit lowers, whatever the order names');
+});
+
+test('fit: nGpuLayers is never lowered, on any profile, with or without a layer count', () => {
+    for (const [profile, model] of [['dedicated', { id: 'm' }], ['dedicated', { id: 'm', memory: { layers: 24 } }], ['cpu', { id: 'm' }]]) {
+        const run = fitRun({ ctxSize: 512, parallel: 1, nGpuLayers: 99 }, { model, profile });
+        assert.equal(run.asked.length, 1, `${profile}: nothing else could be lowered, and the layers are not`);
+    }
+    const mixed = fitRun({ ctxSize: 2048, parallel: 1, nGpuLayers: 20 });
+    assert.ok(mixed.asked.every((set) => set.nGpuLayers === 20), 'a partial offload keeps its layers');
+});
+
+test('fit: the wording of a result that fits only this machine\'s size says it does not fit what is free now', () => {
+    const run = fitRun(START, { verdict: (set) => (set.ctxSize <= 1024 ? 'insufficient-now' : 'incompatible') });
+    assert.equal(run.admission.status, 'insufficient-now');
+    assert.deepEqual(tuple(run.params), [1024, 4]);
+    assert.equal(run.admission.warnings.at(-1), 'Fit lowered ctxSize from 2048 to 1024 so that the model fits this machine\'s size; it does not fit in what is free now.');
+    assert.ok(!/so that the model fits;/.test(run.admission.warnings.at(-1)));
+    assert.deepEqual(run.admission.fit, { lowered: [{ param: 'ctxSize', from: 2048, to: 1024 }] });
+});
+
+test('fit: a refusal whose need did not go down, though its wording moved, gets no "Fit also tried" sentence', () => {
+    // A RAM refusal: lowering the context takes the GPU figure down and leaves the RAM figure where it was.
+    const flat = fitRun(START, { reason: () => 'Needs about 40 GiB of RAM; this machine has 32 GiB.', estimate: (set) => ({ gpuBytes: gpuNeed(set), ramBytes: 40 * MIB }) });
+    assert.ok(flat.asked.length > 1, 'it did try');
+    assert.equal(flat.admission.reason, 'Needs about 40 GiB of RAM; this machine has 32 GiB.');
+    // The wording moves but no figure went down (the estimate carries none that does): the need did not go down, so nothing is added.
+    const moved = fitRun(START, { estimate: () => ({ gpuBytes: 7 * MIB, ramBytes: 7 * MIB }) });
+    assert.equal(moved.admission.reason, 'Needs 2048 tokens and 4 slots');
+    // Control: the GPU need goes down with the sizes and the wording follows it, so the sentence is added.
+    const control = fitRun(START);
+    assert.match(control.admission.reason, /Fit also tried lowering/);
+});
+
+test('fit: lowering parallel lowers a context the training context per slot cannot hold, unless the caller set it', () => {
+    const model = { id: 'm', contextLength: 1024, memory: { layers: 24 } };
+    const lowered = fitRun({ ctxSize: 4096, parallel: 4, nGpuLayers: 1 }, { order: ['parallel'], model });
+    assert.deepEqual(lowered.asked.map(tuple), [[4096, 4], [2048, 2], [1024, 1]]);
+    const set = fitRun({ ctxSize: 4096, parallel: 4, nGpuLayers: 1 }, { order: ['parallel'], model, explicit: ['ctxSize'] });
+    assert.equal(set.asked.length, 1, 'the slots that could not hold the caller\'s context are not lowered');
+    // A candidate the schema refuses cannot be lowered either, and the next key is tried; another error is a fault.
+    const refusing = fitRun(START, { normalize: (candidate) => { if (candidate.ctxSize < 2048) throw Object.assign(new Error('no'), { code: 'invalid_params' }); return candidate; } });
+    assert.ok(refusing.asked.slice(1).every((set) => set.ctxSize === 2048), 'ctxSize cannot go lower, so parallel is');
+    assert.throws(() => fitRun(START, { normalize: () => { throw new Error('boom'); } }), /boom/);
+});
+
+// ---------------------------------------------------------------- fitParams: through the controller
+
+// The cpu estimate of the seed model at a context, read from a preview on a roomy machine, and the memory of a machine whose pool holds exactly `ctx`.
+async function cpuNeeds(t) {
+    const { controller, seed } = await paramsController(t, undefined, { startArgs: [] });
+    const id = seed[0].id;
+    const need = async (ctxSize) => (await controller.overview({ preview: { modelId: id, runnerId: 'llama.cpp', params: { ctxSize } } })).preview.admission.estimate.ramBytes;
+    return { id, need, machineFor: async (ctxSize) => ({ totalBytes: Math.ceil(1.5 * GIB) + (await need(ctxSize)) + MIB, availableBytes: Math.ceil(1.5 * GIB) + (await need(ctxSize)) + MIB }) };
+}
+const FIT_CTX = () => recording({ fitParams: () => ({ order: ['ctxSize', 'parallel'] }) });
+
+test('fit through the controller: a preview and a Run use the largest halved context that fits, the saved set is the one before, and the status shows the chosen context', async (t) => {
+    const { id, machineFor, need } = await cpuNeeds(t);
+    assert.ok(await need(4096) > await need(2048) && await need(2048) > await need(1024), 'the estimate grows with the context');
+    const machine = { memory: await machineFor(2048) };
+    // The control: the identity on the same machine refuses the default context, and nothing is lowered or reported.
+    const plain = await paramsController(t, undefined, { startArgs: [], machine });
+    const refused = (await plain.controller.overview({ preview: { modelId: id, runnerId: 'llama.cpp' } })).preview;
+    assert.equal(refused.admission.status, 'incompatible', refused.admission.reason);
+    assert.equal(refused.params.ctxSize, 4096);
+    assert.equal(refused.admission.fit, undefined);
+    assert.ok(!/Fit/.test(refused.admission.reason));
+    assert.deepEqual(await plain.controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'fit-plain-0001' }).catch((error) => error.code), 'admission_incompatible');
+
+    const probe = FIT_CTX();
+    const args = [];
+    const { controller } = await paramsController(t, probe.limits, { startArgs: args, machine });
+    const { preview } = await controller.overview({ preview: { modelId: id, runnerId: 'llama.cpp' } });
+    assert.equal(preview.admission.status, 'ok', preview.admission.reason);
+    assert.equal(preview.params.ctxSize, 2048, 'the largest halved context that fits');
+    assert.equal(preview.context.totalContext, 2048, 'the context shown is the fitted one');
+    assert.deepEqual(preview.admission.fit, { lowered: [{ param: 'ctxSize', from: 4096, to: 2048 }] });
+    assert.match(preview.admission.warnings.at(-1), /Fit lowered ctxSize from 4096 to 2048/);
+    assert.equal(probe.named('fitParams').length, 2, 'the preview and the overview row ask once each');
+    assert.deepEqual(probe.named('fitParams')[0].args[0], { runnerId: 'llama.cpp', profile: 'cpu' });
+    // The overview's own row says the same: it is an admission point too.
+    const overview = await controller.overview();
+    const row = overview.models.find((model) => model.id === id).runners['llama.cpp'];
+    assert.equal(row.admission.status, 'ok');
+    assert.equal(row.params.ctxSize, 2048);
+
+    await controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'fit-run-0001' });
+    await until(() => args.length === 1);
+    assert.equal(ctxOf(args[0]), '2048', 'the launch uses the fitted context');
+    const { deployment } = controller.state;
+    assert.equal(deployment.params.ctxSize, 2048);
+    assert.deepEqual(deployment.admission.fit, { lowered: [{ param: 'ctxSize', from: 4096, to: 2048 }] });
+    assert.equal(controller.state.params[SAVED].ctxSize, 4096, 'what is saved is the set before fitting');
+    const status = await controller.status();
+    assert.equal(status.context.totalContext, 2048, 'the status shows the chosen context');
+    assert.match(status.deployment.admission.warnings.at(-1), /Fit lowered/);
+});
+
+test('fit through the controller: a context the caller set is refused as it was, and insufficient-now is not fitted', async (t) => {
+    const { id, machineFor } = await cpuNeeds(t);
+    const machine = { memory: await machineFor(2048) };
+    const { controller } = await paramsController(t, FIT_CTX().limits, { startArgs: [], machine });
+    const asked = (await controller.overview({ preview: { modelId: id, runnerId: 'llama.cpp', params: { ctxSize: 4096 } } })).preview;
+    assert.equal(asked.admission.status, 'incompatible');
+    assert.equal(asked.params.ctxSize, 4096, 'the caller\'s value is untouched');
+    assert.ok(!/Fit/.test(asked.admission.reason), 'the context is the caller\'s and the slots are at 1: nothing could be lowered, so the refusal is as it was');
+    const run = await controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'fit-explicit-0001', params: { ctxSize: 4096 } }).catch((error) => error);
+    assert.equal(run.code, 'admission_incompatible');
+    assert.equal(controller.state.params[SAVED], undefined, 'a refused Run saves nothing');
+    // Memory that fits the pool but not what is available now: insufficient-now, which fit leaves as it is (a smaller context would fit).
+    const need4096 = (await controller.overview({ preview: { modelId: id, runnerId: 'llama.cpp', params: { ctxSize: 4096 } } })).preview.admission.estimate.ramBytes;
+    machine.memory = { totalBytes: 8 * GIB, availableBytes: cpuFloorBytes(8 * GIB) + need4096 - MIB };
+    const probe = FIT_CTX();
+    const busy = await paramsController(t, probe.limits, { startArgs: [], machine });
+    const now = (await busy.controller.overview({ preview: { modelId: id, runnerId: 'llama.cpp', params: {} } })).preview;
+    assert.equal(now.admission.status, 'insufficient-now', now.admission.reason);
+    assert.equal(now.params.ctxSize, 4096, 'not lowered');
+    assert.equal(now.admission.fit, undefined);
+});
+
+test('fit through the controller: the check after the download fits again, from the set the Run started with, on the memory then', async (t) => {
+    const { id, machineFor } = await cpuNeeds(t);
+    const machine = { memory: await machineFor(2048) };
+    const tighter = await machineFor(1024);
+    const probe = FIT_CTX();
+    const args = [];
+    // The weights are fetched after the Run was admitted at 2048; the machine has less memory by then.
+    const { controller } = await paramsController(t, probe.limits, { startArgs: args, machine, onDownload: () => { machine.memory = tighter; } });
+    await controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'fit-recheck-0001' });
+    await until(() => args.length === 1);
+    assert.equal(controller.state.deployment.admission.fit.lowered[0].to, 1024, 'the recheck lowered it again');
+    assert.equal(ctxOf(args[0]), '1024', 'and the launch uses the rechecked context');
+    assert.equal(controller.state.deployment.params.ctxSize, 1024);
+    assert.equal(controller.state.params[SAVED].ctxSize, 4096, 'the saved set is still the one before');
+    // The Run itself and both of its repeated checks (after the download, and after the runner is prepared) asked for a fit.
+    assert.equal(probe.named('fitParams').length, 3, 'the Run and its two repeated checks ask once each');
+});
+
+test('identity limits: every admission point makes exactly one admission from one snapshot, and asks the fit hook once', async (t) => {
+    const probe = recording();
+    let snaps = 0;
+    const at = () => ({ admits: probe.named('admit').filter((call) => call.args[0].stage === 'before-policy').length, snaps, fits: probe.named('fitParams').length });
+    const since = (from) => { const now = at(); return { admits: now.admits - from.admits, snaps: now.snaps - from.snaps, fits: now.fits - from.fits }; };
+    let beforeDownload = null;
+    const args = [];
+    const { controller, seed } = await paramsController(t, probe.limits, { startArgs: args, onSnapshot: () => { snaps += 1; }, onDownload: () => { beforeDownload = at(); } });
+    const id = seed[0].id;
+    // The overview: one row is admitted (the other runners are not offered on this machine), from one snapshot.
+    let from = at();
+    await controller.overview();
+    assert.deepEqual(since(from), { admits: 1, snaps: 1, fits: 1 }, 'the overview');
+    // A preview adds its own admission to the overview's row, from the same one snapshot.
+    from = at();
+    await controller.overview({ preview: { modelId: id, runnerId: 'llama.cpp' } });
+    assert.deepEqual(since(from), { admits: 2, snaps: 1, fits: 2 }, 'the preview and the row');
+    // A Run: its own admission before the download, then the check after the download and the check after the runner is prepared.
+    from = at();
+    await controller.run({ modelId: id, runnerId: 'llama.cpp', requestId: 'one-admission-0001' });
+    await until(() => args.length === 1);
+    assert.deepEqual(since(beforeDownload), { admits: 2, snaps: 2, fits: 2 }, 'the check after the download and the check after the runner is prepared: one each');
+    assert.deepEqual(since(from), { admits: 3, snaps: 3, fits: 3 }, 'the Run in all: one admission and one snapshot per point');
 });

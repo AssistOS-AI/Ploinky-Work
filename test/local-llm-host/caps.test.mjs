@@ -30,7 +30,7 @@ import { SEED_CATALOG_FILE, createLocalLlmHost } from '../../lib/local-llm-host/
 import { LAUNCH_SCHEMA, createLaunchRecorder } from '../../lib/local-llm-host/launch.mjs';
 import { createDarwinProcs, parsePsRows } from '../../lib/local-llm-host/darwinProcs.mjs';
 import { createRunnerMemoryReader, parseVmRss } from '../../lib/local-llm-host/runnerMemory.mjs';
-import { capsLine, runEngineVerb } from '../../lib/pworker/models-cli.mjs';
+import { capsLine, fitLine, runEngineVerb } from '../../lib/pworker/models-cli.mjs';
 import { statusFor } from '../../lib/local-llm-host/routes.mjs';
 import { GIB, MODEL, fakeAdapter, freePort, scratch } from './fixtures/engine.mjs';
 import { request, startHost, startProxy } from './fixtures/proxy.mjs';
@@ -66,10 +66,17 @@ const SIZES = { tiny: 0.25, small: 2, six: 6, ten: 10, twelve: 12 };
 // Models with a known training context per slot (8192), the second recommending four slots on the cpu profile.
 const CONTEXT = 8192;
 const withContext = (model, extra = {}) => Object.assign(model, { contextLength: CONTEXT }, extra);
+/** A model whose KV cache is the larger part of its need: `kvKiB` kibibytes per token, so the context decides whether it fits (fit mode). */
+const kvHeavy = (id, weightsGiB, kvKiB) => Object.assign(modelOf(id, weightsGiB), { memory: { layers: 24, kvBytesPerToken: kvKiB * 1024 } });
 const SEED = [
     ...Object.entries(SIZES).map(([id, gib]) => modelOf(id, gib)),
     withContext(modelOf('slots', 2)),
     withContext(modelOf('slots-recommended', 2), { recommended: { cpu: { 'llama.cpp-cpu': { parallel: 4 } } } }),
+    // Fit mode: 2 GiB of weights, and a default context (16384 on dedicated, 4096 on cpu and Metal) that needs the KV cache above
+    // what the cap gives. `fitkv` needs about 10.4 GiB of GPU memory at 16384 and 6.4 GiB at 8192; `fitkv-light` only about 4.4 GiB.
+    kvHeavy('fitkv', 2, 512), kvHeavy('fitkv-light', 2, 128), kvHeavy('fitcpu', 2, 2048), kvHeavy('fitmetal', 2, 1536),
+    // The same on Metal with four slots recommended, so there are slots a fit can lower while the caller sets the context.
+    Object.assign(kvHeavy('fitmetal-slots', 2, 1536), { recommended: { metal: { 'llama.cpp': { parallel: 4 } } } }),
 ];
 
 /** A host on a scratch home with the real runner table, a fake machine and no process. `caps` undefined means no caps. */
@@ -118,7 +125,7 @@ test('parseCaps refuses bad values, unknown keys and the keys of later releases,
         [{ ram: 0 }, 'ram'], [{ ram: -5 }, 'ram'], [{ ram: 1.5 }, 'ram'], [{ ram: true }, 'ram'], [{ ram: '12' }, 'ram'],
         [{ ram: '0GiB' }, 'ram'], [{ ram: '12 GB' }, 'ram'], [{ gpuMemory: 'lots' }, 'gpuMemory'], [{ gpuMemory: null }, 'gpuMemory'],
         [{ gpuMemory: Number.MAX_SAFE_INTEGER + 2 }, 'gpuMemory'], [{ bogus: 1 }, 'bogus'],
-        [{ mode: 'fit' }, 'mode'],
+        [{ mode: 'bogus' }, 'mode'], [{ mode: 1 }, 'mode'], [{ mode: null }, 'mode'], [{ mode: 'Fit' }, 'mode'],
         [{ ram: '8GiB', mode: 'strict' }, 'mode'], [{ gpuMemory: 12 }, 'gpuMemory'], [{ ram: 1048575 }, 'ram'], [{ ram: '512KiB' }, 'ram'],
         [{ threads: 0 }, 'threads'], [{ threads: -2 }, 'threads'], [{ threads: 1.5 }, 'threads'], [{ threads: '4' }, 'threads'], [{ threads: null }, 'threads'],
         [{ maxParallel: 0 }, 'maxParallel'], [{ maxParallel: 2.5 }, 'maxParallel'], [{ maxParallel: true }, 'maxParallel'],
@@ -128,7 +135,7 @@ test('parseCaps refuses bad values, unknown keys and the keys of later releases,
         assert.throws(() => parseCaps(section), (error) => error instanceof LocalLlmError && error.code === 'invalid_caps'
             && error.details.key === key && error.message.includes(key), JSON.stringify(section));
     }
-    assert.throws(() => parseCaps({ mode: 'fit' }), /not supported yet/);
+    assert.throws(() => parseCaps({ mode: 'bogus' }), /must be "refuse" or "fit"/);
     assert.throws(() => parseCaps({ maxContext: 511 }), /smallest context a runner accepts/);
     assert.throws(() => parseCaps([]), (error) => error.code === 'invalid_caps');
     assert.throws(() => parseCaps('8GiB'), (error) => error.code === 'invalid_caps');
@@ -162,7 +169,7 @@ test('defineCapLimits binds the memory pool, the memory view, the GPU share and 
     assert.throws(() => defineCapLimits(null), (error) => error.code === 'invalid_caps');
     const limits = defineCapLimits(parseCaps({ ram: '8GiB', gpuMemory: '4GiB' }));
     // The guard hooks are bound only with a ram cap and a way to read the runners' memory (the V4 cases below); here there is none.
-    for (const hook of ['capCores', 'observeSnapshot', 'decorateSnapshot', 'refuseProfile', 'refuseResourceRequest', 'runnerEnvironment', 'guardSample', 'guardBreach']) {
+    for (const hook of ['capCores', 'fitParams', 'observeSnapshot', 'decorateSnapshot', 'refuseProfile', 'refuseResourceRequest', 'runnerEnvironment', 'guardSample', 'guardBreach']) {
         assert.equal(limits[hook], IDENTITY_LIMITS[hook], hook);
     }
     const pool = limits.memoryPool({ totalBytes: 64 * GIB, availableBytes: 60 * GIB }, null, { amount });
@@ -270,9 +277,12 @@ test('a bad caps section is kept at creation and thrown by controller() after th
     await assert.rejects(host.controller(), { code: 'invalid_caps' }, 'and it is refused again, not remembered as a controller');
 });
 
-test('mode fit is refused the same way when the host is used, and the host with no caps has the identity limits', async (t) => {
-    const host = await capsHost(t, { caps: { ram: '8GiB', mode: 'fit' }, profile: 'cpu', machine: CPU_MACHINE });
-    await assert.rejects(host.controller(), (error) => error.code === 'invalid_caps' && error.details.key === 'mode' && /not supported yet/.test(error.message));
+test('a bad mode is refused the same way when the host is used, mode fit is accepted, and the host with no caps has the identity limits', async (t) => {
+    const bad = await capsHost(t, { caps: { ram: '8GiB', mode: 'strict' }, profile: 'cpu', machine: CPU_MACHINE });
+    await assert.rejects(bad.controller(), (error) => error.code === 'invalid_caps' && error.details.key === 'mode' && /must be "refuse" or "fit"/.test(error.message));
+    const fit = await capsHost(t, { caps: { ram: '8GiB', mode: 'fit' }, profile: 'cpu', machine: CPU_MACHINE });
+    assert.equal(fit.capsRefusal, null);
+    assert.deepEqual((await (await fit.controller()).overview()).limits.budget, { caps: { ram: 8 * GIB }, mode: 'fit' }, 'the overview says which mode is in force');
     const plain = await capsHost(t, { profile: 'cpu', machine: CPU_MACHINE });
     assert.equal(plain.caps, null);
     assert.equal(plain.capsRefusal, null);
@@ -391,10 +401,11 @@ function defaultThreadsOf(profile, { procDir }) {
  * Runs `small` on a host with the real runner table and the real controller, on a fake machine, with the runner process stubbed
  * out, and returns the llama-server argv it would have been started with (or the error the Run was refused with).
  */
-async function launchOf(t, { caps, profile, params, modelId = 'small', home = scratch(t), drain = false }) {
+async function launchOf(t, { caps, profile, params, modelId = 'small', home = scratch(t), drain = false, machine: given = null, onDownload = null, awaitStart = true }) {
     const procDir = sixteenCores(home);
     const metal = profile === 'metal';
-    const machine = { cpu: CPU_MACHINE, dedicated: DEDICATED_MACHINE, unified: UNIFIED_MACHINE, metal: MAC_MACHINE }[profile];
+    // `given` is a machine the test may change between the admission and the check after the download.
+    const machine = given ?? { cpu: CPU_MACHINE, dedicated: DEDICATED_MACHINE, unified: UNIFIED_MACHINE, metal: MAC_MACHINE }[profile];
     const started = [];
     const weights = path.join(home, 'weights.gguf');
     fs.writeFileSync(weights, 'weights');
@@ -404,7 +415,7 @@ async function launchOf(t, { caps, profile, params, modelId = 'small', home = sc
             ensureRunnable: async () => ({ rebuilt: false }), entryFor: (id) => ({ id }), pathsFor: () => ({ runDir: '/run/llama.cpp/b1' }),
         },
         inspect: async () => ({ state: 'complete', bytes: 1 }), detectRunner: () => ({ installed: true, version: 'v1', reason: null }),
-        download: async () => ({ status: 'complete', path: weights, bytesTransferred: 0 }),
+        download: async () => { onDownload?.(); return { status: 'complete', path: weights, bytesTransferred: 0 }; },
         fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({}) }), pollMs: 2, stopGraceMs: 20,
         startRunner(options) {
             started.push(options.args);
@@ -424,6 +435,7 @@ async function launchOf(t, { caps, profile, params, modelId = 'small', home = sc
     const controller = await host.controller();
     const result = await controller.run({ modelId, runnerId: RUNNER[profile] ?? 'llama.cpp', requestId: `caps-${profile}-${started.length}-${Math.random().toString(16).slice(2, 8)}`, params }).then(() => null, (error) => error);
     if (result) return { error: result, procDir };
+    if (!awaitStart) return { controller, started, procDir };
     const deadline = Date.now() + 3000;
     while (!started.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
     assert.equal(started.length, 1, `the runner was started (${controller.state.deployment?.phase}: ${controller.state.deployment?.error})`);
@@ -646,6 +658,25 @@ test('models status, a refused preview and a refused run print the caps line; wi
     assert.equal(run.err, line);
     assert.equal((await verb(['run', 'x'], { limits: null }, refusedRun)).err, '');
     assert.equal((await verb(['status'], capped, { overview: async () => { throw new Error('down'); } })).out, 'phase idle\n', 'an overview that fails never fails the verb');
+});
+
+test('models preview and status say what fit mode lowered, with the values in force, and print nothing more when it lowered nothing', async () => {
+    const verb = async (args, engine) => {
+        const out = [];
+        const code = await runEngineVerb({ args: ['models', ...args], client: { engine }, io: { out: (text) => out.push(text), err: () => {}, isTTY: false } });
+        return { code, out: out.join('') };
+    };
+    const fit = { lowered: [{ param: 'ctxSize', from: 16384, to: 8192 }, { param: 'parallel', from: 4, to: 1 }] };
+    assert.equal(fitLine({ fit }), 'fit lowered: ctxSize 16384 -> 8192, parallel 4 -> 1');
+    assert.equal(fitLine({ status: 'ok' }), null);
+    assert.equal(fitLine({ fit: { lowered: [] } }), null);
+    assert.equal(fitLine(undefined), null);
+    const preview = (admission) => ({ preview: async () => ({ preview: { admission } }), overview: async () => ({}) });
+    assert.equal((await verb(['preview', 'x'], preview({ status: 'ok', reason: null, fit }))).out, 'x: ok\nfit lowered: ctxSize 16384 -> 8192, parallel 4 -> 1\n');
+    assert.equal((await verb(['preview', 'x'], preview({ status: 'ok', reason: null }))).out, 'x: ok\n', 'nothing lowered, nothing printed');
+    const status = (admission) => ({ status: async () => ({ phase: 'ready', deployment: { modelId: 'x', phase: 'ready', admission } }), overview: async () => ({}) });
+    assert.match((await verb(['status'], status({ status: 'ok', fit }))).out, /\nfit lowered: ctxSize 16384 -> 8192, parallel 4 -> 1\n$/);
+    assert.doesNotMatch((await verb(['status'], status({ status: 'ok' }))).out, /fit lowered/);
 });
 
 // ---------------------------------------------------------------- the cap bounds the need, not the host reserve or the floor
@@ -1136,4 +1167,264 @@ test('V4 macOS: the host wires the ps seam into the ram guard, so a Metal runner
     assert.match(controller.state.deployment.error, /localLlm\.caps\.ram/);
     assert.ok(controller.state.deployment.error.includes('9.00 GiB'));
     assert.equal(handles[0].killed, true);
+});
+
+// ---------------------------------------------------------------- V9: mode fit
+
+/** The preview of `modelId` on the host's real controller, whole: the parameters it shows and the admission. */
+async function previewFull(host, profile, modelId, params) {
+    const controller = await host.controller();
+    return (await controller.overview({ preview: { modelId, runnerId: RUNNER[profile], ...(params ? { params } : {}) } })).preview;
+}
+const ctxFlag = (profile) => (profile === 'metal' ? '-c' : '--ctx-size');
+const FIT_DEDICATED = { gpuMemory: '8GiB', mode: 'fit' };
+
+test('parseCaps accepts mode fit, which alone caps nothing, and the digest and the limits tell the modes apart', () => {
+    assert.equal(parseCaps({ ram: '8GiB', mode: 'fit' }).mode, 'fit');
+    assert.equal(parseCaps({ ram: '8GiB', mode: 'refuse' }).mode, 'refuse');
+    assert.equal(parseCaps({ ram: '8GiB' }).mode, 'refuse', 'the default');
+    assert.equal(parseCaps({ mode: 'fit' }), null, 'a mode with nothing to cap is no caps, as with refuse');
+    assert.notEqual(capsDigest(parseCaps({ ram: '8GiB', mode: 'fit' })), capsDigest(parseCaps({ ram: '8GiB' })), 'a cached answer is not reused across modes');
+    const fit = defineCapLimits(parseCaps({ ram: '8GiB', mode: 'fit' }));
+    assert.deepEqual(fit.fitParams({ runnerId: 'llama.cpp', profile: 'dedicated' }), { order: ['ctxSize', 'parallel'] }, 'the layers are not in the order');
+    assert.equal(defineCapLimits(parseCaps({ ram: '8GiB' })).fitParams, IDENTITY_LIMITS.fitParams, 'refuse mode leaves the hook the identity');
+    assert.equal(fit.overview({ snapshot: CPU_MACHINE }).mode, 'fit');
+    assert.match(capsLine({ limits: { budget: { caps: { ram: 8 * GIB }, mode: 'fit' } } }), /; fit mode$/);
+});
+
+test('V9 dedicated: gpuMemory 8GiB in fit mode admits the model whose default 16384 context needs about 10 GiB at the largest halved context that fits, and the saved set is the one before', async (t) => {
+    const host = await capsHost(t, { caps: FIT_DEDICATED, profile: 'dedicated', machine: DEDICATED_MACHINE });
+    const preview = await previewFull(host, 'dedicated', 'fitkv');
+    assert.equal(preview.admission.status, 'ok', preview.admission.reason);
+    assert.equal(preview.params.ctxSize, 8192, '16384 needs about 10.4 GiB, 8192 about 6.4 GiB: the largest halved context under the cap');
+    assert.equal(preview.context.totalContext, 8192);
+    assert.ok(preview.admission.estimate.gpuBytes < 8 * GIB * 0.97 && preview.admission.estimate.gpuBytes > 6 * GIB, `needs ${preview.admission.estimate.gpuBytes}`);
+    assert.deepEqual(preview.admission.fit, { lowered: [{ param: 'ctxSize', from: 16384, to: 8192 }] });
+    assert.match(preview.admission.warnings.at(-1), /Fit lowered ctxSize from 16384 to 8192/, 'the preview says fit lowered it');
+    // The control (negative): refuse mode on the same machine and model is today's refusal, with nothing lowered.
+    const refuse = await capsHost(t, { caps: { gpuMemory: '8GiB' }, profile: 'dedicated', machine: DEDICATED_MACHINE });
+    const refused = await previewFull(refuse, 'dedicated', 'fitkv');
+    assert.equal(refused.admission.status, 'incompatible', refused.admission.reason);
+    assert.equal(refused.params.ctxSize, 16384);
+    assert.ok(refused.admission.estimate.gpuBytes > 10 * GIB && refused.admission.estimate.gpuBytes < 11 * GIB, `needs ${refused.admission.estimate.gpuBytes}`);
+    assert.match(refused.admission.reason, /the GPU has 8\.\d+ GiB|the GPU has 8 GiB/);
+    assert.ok(!/Fit/.test(refused.admission.reason) && refused.admission.fit === undefined);
+    // The Run: the launch, the deployment and the status use the fitted context; what is saved is the set before.
+    const run = await launchOf(t, { caps: FIT_DEDICATED, profile: 'dedicated', modelId: 'fitkv' });
+    assert.equal(run.error, undefined, run.error?.message);
+    assert.equal(flag(run.args, '--ctx-size'), '8192', 'the launch');
+    assert.equal(run.controller.state.deployment.params.ctxSize, 8192, 'the deployment');
+    assert.equal(run.saved['fitkv|llama.cpp'].ctxSize, 16384, 'the saved set is the one before fitting');
+    assert.equal((await run.controller.status()).context.totalContext, 8192, 'the status shows the chosen context');
+    assert.match((await run.controller.status()).deployment.admission.warnings.at(-1), /Fit lowered ctxSize from 16384 to 8192/);
+    // Negative control: no caps at all is the identity: the default context, admitted on a roomy GPU, no budget, nothing lowered.
+    const none = await launchOf(t, { profile: 'dedicated', modelId: 'fitkv' });
+    assert.equal(flag(none.args, '--ctx-size'), '16384');
+    assert.equal(none.controller.state.deployment.admission.fit, undefined);
+    assert.equal((await none.controller.overview()).limits?.budget, undefined);
+});
+
+test('V9 dedicated: an explicit --ctx 16384 is refused, and the slots are at 1, the layers are never lowered, so fit tried nothing', async (t) => {
+    const asked = await launchOf(t, { caps: FIT_DEDICATED, profile: 'dedicated', modelId: 'fitkv', params: { ctxSize: 16384 } });
+    assert.equal(asked.error?.code, 'admission_incompatible', asked.error?.message);
+    assert.ok(!/Fit also tried/.test(asked.error.message), 'nothing was lowered, so there is no fit sentence');
+    assert.ok(!/nGpuLayers/.test(asked.error.message), 'the layers are not something fit tries');
+    const host = await capsHost(t, { caps: FIT_DEDICATED, profile: 'dedicated', machine: DEDICATED_MACHINE });
+    const preview = await previewFull(host, 'dedicated', 'fitkv', { ctxSize: 16384 });
+    assert.equal(preview.admission.status, 'incompatible');
+    assert.equal(preview.params.ctxSize, 16384);
+    assert.equal(preview.params.nGpuLayers, 99, 'the layers stay as asked');
+    assert.equal(preview.admission.fit, undefined);
+    assert.ok(!/Fit also tried/.test(preview.admission.reason));
+    // With slots to give up, fit tries them, but the estimate does not size slots: the need did not go down, so the refusal is left as it was.
+    const slots = await previewFull(host, 'dedicated', 'fitkv', { ctxSize: 16384, parallel: 4 });
+    assert.equal(slots.admission.status, 'incompatible');
+    assert.ok(!/Fit also tried/.test(slots.admission.reason), slots.admission.reason);
+    assert.equal(slots.params.parallel, 4, 'the preview shows the request as asked');
+    // The same explicit value on a model whose KV cache fits is admitted: nothing about the value itself is refused.
+    const light = await previewFull(host, 'dedicated', 'fitkv-light', { ctxSize: 16384 });
+    assert.equal(light.admission.status, 'ok', light.admission.reason);
+    assert.equal(light.params.ctxSize, 16384);
+    // Control: refuse mode refuses the same request with today's reason (no fit sentence).
+    const refuse = await launchOf(t, { caps: { gpuMemory: '8GiB' }, profile: 'dedicated', modelId: 'fitkv', params: { ctxSize: 16384 } });
+    assert.equal(refuse.error?.code, 'admission_incompatible');
+    assert.ok(!/Fit/.test(refuse.error.message));
+});
+
+test('V9 dedicated: a refusal about the machine\'s RAM, which no context lowers, gets no "Fit also tried" sentence, though the GPU figure goes down with the context', async (t) => {
+    // fitkv-light fits the 8 GiB cap at 16384 (about 4.4 GiB), but the runner alone needs 768 MiB of RAM and the machine has 512 MiB.
+    const small = { ...DEDICATED_MACHINE, memory: { totalBytes: GIB / 2, availableBytes: GIB / 2 } };
+    const host = await capsHost(t, { caps: FIT_DEDICATED, profile: 'dedicated', machine: small });
+    const preview = await previewFull(host, 'dedicated', 'fitkv-light');
+    assert.equal(preview.admission.status, 'incompatible', preview.admission.reason);
+    assert.match(preview.admission.reason, /of RAM; this machine has/);
+    assert.equal(preview.params.ctxSize, 16384, 'nothing was lowered');
+    assert.equal(preview.admission.fit, undefined);
+    assert.ok(!/Fit also tried/.test(preview.admission.reason), preview.admission.reason);
+    const run = await launchOf(t, { caps: FIT_DEDICATED, profile: 'dedicated', modelId: 'fitkv-light', machine: structuredClone(small) });
+    assert.equal(run.error?.code, 'admission_incompatible');
+    assert.ok(!/Fit also tried/.test(run.error.message), run.error.message);
+    // Control: refuse mode says the same.
+    const refuse = await launchOf(t, { caps: { gpuMemory: '8GiB' }, profile: 'dedicated', modelId: 'fitkv-light', machine: structuredClone(small) });
+    assert.equal(refuse.error?.message, run.error.message);
+});
+
+test('V9 dedicated: an insufficient-now result is not fitted, even when a smaller context would fit', async (t) => {
+    // 20 GiB of the 24 GiB GPU are in use: 4 GiB are free, inside the 8 GiB cap. fitkv-light needs about 4.4 GiB at 16384, which the cap holds
+    // but the free memory (less its margin) does not; at 8192 it would need about 3.4 GiB, which fits.
+    const busy = { ...DEDICATED_MACHINE, gpu: { ...DEDICATED_MACHINE.gpu, usedBytes: 20 * GIB, freeBytes: 4 * GIB } };
+    const host = await capsHost(t, { caps: FIT_DEDICATED, profile: 'dedicated', machine: busy });
+    const now = await previewFull(host, 'dedicated', 'fitkv-light');
+    assert.equal(now.admission.status, 'insufficient-now', now.admission.reason);
+    assert.equal(now.params.ctxSize, 16384, 'not lowered');
+    assert.equal(now.admission.fit, undefined);
+    const small = await previewFull(host, 'dedicated', 'fitkv-light', { ctxSize: 8192 });
+    assert.equal(small.admission.status, 'ok', 'control: a smaller context does fit now, so only the rule kept it from being chosen');
+    const run = await launchOf(t, { caps: FIT_DEDICATED, profile: 'dedicated', modelId: 'fitkv-light', machine: structuredClone(busy) });
+    assert.equal(run.error?.code, 'admission_insufficient_now');
+});
+
+test('V9 dedicated: the check after the download fits again, from the set the Run started with, on the machine as it is then', async (t) => {
+    const machine = structuredClone(DEDICATED_MACHINE);
+    // Admitted at 8192 against 8 GiB. By the time the weights are fetched the GPU has 6 GiB (the cap is above it): 8192 needs 6.4 GiB, so the check
+    // is incompatible now, and fitting again from the 16384 the Run started with gives 4096.
+    const run = await launchOf(t, { caps: FIT_DEDICATED, profile: 'dedicated', modelId: 'fitkv', machine, onDownload: () => { machine.gpu.totalBytes = 6 * GIB; machine.gpu.freeBytes = 6 * GIB; } });
+    assert.equal(run.error, undefined, run.error?.message);
+    assert.equal(flag(run.args, '--ctx-size'), '4096', 'the launch uses what the recheck settled on');
+    assert.equal(run.controller.state.deployment.params.ctxSize, 4096);
+    assert.deepEqual(run.controller.state.deployment.admission.fit, { lowered: [{ param: 'ctxSize', from: 16384, to: 4096 }] }, 'from the Run\'s own start, not from the 8192 of the first fit');
+    assert.equal(run.saved['fitkv|llama.cpp'].ctxSize, 16384);
+    // Control (negative): refuse mode, same machine change: the first admission passes, the recheck refuses, and nothing is started.
+    const again = structuredClone(DEDICATED_MACHINE);
+    const refused = await launchOf(t, { caps: { gpuMemory: '8GiB' }, profile: 'dedicated', modelId: 'fitkv-light', machine: again, awaitStart: false,
+        onDownload: () => { again.gpu.totalBytes = 3 * GIB; again.gpu.freeBytes = 3 * GIB; } });
+    assert.equal(refused.error, undefined, 'the Run was accepted at the first admission');
+    const deadline = Date.now() + 3000;
+    while (refused.controller.state.deployment?.phase !== 'error' && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(refused.controller.state.deployment.phase, 'error');
+    assert.match(refused.controller.state.deployment.error, /Needs about 4\.4 GiB of GPU memory; the GPU has 3\.0 GiB/);
+    assert.ok(!/Fit/.test(refused.controller.state.deployment.error));
+    assert.deepEqual(refused.started, [], 'nothing was started');
+});
+
+test('V9 cpu: a ram cap in fit mode halves the default context until the pool holds the model, and refuse mode and no caps are the controls', async (t) => {
+    // fitcpu: 2 GiB of weights and 2 MiB of KV cache per token: about 11 GiB at the default 4096 and 7 GiB at 2048, against an 8 GiB cap.
+    const fit = await capsHost(t, { caps: { ram: '8GiB', mode: 'fit' }, profile: 'cpu', machine: CPU_MACHINE });
+    const preview = await previewFull(fit, 'cpu', 'fitcpu');
+    assert.equal(preview.admission.status, 'ok', preview.admission.reason);
+    assert.equal(preview.params.ctxSize, 2048);
+    assert.deepEqual(preview.admission.fit, { lowered: [{ param: 'ctxSize', from: 4096, to: 2048 }] });
+    assert.ok(preview.admission.estimate.ramBytes < 8 * GIB && preview.admission.estimate.ramBytes > 6 * GIB, `needs ${preview.admission.estimate.ramBytes}`);
+    const refuse = await previewFull(await capsHost(t, { caps: { ram: '8GiB' }, profile: 'cpu', machine: CPU_MACHINE }), 'cpu', 'fitcpu');
+    assert.equal(refuse.admission.status, 'incompatible', refuse.admission.reason);
+    assert.equal(refuse.params.ctxSize, 4096);
+    assert.ok(refuse.admission.estimate.ramBytes > 10 * GIB);
+    const none = await previewFull(await capsHost(t, { profile: 'cpu', machine: CPU_MACHINE }), 'cpu', 'fitcpu');
+    assert.equal(none.admission.status, 'ok', 'no caps: the machine holds it');
+    assert.equal(none.params.ctxSize, 4096);
+    assert.equal(none.admission.fit, undefined);
+    // An explicit context is refused; parallel (1) and the layers (not a cpu parameter) leave nothing else to lower.
+    const asked = await previewFull(fit, 'cpu', 'fitcpu', { ctxSize: 4096 });
+    assert.equal(asked.admission.status, 'incompatible');
+    assert.equal(asked.params.ctxSize, 4096);
+    const askedRefuse = await previewFull(await capsHost(t, { caps: { ram: '8GiB' }, profile: 'cpu', machine: CPU_MACHINE }), 'cpu', 'fitcpu', { ctxSize: 4096 });
+    assert.equal(asked.admission.reason, askedRefuse.admission.reason, 'the same refusal as refuse mode gives');
+    assert.ok(!/Fit/.test(asked.admission.reason), 'with the context the caller\'s and one slot there is nothing to lower, so the refusal is as it was');
+    const run = await launchOf(t, { caps: { ram: '8GiB', mode: 'fit' }, profile: 'cpu', modelId: 'fitcpu' });
+    assert.equal(run.error, undefined, run.error?.message);
+    assert.equal(flag(run.args, '--ctx-size'), '2048');
+    assert.equal(run.saved['fitcpu|llama.cpp-cpu'].ctxSize, 4096, 'saved: the set before fitting');
+});
+
+test('V9 metal: a ram cap in fit mode lowers the default -c on a Mac, and refuse mode and no caps are the controls', async (t) => {
+    // fitmetal: 2 GiB of weights and 1.5 MiB of KV cache per token: about 9.3 GiB at the default 4096 and 6 GiB at 2048, against an 8 GiB cap.
+    const run = await launchOf(t, { caps: { ram: '8GiB', mode: 'fit' }, profile: 'metal', modelId: 'fitmetal' });
+    assert.equal(run.error, undefined, run.error?.message);
+    assert.equal(flag(run.args, '-c'), '2048');
+    assert.deepEqual(run.controller.state.deployment.admission.fit, { lowered: [{ param: 'ctxSize', from: 4096, to: 2048 }] });
+    assert.equal(run.saved['fitmetal|llama.cpp'].ctxSize, 4096, 'saved: the set before fitting');
+    const refused = await launchOf(t, { caps: { ram: '8GiB' }, profile: 'metal', modelId: 'fitmetal' });
+    assert.equal(refused.error?.code, 'admission_incompatible', refused.error?.message);
+    assert.ok(!/Fit/.test(refused.error.message));
+    const none = await launchOf(t, { profile: 'metal', modelId: 'fitmetal' });
+    assert.equal(flag(none.args, '-c'), '4096', 'no caps: the machine holds it, nothing lowered');
+    assert.equal(none.controller.state.deployment.admission.fit, undefined);
+    // The Metal estimate multiplies the KV cache by the slots: with the context set by the caller, fewer slots are what fit lowers (four are recommended).
+    const slots = await launchOf(t, { caps: { ram: '8GiB', mode: 'fit' }, profile: 'metal', modelId: 'fitmetal-slots', params: { ctxSize: 2048 } });
+    assert.equal(slots.error, undefined, slots.error?.message);
+    assert.equal(flag(slots.args, '-c'), '2048', 'the context the caller set stays');
+    assert.equal(flag(slots.args, '-np'), '1', 'the slots were lowered from the recommended four until the pool held the model');
+    assert.deepEqual(slots.controller.state.deployment.admission.fit.lowered, [{ param: 'parallel', from: 4, to: 1 }]);
+    assert.equal(slots.saved['fitmetal-slots|llama.cpp'].parallel, 4, 'saved: the set before fitting');
+    const noFit = await launchOf(t, { caps: { ram: '8GiB' }, profile: 'metal', modelId: 'fitmetal-slots', params: { ctxSize: 2048 } });
+    assert.equal(noFit.error?.code, 'admission_incompatible', 'control: refuse mode refuses the same request');
+});
+
+test('V9 metal: a refusal no size caused (the device limit is unknown, as before the runner is installed) is not fitted: today\'s reason and the default parameters', async (t) => {
+    const unknown = () => ({ ...MAC_MACHINE, gpu: { ...MAC_MACHINE.gpu, deviceCapBytes: null } });
+    const fit = await launchOf(t, { caps: { ram: '8GiB', mode: 'fit' }, profile: 'metal', modelId: 'fitmetal', machine: unknown() });
+    const refuse = await launchOf(t, { caps: { ram: '8GiB' }, profile: 'metal', modelId: 'fitmetal', machine: unknown() });
+    assert.equal(fit.error?.code, 'admission_incompatible', fit.error?.message);
+    assert.match(fit.error.message, /The Metal device's memory limit is unknown/);
+    assert.equal(fit.error.message, refuse.error.message, 'the reason is the one refuse mode gives, with no sentence about fit');
+    assert.ok(!/Fit/.test(fit.error.message));
+    assert.equal(fit.error.details.admission.reasonCode, 'metal_device_unknown');
+});
+
+// ---------------------------------------------------------------- Q3: the runners' own memory counts against the ram cap
+
+test('ourUse: with ram, the capped available memory is the smaller of what is available and the cap less the runners\' use, and the reserve figures stay physical', () => {
+    let reads = 0;
+    const limitsWith = (used, caps = { ram: '8GiB' }) => defineCapLimits(parseCaps(caps), { runnerMemory: typeof used === 'function' ? used : () => { reads += 1; return used; } });
+    const memory = () => ({ totalBytes: 64 * GIB, availableBytes: 60 * GIB });
+    const limits = limitsWith(3 * GIB);
+    const pool = limits.memoryPool(memory(), null, { amount });
+    assert.deepEqual({ total: pool.totalBytes, available: pool.availableBytes }, { total: 8 * GIB, available: 5 * GIB }, 'the total is the cap; what is available is the cap less the 3 GiB the runners hold');
+    assert.deepEqual({ total: pool.reserveTotalBytes, available: pool.reserveAvailableBytes }, { total: 64 * GIB, available: 60 * GIB }, 'the reserve figures stay physical');
+    const view = limits.effective({ snapshot: { memory: memory() } }).memory;
+    assert.deepEqual({ total: view.totalBytes, available: view.availableBytes, reserveTotal: view.reserveTotalBytes, reserveAvailable: view.reserveAvailableBytes },
+        { total: 8 * GIB, available: 5 * GIB, reserveTotal: 64 * GIB, reserveAvailable: 60 * GIB });
+    // The smaller of the two: a machine with less available than the cap leaves keeps its own figure.
+    assert.equal(limits.memoryPool({ totalBytes: 64 * GIB, availableBytes: 4 * GIB }, null, { amount }).availableBytes, 4 * GIB);
+    // The control: with nothing running the available figure is the cap, as before; more use than the cap leaves none, never a negative.
+    assert.equal(limitsWith(0).memoryPool(memory(), null, { amount }).availableBytes, 8 * GIB);
+    assert.equal(limitsWith(9 * GIB).memoryPool(memory(), null, { amount }).availableBytes, 0);
+    assert.equal(limitsWith(9 * GIB).effective({ snapshot: { memory: memory() } }).memory.availableBytes, 0);
+    // A reading that is missing counts as 0 (null, a throw, a figure that is not a count of bytes).
+    for (const unreadable of [() => null, () => { throw new Error('no ps'); }, () => Number.NaN, () => -5, () => 1.5]) {
+        assert.equal(limitsWith(unreadable).memoryPool(memory(), null, { amount }).availableBytes, 8 * GIB);
+        assert.equal(limitsWith(unreadable).effective({ snapshot: { memory: memory() } }).memory.availableBytes, 8 * GIB);
+    }
+    // gpuMemory alone: the runners' use is not subtracted from a unified GPU's cap (it is the ram cap's rule), and no reader is asked.
+    reads = 0;
+    const gpuOnly = limitsWith(3 * GIB, { gpuMemory: '4GiB' });
+    assert.equal(gpuOnly.effective({ snapshot: UNIFIED_MACHINE }).memory.availableBytes, 4 * GIB);
+    assert.equal(reads, 0);
+    // The reading is taken once per snapshot, however many admissions (one per fit step, one per model in the overview) ask about it.
+    reads = 0;
+    const cached = limitsWith(3 * GIB);
+    const same = memory();
+    for (let call = 0; call < 5; call += 1) {
+        cached.memoryPool(same, null, { amount });
+        cached.effective({ snapshot: { memory: same } });
+    }
+    assert.equal(reads, 1, 'one read for one snapshot');
+    cached.memoryPool(memory(), null, { amount });
+    assert.equal(reads, 2, 'and a fresh read for the next snapshot');
+    // With no way to read the runners the figure is 0, and the pool is the cap, as before this rule.
+    assert.equal(defineCapLimits(parseCaps({ ram: '8GiB' })).memoryPool(memory(), null, { amount }).availableBytes, 8 * GIB);
+});
+
+test('ourUse: a model that fits the cap alone is refused for now while another runner holds the memory, and admitted when none does', () => {
+    const big = structuredClone(SEED.find((entry) => entry.id === 'small'));
+    const runner = getRunner('llama.cpp-cpu');
+    const snapshot = { ...CPU_MACHINE, memory: { ...MEMORY } };
+    const verdict = (used) => admit({
+        runner, model: big, source: big.sources.gguf, snapshot, profile: 'cpu', limits: defineCapLimits(parseCaps({ ram: '8GiB' }), { runnerMemory: () => used }),
+        params: runner.normalizeParams({}, { model: big, profile: 'cpu' }),
+    });
+    assert.equal(verdict(0).status, 'ok', verdict(0).reason);
+    const held = verdict(6 * GIB);
+    assert.equal(held.status, 'insufficient-now', held.reason);
+    assert.match(held.reason, /2\.00 GiB is available now/, 'the figure is the cap less the runners\' use');
 });
