@@ -11,7 +11,7 @@ import test from 'node:test';
 import { admissionResult, admit, admitOllama, admitVllm } from '../../lib/local-llm/controller/admission.mjs';
 import { loadSeedCatalog, validateModel } from '../../lib/local-llm/controller/catalog.mjs';
 import { cpuDefaultThreads, defaultThreads, performanceCoreCount, physicalCoreCount, readSnapshot } from '../../lib/local-llm/controller/hardware.mjs';
-import { admitApuLlamaServer } from '../../lib/local-llm/controller/profiles.mjs';
+import { UNIFIED, admitApuLlamaServer, cpuFloorBytes, cpuHostReserveBytes } from '../../lib/local-llm/controller/profiles.mjs';
 import { LocalLlmError } from '../../lib/local-llm/errors.mjs';
 import { IDENTITY_LIMITS, LIMIT_HOOKS, defineLimits } from '../../lib/local-llm/limits.mjs';
 import { createRunners } from '../../lib/local-llm/runners/index.mjs';
@@ -465,6 +465,51 @@ test('memoryPool: the CPU policy asks with the memory, the snapshot and a byte f
     assert.equal(refused.status, 'incompatible');
     assert.match(refused.reason, /cannot be read/);
     assert.equal(unread.calls.filter((call) => call.name === 'memoryPool').length, 0);
+});
+
+// A limit that is a hard ceiling (a container's memory) returns a capped view with `physicalTotalBytes` and
+// `physicalAvailableBytes` beside it, as the denominator of a vLLM share. Those members do not move the host reserve or the floor:
+// they stay inside the capped figures, as they were before `reserveTotalBytes` and `reserveAvailableBytes` existed.
+test('effective and memoryPool: a view that carries physicalTotalBytes and physicalAvailableBytes keeps its reserve and floor inside the capped figures', () => {
+    const seedModel = loadSeedCatalog(SEED_CATALOG_FILE).find((entry) => entry.id === 'qwen2.5-0.5b-instruct-q4_k_m');
+    const llama = getRunner('llama.cpp');
+    const gb10 = { available: true, name: 'NVIDIA GB10', memoryModel: 'unified', totalBytes: null, usedBytes: null, freeBytes: null, processes: [] };
+    const unifiedVerdict = (memory, view) => {
+        const snapshot = { gpu: gb10, memory, disk: { freeBytes: 400 * GIB } };
+        const limits = defineLimits({ effective: () => ({ memory: view }) });
+        return admit({ runner: llama, model: seedModel, source: seedModel.sources.gguf, snapshot, profile: 'unified', limits,
+            params: llama.normalizeParams({}, { model: seedModel, profile: 'unified' }) });
+    };
+    const host = { totalBytes: 128 * GIB, availableBytes: 120 * GIB };
+    const need = unifiedVerdict(host, host).estimate.unifiedBytes;
+    const view = (total, available, extra = { physicalTotalBytes: host.totalBytes, physicalAvailableBytes: host.availableBytes }) => ({ totalBytes: total, availableBytes: available, ...extra });
+    // The reserve: the need fits exactly when it is the capped total less the 16 GiB reserve, whatever the host holds.
+    const atEdge = unifiedVerdict(host, view(Math.ceil(need) + UNIFIED.hostReserveBytes, 100 * GIB));
+    assert.equal(atEdge.status, 'ok', atEdge.reason);
+    const pastEdge = unifiedVerdict(host, view(Math.ceil(need) + UNIFIED.hostReserveBytes - 1, 100 * GIB));
+    assert.equal(pastEdge.status, 'incompatible', pastEdge.reason);
+    assert.match(pastEdge.reason, /which must keep 16\.0 GiB for the host/);
+    // The floor: the need fits now exactly when the capped available memory less the 8 GiB floor holds it.
+    const noEdge = unifiedVerdict(host, view(100 * GIB, Math.ceil(need) + UNIFIED.floorBytes));
+    assert.equal(noEdge.status, 'ok', noEdge.reason);
+    const pastFloor = unifiedVerdict(host, view(100 * GIB, Math.ceil(need) + UNIFIED.floorBytes - 1));
+    assert.equal(pastFloor.status, 'insufficient-now', pastFloor.reason);
+    assert.equal(pastFloor.estimate.floorBytes, UNIFIED.floorBytes);
+    assert.equal(pastFloor.estimate.hostReserveBytes, UNIFIED.hostReserveBytes);
+    // Whole verdicts are those of a view without the members.
+    const bare = view(Math.ceil(need) + UNIFIED.hostReserveBytes - 1, 100 * GIB, {});
+    assert.deepEqual(unifiedVerdict(host, view(bare.totalBytes, bare.availableBytes)), unifiedVerdict(host, bare));
+
+    // The CPU pool: its floor and reserve are those of the capped total.
+    const pool = { totalBytes: 4 * GIB, availableBytes: 3 * GIB, capped: true, warning: 'A limit of four applies.' };
+    const members = { physicalTotalBytes: 64 * GIB, physicalAvailableBytes: 60 * GIB };
+    const bareCpu = onCpu(recording({ memoryPool: pool }).limits).result;
+    const withMembers = onCpu(recording({ memoryPool: { ...pool, ...members } }).limits).result;
+    assert.equal(withMembers.estimate.floorBytes, cpuFloorBytes(4 * GIB));
+    assert.equal(withMembers.estimate.hostReserveBytes, cpuHostReserveBytes(4 * GIB));
+    assert.equal(withMembers.estimate.floorBytes, 512 * MIB);
+    assert.equal(withMembers.estimate.hostReserveBytes, 1.5 * GIB);
+    assert.deepEqual(withMembers, bareCpu);
 });
 
 // ---------------------------------------------------------------- refuseResourceRequest

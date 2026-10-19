@@ -125,9 +125,34 @@ A tier entry `{ "upstream": "local-llm", "model": "<catalog id>", "runner": "<id
 | The base | `pworker models run` starts the single deployment. The gate uses a deployment that is ready for the requested model (and runner, when the entry names one) and never replaces or idle-stops one an admin started |
 | On demand | With `localLlm.onDemand.enabled` the gate may start a model itself: only when its weights are complete and its runner is installed (a request never downloads; a run that finds its weights gone and starts fetching them is cancelled), with one start shared by all requests that arrive meanwhile, and a deployment it started is replaced only while nothing is running or queued for the provider. `idleStopMs` (default 15 min) stops a deployment the gate started, again only when nothing runs or waits. `startWaitMs` (default 120 s) bounds the wait for readiness |
 | The forward | The request is sent over the target's Unix socket (`httpFetch(url, { socketPath })`) with the per-start key as the bearer token. The client's `Authorization` is never forwarded, and `body.model` becomes the runner's chat model; the request log keeps the catalog id. Streamed answers pass through unchanged |
-| The cache | The identity of a cached answer is `local-llm:<model>:<runner>:<runner version>:<sha256 of the weights>`. It is known without the engine only when the entry names a runner, or a deployment of the model is ready; otherwise nothing is read or stored, and a `strict` request is a miss |
+| The cache | The identity of a cached answer is `local-llm:<model>:<runner>:<runner version>:<sha256 of the weights>`. With `localLlm.caps` set, `:caps-<digest of the caps>` is appended, so an answer cached under other caps is not reused. It is known without the engine only when the entry names a runner, or a deployment of the model is ready; otherwise nothing is read or stored, and a `strict` request is a miss |
 | `/v1/models` | `GET /u/local-llm/v1/models` is built fresh from the seed catalog, the user's models and the deployment on every call; there is no time-to-live |
 | Secrets | The Hugging Face token and every per-start key are added to the secrets the proxy removes from its logs and error texts |
+
+### Caps
+
+`localLlm.caps` in the user or project configuration declares the hardware that local models may plan for. `config.default.json` has no entry, and there are no command-line flags: an auto-started proxy would not carry them. The section is read once when the host is created (`lib/local-llm-host/caps.mjs`), so changing it means restarting `pworker serve`. With no `caps` the engine runs with its identity limits and every output, overview and cache identity is as without this feature.
+
+| Key | Value | Effect |
+| --- | --- | --- |
+| `ram` | Bytes (a safe integer of at least 1 MiB), a string with a binary unit (`"12GiB"`, `"512MiB"`, `"1.5GiB"`), or a fraction above 0 and at most 1 of the machine's total memory (the first reading, then kept) | Admission sizes against this much host memory instead of the machine's: the cpu and Metal pool (`memoryPool`, whose refusal and warning name the cap) and the memory view of the dedicated and unified policies (`effective`) |
+| `gpuMemory` | The same forms; a fraction is of the GPU's total (dedicated) or of system memory (unified) | Dedicated: the GPU the policy sizes against is `{ totalBytes: min(total, cap), freeBytes: min(free, cap) }`. Unified: folded into the memory view, as the smaller of `ram` and `gpuMemory`. Published in the overview only when the machine has a usable NVIDIA GPU. No effect on the cpu and Metal profiles, and refused on macOS (`invalid_caps`): use `ram` there |
+| `mode` | Only `"refuse"` (the default) | A request over a cap is refused; there is no mode that shrinks it |
+| `threads`, `maxContext`, `maxParallel` | Not supported yet | Refused when the host is used, not ignored, so a cap is never silently missing |
+
+A bad section (an unknown key, a wrong type, zero or a negative size, a key that is not supported yet) is kept when the host is created and thrown as `invalid_caps`, naming the key, by `host.controller()` before the engine is created. `acquire()` is not affected, so the orphan reap still runs first. `pworker models status` prints the caps in force from `limits.budget.caps` of the overview, and so do a refused `preview`, `run` and a run that does not start.
+
+What a cap is, and is not:
+
+| Cap | Enforced by | Strength |
+| --- | --- | --- |
+| `gpuMemory` | Admission's estimate against the capped GPU | Sizing only. Nothing stops a runner using more GPU memory once it runs |
+| `ram` | Admission's estimate against the capped memory | Sizing only in this release. The memory guard is unchanged and watches the machine's available memory, not the cap, and the runners' own memory is not subtracted from the cap (a later release) |
+| GPU compute share | Nothing | Not offered |
+| llama-servers that the proxy itself starts (`upstreams.<name>.start`) | Nothing | Outside the caps: their memory is neither limited nor counted |
+| Runners that pworker does not offer (Ollama, vLLM, TabbyAPI, LM Studio, the Vulkan build) | Nothing | Not offered, so not capped |
+
+A cap bounds what a model may plan for; the host reserve and the memory-guard floor stay those of the physical machine (the capped pool and memory view carry the physical figures beside the capped ones, DS007). A model must fit both the cap and the machine less its reserve. The unified policy has a fixed need of about 10 GiB (prompt cache, runtime and buffers) before the weights, so a `gpuMemory` under about 11 GiB admits nothing there.
 
 ### Admin routes
 
