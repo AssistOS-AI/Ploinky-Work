@@ -9,11 +9,21 @@ export function statLine({ pid, comm = 'llama-server', state = 'S', ppid = 1, pg
     return `${pid} (${comm}) ${after.join(' ')}\n`;
 }
 
+/** The contents of `<pid>/status`: a few of its lines, with `VmRSS` in kB when `rssKb` is given (a kernel thread or a zombie has none). */
+export function statusText({ pid, comm = 'llama-server', state = 'S', rssKb }) {
+    return [`Name:\t${comm}`, `State:\t${state} (sleeping)`, `Pid:\t${pid}`, 'VmPeak:\t 9999999 kB', ...(rssKb === undefined ? [] : [`VmRSS:\t${String(rssKb).padStart(8, ' ')} kB`]), 'Threads:\t4', ''].join('\n');
+}
+
+export function writeStatus(procDir, spec) {
+    fs.writeFileSync(path.join(procDir, String(spec.pid), 'status'), typeof spec.text === 'string' ? spec.text : statusText(spec));
+}
+
 export function writeProc(procDir, spec) {
     const dir = path.join(procDir, String(spec.pid));
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'stat'), statLine(spec));
     fs.writeFileSync(path.join(dir, 'cmdline'), `${(spec.argv ?? []).join('\0')}\0`);
+    if (spec.rssKb !== undefined || typeof spec.statusText === 'string') writeStatus(procDir, { ...spec, ...(typeof spec.statusText === 'string' ? { text: spec.statusText } : {}) });
 }
 
 export function removeProc(procDir, pid) {

@@ -12,6 +12,7 @@ import { admissionResult, admit, admitOllama, admitVllm } from '../../lib/local-
 import { loadSeedCatalog, validateModel } from '../../lib/local-llm/controller/catalog.mjs';
 import { cpuDefaultThreads, defaultThreads, performanceCoreCount, physicalCoreCount, readSnapshot } from '../../lib/local-llm/controller/hardware.mjs';
 import { UNIFIED, admitApuLlamaServer, cpuFloorBytes, cpuHostReserveBytes } from '../../lib/local-llm/controller/profiles.mjs';
+import { linuxPlatform } from '../../lib/local-llm/host.mjs';
 import { LocalLlmError } from '../../lib/local-llm/errors.mjs';
 import { IDENTITY_LIMITS, LIMIT_HOOKS, defineLimits } from '../../lib/local-llm/limits.mjs';
 import { createRunners } from '../../lib/local-llm/runners/index.mjs';
@@ -68,6 +69,7 @@ test('limits: the default is the identity of every hook, and the value is frozen
     assert.equal(IDENTITY_LIMITS.runnerEnvironment({ env: {}, profile: 'dedicated', adapterEnvironment }), adapterEnvironment);
     assert.equal(IDENTITY_LIMITS.guardSample(), null);
     assert.equal(IDENTITY_LIMITS.guardBreach(null, { check: 'watchable', profile: 'apu' }), null);
+    assert.equal(IDENTITY_LIMITS.guardBreach({ watched: true, usedBytes: 1 }, { check: 'headroom', memory: {}, available: 1 }), null, 'no stop, no figure, no unreadable');
     assert.equal(IDENTITY_LIMITS.vllmQualification, null);
 });
 
@@ -702,13 +704,19 @@ const FLOORED_RUNNER = Object.freeze({
     parseReport: () => ({}),
 });
 
-function dedicatedGuard(t, limits) {
+// The same runner with no RAM floor in its admission: the dedicated profile has no guard for it unless the limits ask for one.
+const FLOORLESS_RUNNER = Object.freeze({
+    ...FLOORED_RUNNER, id: 'floorless', displayName: 'Floorless runner',
+    admit: () => admissionResult('ok', null, { gpuBytes: GIB, basis: 'fake policy' }),
+});
+
+function dedicatedGuard(t, limits, runner = FLOORED_RUNNER) {
     const dataDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'limits-guard-'));
     t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
     const reads = { count: 0, availableBytes: 24 * GIB };
     const controller = createController({
         dataDir, env: { PATH: '/usr/bin' }, seedCatalog: loadSeedCatalog(SEED_CATALOG_FILE), stateStore: createStateStore({ dataDir }), limits,
-        runners: { floored: FLOORED_RUNNER }, snapshot: async () => structuredClone(DEDICATED_SNAPSHOT),
+        runners: { [runner.id]: runner }, snapshot: async () => structuredClone(DEDICATED_SNAPSHOT),
         download: async ({ artifact }) => ({ status: 'complete', path: `/data/models/gguf/${artifact.file}`, bytesTransferred: 0 }),
         inspect: async () => ({ state: 'complete', bytes: 1 }),
         startRunner({ command, args, env }) {
@@ -727,7 +735,7 @@ function dedicatedGuard(t, limits) {
         memoryGuardLoadMs: 60_000, memoryGuardReadyMs: 60_000, unifiedGuardMs: 5,
     });
     t.after(() => controller.drain());
-    const run = (requestId) => controller.run({ modelId: 'gpt-oss-20b', runnerId: 'floored', requestId, params: {} });
+    const run = (requestId) => controller.run({ modelId: 'gpt-oss-20b', runnerId: runner.id, requestId, params: {} });
     return { controller, reads, run };
 }
 
@@ -761,6 +769,180 @@ test('guard hooks: the headroom answer is compared with the floor of a dedicated
     await until(() => h.controller.state.deployment?.phase !== 'ready');
     assert.match(h.controller.state.deployment.error ?? '', /below the floor \(0\.0 GiB available, 4\.0 GiB required\)/);
 });
+
+// ---------------------------------------------------------------- the guard under limits that stop: a guard with no floor, and { stop }
+
+const STOP = Object.freeze({ stop: 'stopped: the limits say so' });
+const WATCHED = Object.freeze({ watched: true, standalone: true });
+const quietFor = () => new Promise((resolve) => setTimeout(resolve, 150));
+
+/**
+ * A guardBreach answer that follows `script` (one answer per headroom call, then null), and counts the headroom calls. The guard
+ * ticks from the launch, possibly before `ready`: the answers are null, and not counted, until the test sets `armed` after `ready`.
+ */
+function scripted(script) {
+    const seen = { headroom: 0 };
+    const scripts = { seen, armed: false };
+    scripts.answer = (sample, context) => (context.check === 'headroom' && scripts.armed ? script[seen.headroom++] ?? null : null);
+    return scripts;
+}
+
+test('guard hooks: a runner with no floor is guarded only when the first sample says watched and standalone', async (t) => {
+    const identity = dedicatedGuard(t, undefined, FLOORLESS_RUNNER);
+    await identity.run('limits-floorless-0001'); await until(() => identity.controller.state.deployment?.phase === 'ready');
+    await quietFor();
+    assert.equal(identity.reads.count, 0, 'the identity limits: no floor, no guard');
+    // The shape the container limits give: watched under a finite memory limit, with no further member. No floor, so no guard, whatever
+    // guardBreach would say, and the limits are sampled once and never again.
+    const container = recording({ guardSample: { watched: true, finiteMemory: true }, guardBreach: { unreadable: 'stopped: the budget cannot be read' } });
+    const unmarked = dedicatedGuard(t, container.limits, FLOORLESS_RUNNER);
+    await unmarked.run('limits-floorless-0002'); await until(() => unmarked.controller.state.deployment?.phase === 'ready');
+    await quietFor();
+    assert.equal(unmarked.reads.count, 0, 'memory is not sampled');
+    assert.equal(container.named('guardSample').length, 1, 'the limits are sampled once, to decide');
+    assert.equal(container.named('guardBreach').length, 0);
+    assert.equal(unmarked.controller.state.deployment.phase, 'ready');
+    for (const first of [{ standalone: true }, { watched: false, standalone: true }, { watched: true, standalone: false }]) {
+        const probe = recording({ guardSample: first });
+        const h = dedicatedGuard(t, probe.limits, FLOORLESS_RUNNER);
+        await h.run('limits-floorless-0003'); await until(() => h.controller.state.deployment?.phase === 'ready');
+        await quietFor();
+        assert.equal(h.reads.count, 0, JSON.stringify(first));
+    }
+    // Watched and standalone: the guard samples on the short interval and asks for headroom on every tick.
+    const probe = recording({ guardSample: { ...WATCHED, usedBytes: 1 } });
+    const h = dedicatedGuard(t, probe.limits, FLOORLESS_RUNNER);
+    await h.run('limits-floorless-0004'); await until(() => h.controller.state.deployment?.phase === 'ready');
+    await until(() => probe.named('guardBreach').length >= 3);
+    assert.ok(h.reads.count >= 3);
+    assert.deepEqual([...new Set(probe.named('guardBreach').map((call) => call.args[1].check))], ['headroom']);
+    const [sample, context] = probe.named('guardBreach')[0].args;
+    assert.deepEqual(sample, { ...WATCHED, usedBytes: 1 });
+    assert.equal(context.available, 24 * GIB);
+    assert.equal(context.memory.totalBytes, 31 * GIB);
+    assert.equal(h.controller.state.deployment.phase, 'ready');
+});
+
+test('guard hooks: with no floor, { available } and { unreadable } answers are ignored; only two { stop } answers stop the runner', async (t) => {
+    const seen = { headroom: 0 };
+    const probe = recording({ guardSample: WATCHED, guardBreach: () => (seen.headroom++ % 3 === 0 ? { unreadable: 'stopped: unreadable' } : { available: 0 }) });
+    const h = dedicatedGuard(t, probe.limits, FLOORLESS_RUNNER);
+    await h.run('limits-floorless-0005'); await until(() => h.controller.state.deployment?.phase === 'ready');
+    await until(() => seen.headroom >= 12);
+    assert.equal(h.controller.state.deployment.phase, 'ready', 'no floor to compare { available: 0 } with, and no unreadable count');
+});
+
+for (const [name, runner] of [['a guard with a floor', FLOORED_RUNNER], ['a guard with no floor', FLOORLESS_RUNNER]]) {
+    test(`guard hooks: two consecutive { stop } answers stop the runner with the message (${name})`, async (t) => {
+        // stop, none, stop, an unreadable answer, stop, a figure, then two stops in a row.
+        const script = [STOP, null, STOP, { unreadable: 'stopped: unreadable' }, STOP, { available: 24 * GIB }, STOP, STOP];
+        const answers = scripted(script);
+        const probe = recording({ guardSample: WATCHED, guardBreach: answers.answer });
+        const h = dedicatedGuard(t, probe.limits, runner);
+        await h.run('limits-stop-0001'); await until(() => h.controller.state.deployment?.phase === 'ready');
+        answers.armed = true;
+        await until(() => h.controller.state.deployment?.phase !== 'ready');
+        assert.equal(h.controller.state.deployment.error, STOP.stop);
+        assert.equal(answers.seen.headroom, script.length, 'it stopped on the second of the two, not before');
+        await quietFor();
+        assert.equal(answers.seen.headroom, script.length, 'and the guard ended with the runner');
+    });
+
+    test(`guard hooks: { stop } answers that never come twice in a row never stop the runner (${name})`, async (t) => {
+        for (const between of [null, { unreadable: 'stopped: unreadable' }, { available: 24 * GIB }]) {
+            const answers = scripted(Array.from({ length: 60 }, (_, index) => (index % 2 === 0 ? STOP : between)));
+            const probe = recording({ guardSample: WATCHED, guardBreach: answers.answer });
+            const h = dedicatedGuard(t, probe.limits, runner);
+            await h.run('limits-stop-0002'); await until(() => h.controller.state.deployment?.phase === 'ready');
+            answers.armed = true;
+            await until(() => answers.seen.headroom >= 40);
+            assert.equal(h.controller.state.deployment.phase, 'ready', JSON.stringify(between));
+        }
+    });
+}
+
+test('guard hooks: a physical floor breach still stops a guard with a floor at the first reading, with the engine\'s own message, whatever the limits answer', async (t) => {
+    const probe = recording({ guardSample: WATCHED, guardBreach: () => null });
+    const h = dedicatedGuard(t, probe.limits);
+    await h.run('limits-stop-0003'); await until(() => h.controller.state.deployment?.phase === 'ready');
+    h.reads.availableBytes = GIB;
+    await until(() => h.controller.state.deployment?.phase !== 'ready');
+    assert.equal(h.controller.state.deployment.error, 'stopped: host memory below the floor (1.0 GiB available, 4.0 GiB required)');
+});
+
+// The cpu and metal profiles, whose guards stop on a floor and on pressure: the stop answers count the same way on them.
+function pooledGuard(t, { profile, limits, pressure, memory }) {
+    const dataDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'limits-pooled-'));
+    const seed = loadSeedCatalog(SEED_CATALOG_FILE);
+    const tiny = seed.find((entry) => entry.id === 'qwen2.5-0.5b-instruct-q4_k_m');
+    const metal = profile === 'metal';
+    const handles = [];
+    const machine = metal
+        ? { gpu: { available: true, backend: 'metal', name: 'Apple M1', memoryModel: 'unified', deviceCapBytes: 12 * GIB },
+            memory: { totalBytes: 16 * GIB, availableBytes: 9 * GIB, freeBytes: 2 * GIB, swapFreeBytes: GIB, cachedBytes: null, pressureLevel: 1 }, disk: { freeBytes: 200 * GIB, totalBytes: 500 * GIB }, cpus: 8, cores: 4 }
+        : { gpu: { available: false }, memory: { totalBytes: 16 * GIB, availableBytes: 9 * GIB, pressureLevel: 1 }, disk: { freeBytes: 200 * GIB, totalBytes: 500 * GIB }, cpus: 8, cores: 4 };
+    const controller = createController({
+        dataDir, ...(metal ? {} : { hostOverrides: { platform: linuxPlatform() } }), env: { PATH: '/usr/bin' }, seedCatalog: seed, imageContract: null, hostArch: metal ? 'arm64' : 'x64',
+        fileExists: () => true, sharedModelsRoot: null, profile, limits, detectRunner: () => ({ installed: true, version: 'b11295', reason: null }),
+        snapshot: async () => structuredClone(machine), inspect: async () => ({ state: 'absent', bytes: 0 }),
+        download: async () => ({ status: 'complete', path: path.join(dataDir, 'fixture.gguf'), bytesTransferred: 0 }),
+        startRunner({ command, args, env }) {
+            let running = true; let settle; let killed = false;
+            const handle = { command, args, env, pid: 4242, exited: new Promise((resolve) => { settle = resolve; }),
+                get running() { return running; }, get killed() { return killed; },
+                async stop() { running = false; settle({ code: 0, signal: 'SIGTERM' }); return handle.exited; },
+                async kill() { killed = true; return handle.stop(); } };
+            handles.push(handle);
+            return handle;
+        },
+        fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({}) }), pollMs: 1,
+        readMemory: () => memory.current, readPressure: () => pressure.current, metalGuardMs: 3, unifiedGuardMs: 3,
+    });
+    t.after(async () => { await controller.drain(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+    const run = async (requestId) => {
+        await controller.run({ modelId: tiny.id, runnerId: 'llama.cpp', requestId });
+        await until(() => controller.state.deployment?.phase === 'ready' || controller.state.deployment?.phase === 'error');
+        assert.equal(controller.state.deployment.phase, 'ready', JSON.stringify(controller.state.deployment));
+    };
+    return { controller, handles, run };
+}
+
+for (const profile of ['cpu', 'metal']) {
+    const normal = () => ({ current: profile === 'metal' ? 1 : 0 });
+    const roomy = () => ({ current: { totalBytes: 16 * GIB, availableBytes: 9 * GIB } });
+
+    test(`guard hooks: on the ${profile} profile two consecutive { stop } answers stop the runner under normal pressure and plenty of memory, and a stop and a null do not`, async (t) => {
+        // Alternating answers: the runner stays up through many ticks.
+        const alternating = scripted(Array.from({ length: 60 }, (_, index) => (index % 2 === 0 ? STOP : null)));
+        const steady = pooledGuard(t, { profile, limits: recording({ guardSample: WATCHED, guardBreach: alternating.answer }).limits, pressure: normal(), memory: roomy() });
+        await steady.run('limits-pooled-0001');
+        alternating.armed = true;
+        await until(() => alternating.seen.headroom >= 40);
+        assert.equal(steady.controller.state.deployment.phase, 'ready');
+        assert.equal(steady.handles[0].running, true);
+        // Two in a row: stopped, with the limits' message, and the process group killed.
+        const twice = scripted([null, STOP, null, STOP, STOP]);
+        const h = pooledGuard(t, { profile, limits: recording({ guardSample: WATCHED, guardBreach: twice.answer }).limits, pressure: normal(), memory: roomy() });
+        await h.run('limits-pooled-0002');
+        twice.armed = true;
+        await until(() => h.controller.state.deployment?.phase === 'error');
+        assert.equal(h.controller.state.deployment.error, STOP.stop);
+        assert.equal(twice.seen.headroom, 5);
+        assert.equal(h.handles[0].killed, true);
+    });
+
+    test(`guard hooks: on the ${profile} profile the physical floor stop is the engine's own, whatever the limits answer`, async (t) => {
+        const memory = roomy();
+        const pressure = { current: profile === 'metal' ? 2 : 0 };
+        const quiet = pooledGuard(t, { profile, limits: recording({ guardSample: WATCHED, guardBreach: () => null }).limits, pressure, memory });
+        await quiet.run('limits-pooled-0003');
+        memory.current = { totalBytes: 16 * GIB, availableBytes: cpuFloorBytes(16 * GIB) - 1 };
+        await until(() => quiet.controller.state.deployment?.phase === 'error');
+        // The Linux cpu guard stops on one reading below the floor; Metal on elevated pressure with the memory below it, three times in a row.
+        assert.match(quiet.controller.state.deployment.error, profile === 'metal' ? /macOS memory pressure \(level 2\) for 3 samples in a row/ : /^stopped: host memory below the floor/);
+        assert.equal(quiet.handles[0].killed, true);
+    });
+}
 
 // ---------------------------------------------------------------- capThreads and capParams
 

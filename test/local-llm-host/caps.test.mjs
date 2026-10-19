@@ -27,12 +27,14 @@ import {
 import { cpuFloorBytes, cpuHostReserveBytes } from '../../lib/local-llm/controller/profiles.mjs';
 import { getRunner } from '../local-llm/fixtures/host.mjs';
 import { SEED_CATALOG_FILE, createLocalLlmHost } from '../../lib/local-llm-host/host.mjs';
-import { LAUNCH_SCHEMA } from '../../lib/local-llm-host/launch.mjs';
+import { LAUNCH_SCHEMA, createLaunchRecorder } from '../../lib/local-llm-host/launch.mjs';
+import { createDarwinProcs, parsePsRows } from '../../lib/local-llm-host/darwinProcs.mjs';
+import { createRunnerMemoryReader, parseVmRss } from '../../lib/local-llm-host/runnerMemory.mjs';
 import { capsLine, runEngineVerb } from '../../lib/pworker/models-cli.mjs';
 import { statusFor } from '../../lib/local-llm-host/routes.mjs';
 import { GIB, MODEL, fakeAdapter, freePort, scratch } from './fixtures/engine.mjs';
 import { request, startHost, startProxy } from './fixtures/proxy.mjs';
-import { recordingKill, removeProc, runnerArgv, writeProc } from './fixtures/proc.mjs';
+import { recordingKill, removeProc, runnerArgv, writeProc, writeStatus } from './fixtures/proc.mjs';
 
 const amount = (bytes) => (bytes >= GIB ? `${(bytes / GIB).toFixed(2)} GiB` : `${Math.round(bytes / (1024 * 1024))} MiB`);
 
@@ -159,6 +161,7 @@ test('a fraction is resolved against the first physical figure seen and then kep
 test('defineCapLimits binds the memory pool, the memory view, the GPU share and the overview, and leaves every other hook the identity', () => {
     assert.throws(() => defineCapLimits(null), (error) => error.code === 'invalid_caps');
     const limits = defineCapLimits(parseCaps({ ram: '8GiB', gpuMemory: '4GiB' }));
+    // The guard hooks are bound only with a ram cap and a way to read the runners' memory (the V4 cases below); here there is none.
     for (const hook of ['capCores', 'observeSnapshot', 'decorateSnapshot', 'refuseProfile', 'refuseResourceRequest', 'runnerEnvironment', 'guardSample', 'guardBreach']) {
         assert.equal(limits[hook], IDENTITY_LIMITS[hook], hook);
     }
@@ -745,4 +748,392 @@ test('a bad caps config is a 503, the gate says so instead of "no model is ready
     const badProxy = await startProxy(t, { localLlm: { caps: { ram: 0 } } });
     const refused = await request(badProxy.base, '/v1/local-llm/status');
     assert.equal(refused.body.refusal.code, 'invalid_caps');
+});
+
+// ---------------------------------------------------------------- V4: the ram guard (the RSS of the runners, and the stop)
+
+const KIB = 1024;
+/** A home with its launch records, on the Linux or macOS reader, and the `socketPath` of a start id. */
+const socketOf = (home, startId) => path.join(home, 'r', `${startId}.sock`);
+
+/** A fake /proc and the launch records of the runners in `specs` ({ startId, pid, rssKb, startTime }); the record gets the start time /proc has. */
+function linuxRunners(home, specs) {
+    const procDir = path.join(home, 'proc');
+    const launchDir = path.join(home, 'launch');
+    const recorder = createLaunchRecorder({ dir: launchDir, procDir, platformName: 'linux' });
+    for (const spec of specs) {
+        const socketPath = socketOf(home, spec.startId);
+        writeProc(procDir, { pid: spec.pid, argv: runnerArgv(socketPath), startTime: spec.startTime ?? '5000', rssKb: spec.rssKb });
+        recorder.intent({ startId: spec.startId, socketPath });
+        recorder.spawned({ startId: spec.startId, socketPath, pid: spec.pid });
+    }
+    return { procDir, launchDir, recorder };
+}
+
+test('V4 Linux reader: the VmRSS of the runners the launch records name is summed; a pid that is not that runner any more is not counted', (t) => {
+    const home = scratch(t);
+    const { procDir, launchDir } = linuxRunners(home, [
+        { startId: 'aaaa0001', pid: 4101, rssKb: 3 * 1024 * 1024 },
+        { startId: 'aaaa0002', pid: 4102, rssKb: 2 * 1024 * 1024 },
+        { startId: 'aaaa0003', pid: 4103, rssKb: 50 * 1024 * 1024 },
+    ]);
+    const read = createRunnerMemoryReader({ launchDir, platformName: 'linux', procDir });
+    assert.equal(read(), 55 * GIB, 'all three runners');
+    // The system gave pid 4103 to another program: a different start time, so its memory is not ours.
+    writeProc(procDir, { pid: 4103, argv: runnerArgv(socketOf(home, 'aaaa0003')), startTime: '9999', rssKb: 50 * 1024 * 1024 });
+    assert.equal(read(), 5 * GIB, 'the reused pid is ignored');
+    // The same start time but another program (not listening on the record\'s socket) is not ours either; the record\'s start time is exact.
+    writeProc(procDir, { pid: 4102, argv: ['/usr/bin/other', '--host', '/elsewhere.sock'], startTime: '5000', rssKb: 2 * 1024 * 1024 });
+    assert.equal(read(), 3 * GIB);
+    // A runner that exited, and a zombie, are not counted.
+    removeProc(procDir, 4101);
+    assert.equal(read(), 0);
+    writeProc(procDir, { pid: 4101, argv: runnerArgv(socketOf(home, 'aaaa0001')), startTime: '5000', state: 'Z', rssKb: 3 * 1024 * 1024 });
+    assert.equal(read(), 0, 'a zombie');
+});
+
+test('V4 Linux reader: an intent record counts nothing, a missing VmRSS is 0, and an unreadable status or directory is no reading (null), never a throw', (t) => {
+    const home = scratch(t);
+    const { procDir, launchDir, recorder } = linuxRunners(home, [{ startId: 'bbbb0001', pid: 4201, rssKb: 1024 * 1024 }]);
+    const read = createRunnerMemoryReader({ launchDir, platformName: 'linux', procDir });
+    recorder.intent({ startId: 'bbbb0002', socketPath: socketOf(home, 'bbbb0002') });
+    assert.equal(read(), GIB, 'a start that has not spawned has no pid');
+    writeProc(procDir, { pid: 4201, argv: runnerArgv(socketOf(home, 'bbbb0001')), startTime: '5000', statusText: 'Name:\tllama-server\nState:\tS (sleeping)\n' });
+    assert.equal(read(), 0, 'a status with no VmRSS line (an exiting process)');
+    writeProc(procDir, { pid: 4201, argv: runnerArgv(socketOf(home, 'bbbb0001')), startTime: '5000', statusText: 'VmRSS:\tmany kB\n' });
+    assert.equal(read(), null, 'a VmRSS that is not a number');
+    fs.rmSync(path.join(procDir, '4201', 'status'));
+    assert.equal(read(), 0, 'no status file: the process went away after it was identified');
+    fs.mkdirSync(path.join(procDir, '4201', 'status'));
+    assert.equal(read(), null, 'a status that cannot be read');
+    assert.equal(createRunnerMemoryReader({ launchDir: path.join(home, 'nothing'), platformName: 'linux', procDir })(), 0, 'no launch directory: no runner');
+    fs.writeFileSync(path.join(home, 'file'), 'x');
+    assert.equal(createRunnerMemoryReader({ launchDir: path.join(home, 'file'), platformName: 'linux', procDir })(), null, 'a launch directory that cannot be listed');
+    assert.equal(createRunnerMemoryReader({ launchDir, platformName: 'win32', procDir })(), null, 'a platform with no process table');
+    assert.equal(parseVmRss('VmRSS:\t 1024 kB\n'), 1024 * KIB);
+    assert.equal(parseVmRss('VmRSS:\t 1024 kB'), 1024 * KIB);
+});
+
+// A `ps` over a table of { start, command, rss } for the macOS reader: the rows the process table reads and the rss rows.
+const PS_T0 = 'Fri Oct 16 03:42:14 2026';
+const PS_T1 = 'Fri Oct 16 03:42:15 2026';
+const RSS_FIELDS = 'pid=,pgid=,state=,lstart=,rss=,command=';
+function fakeMacPs(initial) {
+    const table = new Map(Object.entries(initial).map(([pid, spec]) => [Number(pid), { start: PS_T0, ...spec }]));
+    const calls = [];
+    let failure = null;
+    const exec = (file, args, options) => {
+        calls.push({ file, args, options });
+        if (failure) throw failure;
+        const wanted = String(args.at(-1)).split(',').map(Number);
+        const present = wanted.filter((pid) => table.has(pid));
+        if (args.includes(RSS_FIELDS)) {
+            const text = present.map((pid) => `${String(pid).padStart(5)} ${String(pid).padStart(5)} ${table.get(pid).state ?? 'S'}    ${table.get(pid).start}  ${String(table.get(pid).rss).padStart(9)} ${table.get(pid).command}\n`).join('');
+            if (present.length < wanted.length) throw Object.assign(new Error('Command failed: ps'), { status: 1, stdout: text });
+            return text;
+        }
+        const text = present.map((pid) => `${String(pid).padStart(5)} ${String(pid).padStart(5)} S    ${table.get(pid).start}     ${table.get(pid).command}\n`).join('');
+        if (!text) throw Object.assign(new Error('Command failed: ps'), { status: 1, stdout: '' });
+        return text;
+    };
+    return { table, calls, exec, failWith: (error) => { failure = error; } };
+}
+const macCommand = (socketPath) => `/run/llama.cpp/b11295/llama-server -m /m/q.gguf --host ${socketPath} --api-key k`;
+const rssCalls = (ps) => ps.calls.filter((call) => call.args.includes(RSS_FIELDS));
+
+test('V4 macOS reader: one ps over the recorded pids gives identity and rss (KiB); a reused pid is not counted, and every unreadable outcome is null', (t) => {
+    const home = scratch(t);
+    const launchDir = path.join(home, 'launch');
+    const ps = fakeMacPs({
+        4301: { command: macCommand(socketOf(home, 'cccc0001')), rss: 3 * 1024 * 1024 },
+        4302: { command: macCommand(socketOf(home, 'cccc0002')), rss: 2 * 1024 * 1024 },
+        4303: { command: macCommand(socketOf(home, 'cccc0003')), rss: 7 * 1024 * 1024 },
+    });
+    const procs = createDarwinProcs({ exec: ps.exec });
+    const recorder = createLaunchRecorder({ dir: launchDir, platformName: 'darwin', procs });
+    for (const [startId, pid] of [['cccc0001', 4301], ['cccc0002', 4302], ['cccc0003', 4303]]) recorder.spawned({ startId, socketPath: socketOf(home, startId), pid });
+    const read = createRunnerMemoryReader({ launchDir, platformName: 'darwin', exec: ps.exec });
+    ps.calls.length = 0;
+    assert.equal(read(), 12 * GIB);
+    assert.equal(ps.calls.length, 1, 'exactly one exec for three runners');
+    assert.deepEqual(ps.calls.map((call) => [call.file, call.args]), [['/bin/ps', ['-ww', '-o', RSS_FIELDS, '-p', '4301,4302,4303']]]);
+    assert.equal(ps.calls[0].options.env.TZ, 'UTC');
+    assert.equal(ps.calls[0].options.timeout, 10_000);
+    assert.equal(ps.calls[0].options.maxBuffer, 1024 * 1024);
+    // Pid 4303 now belongs to a program started later (another lstart): it is not counted. Still one exec.
+    ps.table.get(4303).start = PS_T1;
+    ps.calls.length = 0;
+    assert.equal(read(), 5 * GIB);
+    assert.equal(ps.calls.length, 1);
+    // A zombie is not counted; a pid whose command is not listening on the record's socket is not either.
+    ps.table.get(4303).start = PS_T0;
+    ps.table.get(4302).state = 'Z';
+    ps.table.get(4301).command = '/usr/bin/other --host /elsewhere.sock';
+    ps.calls.length = 0;
+    assert.equal(read(), 7 * GIB);
+    assert.equal(ps.calls.length, 1);
+    ps.table.get(4302).state = 'S';
+    ps.table.get(4301).command = macCommand(socketOf(home, 'cccc0001'));
+    // A runner that is gone: ps exits 1 and still prints the others; the sum is theirs. All gone: status 1 with nothing is 0.
+    ps.table.delete(4302);
+    ps.calls.length = 0;
+    assert.equal(read(), 10 * GIB);
+    assert.equal(ps.calls.length, 1);
+    ps.table.clear();
+    assert.equal(read(), 0, 'every runner gone');
+    // Recorded ps text, with blank lines: the rows are `<pid> <pgid> <state> <lstart> <rss> <command>`.
+    const text = `\n  4301  4301 Ss   ${PS_T0}    1048576 ${macCommand(socketOf(home, 'cccc0001'))}\n\n  4302  4302 S    ${PS_T1}    2097152 ${macCommand(socketOf(home, 'cccc0002'))}\n\n`;
+    let calls = 0;
+    const recorded = createRunnerMemoryReader({ launchDir, platformName: 'darwin', exec: () => { calls += 1; return text; } });
+    assert.equal(recorded(), GIB, 'pid 4302 has a start time that is not the record\'s');
+    assert.equal(calls, 1);
+    // Every unreadable outcome is null, never a throw: a timeout, a missing tool, a signal, another status, an exec that throws a plain error.
+    for (const failure of [Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }), Object.assign(new Error('spawn'), { code: 'ENOENT' }),
+        Object.assign(new Error('killed'), { signal: 'SIGKILL' }), Object.assign(new Error('failed'), { status: 2, stdout: '' }), new Error('boom')]) {
+        let attempts = 0;
+        const reader = createRunnerMemoryReader({ launchDir, platformName: 'darwin', exec: () => { attempts += 1; throw failure; } });
+        assert.equal(reader(), null, failure.message);
+        assert.equal(attempts, 1);
+    }
+    assert.equal(createRunnerMemoryReader({ launchDir, platformName: 'darwin', exec: () => '  4301  lots\n' })(), null, 'text that is not rows');
+    assert.equal(createRunnerMemoryReader({ launchDir, platformName: 'darwin', exec: () => `  9999  9999 S    ${PS_T0}    1024 ${macCommand(socketOf(home, 'cccc0001'))}\n` })(), null, 'a row for a pid that was not asked about');
+    // No spawned record: no ps at all.
+    let none = 0;
+    assert.equal(createRunnerMemoryReader({ launchDir: path.join(home, 'nothing'), platformName: 'darwin', exec: () => { none += 1; return ''; } })(), 0);
+    assert.equal(none, 0);
+    assert.equal(parsePsRows(`  1  1 S ${PS_T0}  2048 /bin/x --host /r/a.sock\n`, { rss: true })[0].rssKib, 2048);
+    assert.equal(parsePsRows(`  1  1 S ${PS_T0} /bin/x --host /r/a.sock\n`, { rss: true }), null, 'a row with no rss column');
+});
+
+test('V4 caps.mjs: with ram, guardSample is the watched sample and guardBreach stops above the cap only, naming the cap; without ram the guard hooks are the identity', () => {
+    const limitsFor = (caps, used, memory = {}) => ({ limits: defineCapLimits(parseCaps(caps), { runnerMemory: typeof used === 'function' ? used : () => used }), memory });
+    const { limits } = limitsFor({ ram: '8GiB' }, 9 * GIB);
+    assert.deepEqual(limits.guardSample(), { watched: true, standalone: true, usedBytes: 9 * GIB });
+    const stop = limits.guardBreach(limits.guardSample(), { check: 'headroom', memory: { totalBytes: 64 * GIB }, available: 60 * GIB });
+    assert.deepEqual(Object.keys(stop), ['stop'], 'a stop, never an { available }');
+    assert.match(stop.stop, /localLlm\.caps\.ram/);
+    assert.ok(stop.stop.includes('8.00 GiB') && stop.stop.includes('9.00 GiB'), stop.stop);
+    for (const used of [8 * GIB, 8 * GIB - 1, 0]) {
+        const sample = limitsFor({ ram: '8GiB' }, used).limits.guardSample();
+        assert.equal(limits.guardBreach(sample, { check: 'headroom', memory: {}, available: 1 }), null, `${used} is within the cap`);
+    }
+    assert.equal(limits.guardBreach({ usedBytes: 9 * GIB }, { check: 'watchable', profile: 'apu' }), null, 'the watchable check');
+    assert.equal(limits.guardBreach({ usedBytes: 8 * GIB + 1 }, { check: 'headroom', memory: {}, available: 1 }).stop.includes('8.00 GiB'), true);
+    // A reading that failed (null or a throw) is a watched sample with no figure, so the guard still watches; it asks for no stop.
+    for (const failed of [() => null, () => { throw new Error('no ps'); }, () => Number.NaN, () => -1]) {
+        const sample = limitsFor({ ram: '8GiB' }, failed).limits.guardSample();
+        assert.deepEqual(sample, { watched: true, standalone: true, usedBytes: null });
+        assert.equal(limits.guardBreach(sample, { check: 'headroom', memory: {}, available: 1 }), null);
+    }
+    assert.equal(limits.guardBreach(null, { check: 'headroom', memory: {}, available: 1 }), null);
+    // A fraction is a share of the memory total, frozen at the first one seen (here the headroom check\'s own memory).
+    const half = limitsFor({ ram: 0.125 }, 9 * GIB).limits;
+    assert.ok(half.guardBreach({ usedBytes: 9 * GIB }, { check: 'headroom', memory: { totalBytes: 64 * GIB }, available: 1 }).stop.includes('8.00 GiB'));
+    assert.equal(half.guardBreach({ usedBytes: 9 * GIB }, { check: 'headroom', memory: { totalBytes: 512 * GIB }, available: 1 }).stop.includes('8.00 GiB'), true, 'frozen');
+    // No ram cap, or no way to read the runners: the identity hooks.
+    for (const [caps, options] of [[{ gpuMemory: '4GiB' }, { runnerMemory: () => 9 * GIB }], [{ threads: 2 }, { runnerMemory: () => 9 * GIB }], [{ ram: '8GiB' }, {}]]) {
+        const own = defineCapLimits(parseCaps(caps), options);
+        assert.equal(own.guardSample, IDENTITY_LIMITS.guardSample, JSON.stringify(caps));
+        assert.equal(own.guardBreach, IDENTITY_LIMITS.guardBreach, JSON.stringify(caps));
+    }
+});
+
+// The whole path: the host with caps, the real controller and guard, a fake /proc for the runner, the launch records the real recorder writes.
+const PID = 9100;
+async function guardedHost(t, { caps, profile, machine = CPU_MACHINE, startRssKb = 1, startStatusText }) {
+    const home = scratch(t);
+    const procDir = path.join(home, 'proc');
+    const weights = path.join(home, 'weights.gguf');
+    fs.writeFileSync(weights, 'weights');
+    const feed = { values: [], last: startRssKb, ticks: 0, available: MEMORY.availableBytes, killed: 0 };
+    const handles = [];
+    let recorder = null;
+    const killImpl = recordingKill();
+    const host = createLocalLlmHost({
+        config: caps === undefined ? {} : { localLlm: { caps } }, home, env: { PATH: '/usr/bin:/bin', HOME: '/home/test', LANG: 'C.UTF-8' }, platformName: 'linux',
+        procDir, ownerPort: await freePort(), which: () => '/usr/bin/nvidia-smi', killImpl,
+        controllerOptions: {
+            profile, snapshot: async () => structuredClone(machine), seedCatalog: SEED, fileExists: () => true,
+            installer: { installable: () => true, lock: null, describe: async () => ({ installed: true, runnable: true, version: 'v1' }),
+                ensureRunnable: async () => ({ rebuilt: false }), entryFor: (id) => ({ id }), pathsFor: () => ({ runDir: '/run/llama.cpp/b1' }) },
+            inspect: async () => ({ state: 'complete', bytes: 1 }), detectRunner: () => ({ installed: true, version: 'v1', reason: null }),
+            download: async () => ({ status: 'complete', path: weights, bytesTransferred: 0 }),
+            fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({}) }), pollMs: 2, stopGraceMs: 20,
+            // One call per tick of the guard, before it reads the runner's memory: the feed is what that reading will be.
+            readMemory: () => {
+                feed.ticks += 1;
+                feed.last = feed.values.length ? feed.values.shift() : feed.last;
+                if (fs.existsSync(path.join(procDir, String(PID)))) writeStatus(procDir, { pid: PID, rssKb: Math.round(feed.last / KIB) });
+                return { totalBytes: MEMORY.totalBytes, availableBytes: feed.available };
+            },
+            readPressure: () => 0, unifiedGuardMs: 3, memoryGuardLoadMs: 3, memoryGuardReadyMs: 3,
+            // The real recorder writes the launch record, so the guard finds the runner the way it does in production.
+            startRunner(options) {
+                recorder ??= createLaunchRecorder({ dir: host.layout.launchDir, procDir, platformName: 'linux' });
+                const { listen } = options;
+                writeProc(procDir, { pid: PID, argv: runnerArgv(listen.socketPath), startTime: '5000', rssKb: Math.round(feed.last / KIB), ...(startStatusText ? { statusText: startStatusText } : {}) });
+                recorder.intent(listen);
+                recorder.spawned({ ...listen, pid: PID });
+                let resolve;
+                const handle = { pid: PID, running: true, killed: false, exited: new Promise((done) => { resolve = done; }),
+                    async stop() { handle.running = false; resolve({ code: 0, signal: 'SIGTERM' }); },
+                    async kill() { handle.killed = true; return handle.stop(); } };
+                handles.push(handle);
+                return handle;
+            },
+        },
+    });
+    t.after(() => host.drain().catch(() => {}));
+    await host.acquire();
+    const controller = await host.controller();
+    // The stand-in runner never answers on its socket, so the deployment stays in `loading`: the guard watches it in every phase.
+    const alive = () => ['starting', 'loading', 'ready'].includes(controller.state.deployment?.phase) && handles.at(-1)?.running === true;
+    const run = async (modelId = 'small') => {
+        await controller.run({ modelId, runnerId: RUNNER[profile], requestId: `guard-${Math.random().toString(16).slice(2, 10)}` });
+        await until(() => handles.length === 1);
+        assert.ok(alive(), JSON.stringify(controller.state.deployment));
+    };
+    // The runner is stopped, and the deployment says why.
+    const stopped = async () => {
+        await until(() => !alive());
+        await until(() => controller.state.deployment?.error);
+        return controller.state.deployment.error;
+    };
+    return { host, controller, feed, handles, run, alive, stopped, killImpl };
+}
+const until = async (predicate, timeoutMs = 4000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (await predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 3));
+    }
+    assert.fail('not reached');
+};
+const settle = (ms = 120) => new Promise((resolve) => setTimeout(resolve, ms));
+
+for (const profile of ['cpu', 'dedicated']) {
+    const machine = profile === 'cpu' ? CPU_MACHINE : DEDICATED_MACHINE;
+
+    test(`V4 ${profile}: two readings of the runner above ram 8GiB stop it with the caps message; one above and one below, over and over, do not`, async (t) => {
+        const h = await guardedHost(t, { caps: { ram: '8GiB' }, profile, machine, startRssKb: 1024 * 1024 });
+        await h.run();
+        // Above, below, above, below ...: no two in a row.
+        h.feed.values = Array.from({ length: 40 }, (_, index) => (index % 2 === 0 ? 9 * GIB : 7 * GIB));
+        await until(() => h.feed.values.length === 0);
+        assert.ok(h.alive());
+        // Two in a row (the reading stays at the last value once the feed is spent), and only the second stops it.
+        h.feed.values = [7 * GIB, 9 * GIB, 9 * GIB];
+        h.feed.ticks = 0;
+        const message = await h.stopped();
+        assert.equal(h.feed.ticks, 3, 'stopped on the second reading above the cap, not the first');
+        assert.match(message, /localLlm\.caps\.ram/);
+        assert.ok(message.includes('8.00 GiB') && message.includes('9.00 GiB'), message);
+        assert.equal(h.handles[0].running, false);
+        assert.deepEqual(h.killImpl.calls, [], 'no real signal was sent');
+    });
+
+    test(`V5 ${profile}: with no caps the same readings above 8 GiB stop nothing${profile === 'dedicated' ? ', and a dedicated llama.cpp has no guard at all' : ''}`, async (t) => {
+        const h = await guardedHost(t, { profile, machine, startRssKb: 9 * 1024 * 1024 });
+        await h.run();
+        h.feed.values = Array.from({ length: 30 }, () => 9 * GIB);
+        await settle();
+        assert.ok(h.alive());
+        if (profile === 'dedicated') assert.equal(h.feed.ticks, 0, 'no floor and no caps: the guard never starts');
+        else assert.ok(h.feed.ticks > 3, 'the cpu profile has its floor guard either way');
+    });
+}
+
+test('V4: the physical floor stop is unchanged by a ram cap: one reading of the machine\'s available memory below the floor stops the runner with the engine\'s message', async (t) => {
+    const stops = [];
+    for (const caps of [{ ram: '8GiB' }, undefined]) {
+        const h = await guardedHost(t, { caps, profile: 'cpu', startRssKb: 1024 * 1024 });
+        await h.run();
+        h.feed.available = cpuFloorBytes(MEMORY.totalBytes) - 1;
+        stops.push(await h.stopped());
+        assert.equal(h.handles[0].killed, true);
+    }
+    assert.match(stops[0], /^stopped: host memory below the floor \(/);
+    assert.doesNotMatch(stops[0], /caps/);
+    assert.equal(stops[0], stops[1], 'the same message with and without the cap');
+});
+
+test('V4: a runner over the ram cap is stopped even while the machine has plenty of memory, and the cap message names no container or Ploinky', async (t) => {
+    const h = await guardedHost(t, { caps: { ram: '8GiB' }, profile: 'cpu', startRssKb: 1024 * 1024 });
+    await h.run();
+    assert.ok(h.feed.available > 50 * GIB);
+    h.feed.values = [12 * GIB, 12 * GIB];
+    const message = await h.stopped();
+    assert.doesNotMatch(message, /container|ploinky/i);
+    assert.match(message, /12\.00 GiB/);
+});
+
+test('V4: a first reading that fails does not leave the cap unenforced: the guard of a runner with no floor still starts, and the later readings count', async (t) => {
+    // The status file of the runner is not a number of kB when the guard starts; the readings after that are good.
+    const h = await guardedHost(t, { caps: { ram: '8GiB' }, profile: 'dedicated', machine: DEDICATED_MACHINE, startRssKb: 1024 * 1024, startStatusText: 'VmRSS:\tmany kB\n' });
+    await h.run();
+    await until(() => h.feed.ticks >= 3);
+    assert.ok(h.alive(), 'readings at 1 GiB under an 8 GiB cap');
+    h.feed.values = [9 * GIB, 9 * GIB];
+    assert.match(await h.stopped(), /localLlm\.caps\.ram/);
+});
+
+test('V4 macOS: the host wires the ps seam into the ram guard, so a Metal runner over the cap is stopped on two ps readings, and not on one', async (t) => {
+    const home = scratch(t);
+    const weights = path.join(home, 'weights.gguf');
+    fs.writeFileSync(weights, 'weights');
+    const ps = fakeMacPs({});
+    // `ps` answers from the table; the captured sysctl and vm_stat answer for everything else the macOS readers run.
+    const exec = (file, args, options) => (file === '/bin/ps' ? ps.exec(file, args, options) : MAC_EXEC(file, args, options));
+    const feed = { values: [], last: 1024 * 1024, ticks: 0 };
+    const handles = [];
+    let recorder = null;
+    const host = createLocalLlmHost({
+        config: { localLlm: { caps: { ram: '8GiB' } } }, home, env: { PATH: '/usr/bin:/bin', HOME: '/home/test', LANG: 'C.UTF-8' }, platformName: 'darwin', arch: 'arm64',
+        darwinExec: exec, ownerPort: await freePort(), killImpl: recordingKill(),
+        controllerOptions: {
+            profile: 'metal', snapshot: async () => structuredClone(MAC_MACHINE), seedCatalog: SEED, fileExists: () => true,
+            installer: { installable: () => true, lock: null, describe: async () => ({ installed: true, runnable: true, version: 'v1' }),
+                ensureRunnable: async () => ({ rebuilt: false }), entryFor: (id) => ({ id }), pathsFor: () => ({ runDir: '/run/llama.cpp/b1' }) },
+            inspect: async () => ({ state: 'complete', bytes: 1 }), detectRunner: () => ({ installed: true, version: 'v1', reason: null }),
+            download: async () => ({ status: 'complete', path: weights, bytesTransferred: 0 }),
+            fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({}) }), pollMs: 2, stopGraceMs: 20,
+            readMemory: () => {
+                feed.ticks += 1;
+                feed.last = feed.values.length ? feed.values.shift() : feed.last;
+                if (ps.table.has(PID)) ps.table.get(PID).rss = Math.round(feed.last / KIB);
+                return { totalBytes: 16 * GIB, availableBytes: 12 * GIB, pressureLevel: 1 };
+            },
+            readPressure: () => 1, metalGuardMs: 3,
+            startRunner(options) {
+                recorder ??= createLaunchRecorder({ dir: host.layout.launchDir, platformName: 'darwin', procs: createDarwinProcs({ exec: ps.exec }) });
+                const { listen } = options;
+                ps.table.set(PID, { start: PS_T0, command: macCommand(listen.socketPath), rss: Math.round(feed.last / KIB) });
+                recorder.intent(listen);
+                recorder.spawned({ ...listen, pid: PID });
+                let resolve;
+                const handle = { pid: PID, running: true, killed: false, exited: new Promise((done) => { resolve = done; }),
+                    async stop() { handle.running = false; resolve({ code: 0, signal: 'SIGTERM' }); },
+                    async kill() { handle.killed = true; return handle.stop(); } };
+                handles.push(handle);
+                return handle;
+            },
+        },
+    });
+    t.after(() => host.drain().catch(() => {}));
+    await host.acquire();
+    const controller = await host.controller();
+    await controller.run({ modelId: 'small', runnerId: 'llama.cpp', requestId: 'guard-mac-000001' });
+    await until(() => handles.length === 1);
+    // 9 GiB then 1 GiB, over and over: never two readings above the 8 GiB cap in a row.
+    feed.values = Array.from({ length: 30 }, (_, index) => (index % 2 === 0 ? 9 * GIB : GIB));
+    await until(() => feed.values.length === 0);
+    assert.equal(handles[0].running, true);
+    assert.ok(rssCalls(ps).length >= 30, 'ps was asked for the runner\'s rss on every tick');
+    assert.equal(rssCalls(ps).at(-1).args.at(-1), String(PID));
+    feed.values = [9 * GIB, 9 * GIB];
+    await until(() => handles[0].running === false);
+    await until(() => controller.state.deployment?.error);
+    assert.match(controller.state.deployment.error, /localLlm\.caps\.ram/);
+    assert.ok(controller.state.deployment.error.includes('9.00 GiB'));
+    assert.equal(handles[0].killed, true);
 });
