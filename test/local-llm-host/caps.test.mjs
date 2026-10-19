@@ -1186,7 +1186,7 @@ test('parseCaps accepts mode fit, which alone caps nothing, and the digest and t
     assert.equal(parseCaps({ mode: 'fit' }), null, 'a mode with nothing to cap is no caps, as with refuse');
     assert.notEqual(capsDigest(parseCaps({ ram: '8GiB', mode: 'fit' })), capsDigest(parseCaps({ ram: '8GiB' })), 'a cached answer is not reused across modes');
     const fit = defineCapLimits(parseCaps({ ram: '8GiB', mode: 'fit' }));
-    assert.deepEqual(fit.fitParams({ runnerId: 'llama.cpp', profile: 'dedicated' }), { order: ['ctxSize', 'parallel'] }, 'the layers are not in the order');
+    assert.deepEqual(fit.fitParams({ runnerId: 'llama.cpp', profile: 'dedicated' }), { order: ['ctxSize', 'nGpuLayers', 'parallel'] }, 'the context, then the layers, then the slots');
     assert.equal(defineCapLimits(parseCaps({ ram: '8GiB' })).fitParams, IDENTITY_LIMITS.fitParams, 'refuse mode leaves the hook the identity');
     assert.equal(fit.overview({ snapshot: CPU_MACHINE }).mode, 'fit');
     assert.match(capsLine({ limits: { budget: { caps: { ram: 8 * GIB }, mode: 'fit' } } }), /; fit mode$/);
@@ -1224,31 +1224,45 @@ test('V9 dedicated: gpuMemory 8GiB in fit mode admits the model whose default 16
     assert.equal((await none.controller.overview()).limits?.budget, undefined);
 });
 
-test('V9 dedicated: an explicit --ctx 16384 is refused, and the slots are at 1, the layers are never lowered, so fit tried nothing', async (t) => {
+test('V9 dedicated: an explicit --ctx 16384 is kept, and fit moves layers to the CPU until the GPU holds the rest', async (t) => {
+    // fitkv at 16384 needs about 10.4 GiB with every layer on the GPU; with 17 of its 24 layers it needs about 7.5 GiB, under the 8 GiB cap
+    // (7.76 GiB with the 3 % margin), and with 18 more than the cap.
     const asked = await launchOf(t, { caps: FIT_DEDICATED, profile: 'dedicated', modelId: 'fitkv', params: { ctxSize: 16384 } });
-    assert.equal(asked.error?.code, 'admission_incompatible', asked.error?.message);
-    assert.ok(!/Fit also tried/.test(asked.error.message), 'nothing was lowered, so there is no fit sentence');
-    assert.ok(!/nGpuLayers/.test(asked.error.message), 'the layers are not something fit tries');
+    assert.equal(asked.error, undefined, asked.error?.message);
+    assert.equal(flag(asked.args, '--ctx-size'), '16384', 'the context the caller set');
+    assert.equal(flag(asked.args, '--n-gpu-layers'), '17', 'the largest layer count that fits');
+    assert.deepEqual(asked.controller.state.deployment.admission.fit, { lowered: [{ param: 'nGpuLayers', from: 99, to: 17 }] });
+    assert.equal(asked.saved['fitkv|llama.cpp'].nGpuLayers, 99, 'the saved set is the one before fitting');
     const host = await capsHost(t, { caps: FIT_DEDICATED, profile: 'dedicated', machine: DEDICATED_MACHINE });
     const preview = await previewFull(host, 'dedicated', 'fitkv', { ctxSize: 16384 });
-    assert.equal(preview.admission.status, 'incompatible');
-    assert.equal(preview.params.ctxSize, 16384);
-    assert.equal(preview.params.nGpuLayers, 99, 'the layers stay as asked');
-    assert.equal(preview.admission.fit, undefined);
-    assert.ok(!/Fit also tried/.test(preview.admission.reason));
-    // With slots to give up, fit tries them, but the estimate does not size slots: the need did not go down, so the refusal is left as it was.
-    const slots = await previewFull(host, 'dedicated', 'fitkv', { ctxSize: 16384, parallel: 4 });
-    assert.equal(slots.admission.status, 'incompatible');
-    assert.ok(!/Fit also tried/.test(slots.admission.reason), slots.admission.reason);
-    assert.equal(slots.params.parallel, 4, 'the preview shows the request as asked');
-    // The same explicit value on a model whose KV cache fits is admitted: nothing about the value itself is refused.
+    assert.equal(preview.admission.status, 'ok', preview.admission.reason);
+    assert.deepEqual([preview.params.ctxSize, preview.params.nGpuLayers], [16384, 17]);
+    assert.ok(preview.admission.estimate.gpuBytes < 8 * GIB * 0.97, `needs ${preview.admission.estimate.gpuBytes}`);
+    assert.ok(preview.admission.estimate.ramBytes > 3 * GIB, 'the layers that moved and their KV cache are in RAM now');
+    assert.match(preview.admission.warnings.at(-1), /^Fit lowered nGpuLayers from 99 to 17 so that the model fits/);
+    // Layers the caller set are theirs too: with both set there is nothing to lower, and the refusal is left as it was.
+    const both = await previewFull(host, 'dedicated', 'fitkv', { ctxSize: 16384, nGpuLayers: 99 });
+    assert.equal(both.admission.status, 'incompatible');
+    assert.equal(both.params.nGpuLayers, 99);
+    assert.ok(!/Fit also tried/.test(both.admission.reason), both.admission.reason);
+    // The same explicit value on a model whose KV cache fits is admitted with every layer: nothing is lowered that need not be.
     const light = await previewFull(host, 'dedicated', 'fitkv-light', { ctxSize: 16384 });
     assert.equal(light.admission.status, 'ok', light.admission.reason);
-    assert.equal(light.params.ctxSize, 16384);
+    assert.deepEqual([light.params.ctxSize, light.params.nGpuLayers], [16384, 99]);
     // Control: refuse mode refuses the same request with today's reason (no fit sentence).
     const refuse = await launchOf(t, { caps: { gpuMemory: '8GiB' }, profile: 'dedicated', modelId: 'fitkv', params: { ctxSize: 16384 } });
     assert.equal(refuse.error?.code, 'admission_incompatible');
     assert.ok(!/Fit/.test(refuse.error.message));
+});
+
+test('V9 dedicated: a GPU refusal fit walked only through the layers, down to one, says so and names the smallest size tried', async (t) => {
+    // With a 512 MiB cap even one layer of fitkv at 16384 (its share of the 8 GiB KV cache, the compute buffer and the CUDA context) is too much.
+    const host = await capsHost(t, { caps: { gpuMemory: '512MiB', mode: 'fit' }, profile: 'dedicated', machine: DEDICATED_MACHINE });
+    const preview = await previewFull(host, 'dedicated', 'fitkv', { ctxSize: 16384, parallel: 1 });
+    assert.equal(preview.admission.status, 'incompatible');
+    assert.equal(preview.params.nGpuLayers, 99, 'refused as it was asked');
+    assert.match(preview.admission.reason, /^Needs about 10\.\d GiB of GPU memory; the GPU has 0\.5 GiB\./, 'the first refusal, with every layer');
+    assert.match(preview.admission.reason, /Fit also tried lowering nGpuLayers from 99 to 1, and it still does not fit; the smallest size tried was ctxSize 16384, nGpuLayers 1, parallel 1\.$/);
 });
 
 test('V9 dedicated: a refusal about the machine\'s RAM, which no context lowers, gets no "Fit also tried" sentence, though the GPU figure goes down with the context', async (t) => {
@@ -1287,12 +1301,13 @@ test('V9 dedicated: an insufficient-now result is not fitted, even when a smalle
 test('V9 dedicated: the check after the download fits again, from the set the Run started with, on the machine as it is then', async (t) => {
     const machine = structuredClone(DEDICATED_MACHINE);
     // Admitted at 8192 against 8 GiB. By the time the weights are fetched the GPU has 6 GiB (the cap is above it): 8192 needs 6.4 GiB, so the check
-    // is incompatible now, and fitting again from the 16384 the Run started with gives 4096.
+    // is incompatible now, and fitting again from the 16384 the Run started with stops the context at the 8192 floor and moves 3 of the 24 layers.
     const run = await launchOf(t, { caps: FIT_DEDICATED, profile: 'dedicated', modelId: 'fitkv', machine, onDownload: () => { machine.gpu.totalBytes = 6 * GIB; machine.gpu.freeBytes = 6 * GIB; } });
     assert.equal(run.error, undefined, run.error?.message);
-    assert.equal(flag(run.args, '--ctx-size'), '4096', 'the launch uses what the recheck settled on');
-    assert.equal(run.controller.state.deployment.params.ctxSize, 4096);
-    assert.deepEqual(run.controller.state.deployment.admission.fit, { lowered: [{ param: 'ctxSize', from: 16384, to: 4096 }] }, 'from the Run\'s own start, not from the 8192 of the first fit');
+    assert.deepEqual([flag(run.args, '--ctx-size'), flag(run.args, '--n-gpu-layers')], ['8192', '21'], 'the launch uses what the recheck settled on');
+    assert.equal(run.controller.state.deployment.params.ctxSize, 8192);
+    assert.deepEqual(run.controller.state.deployment.admission.fit, { lowered: [{ param: 'ctxSize', from: 16384, to: 8192 }, { param: 'nGpuLayers', from: 99, to: 21 }] },
+        'from the Run\'s own start, not from the set of the first fit');
     assert.equal(run.saved['fitkv|llama.cpp'].ctxSize, 16384);
     // Control (negative): refuse mode, same machine change: the first admission passes, the recheck refuses, and nothing is started.
     const again = structuredClone(DEDICATED_MACHINE);

@@ -8,8 +8,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { admissionResult, admit, admitOllama, admitVllm } from '../../lib/local-llm/controller/admission.mjs';
-import { FIT_KEYS, MAX_FIT_STEPS, fitAdmission } from '../../lib/local-llm/controller/fit.mjs';
+import { admissionResult, admit, admitLlamaServer, admitLmStudio, admitOllama, admitVllm } from '../../lib/local-llm/controller/admission.mjs';
+import { FIT_CONTEXT_FLOOR, FIT_KEYS, MAX_FIT_STEPS, fitAdmission } from '../../lib/local-llm/controller/fit.mjs';
 import { loadSeedCatalog, validateModel } from '../../lib/local-llm/controller/catalog.mjs';
 import { cpuDefaultThreads, defaultThreads, performanceCoreCount, physicalCoreCount, readSnapshot } from '../../lib/local-llm/controller/hardware.mjs';
 import { UNIFIED, admitApuLlamaServer, cpuFloorBytes, cpuHostReserveBytes } from '../../lib/local-llm/controller/profiles.mjs';
@@ -1160,17 +1160,18 @@ test('capParams: a result outside the runner\'s schema is refused as invalid par
 // ---------------------------------------------------------------- fitParams: fit.mjs on its own
 
 const FIT_SCHEMA = LLAMA_SERVER_PARAM_SCHEMA;
-const SIZED = (status, reason = 'too big', estimate = {}) => admissionResult(status, reason, { weightsBytes: MIB, ...estimate });
+const SIZED = (status, reason = 'too big', estimate = {}, code = null) => admissionResult(status, reason, { weightsBytes: MIB, ...estimate }, [], code);
 // A refusal about the sizes names the need, which moves with them; this one does, as the policies' reasons do.
 const needs = (set) => `Needs ${set.ctxSize} tokens and ${set.parallel} slots`;
 // The GPU need the estimate carries: it grows with the context and the slots, as the KV cache does.
 const gpuNeed = (set) => set.ctxSize * set.parallel * 1024;
 
 /** fitAdmission with an `admitWith` that records every parameter set it is asked about and answers `verdict(params)`. */
-function fitRun(params, { verdict = () => 'incompatible', explicit = [], order = FIT_KEYS, model = { id: 'm', memory: { layers: 24 } }, profile = 'dedicated', schema = FIT_SCHEMA, normalize = (value) => value, maxSteps, reason = needs, estimate = (set) => ({ gpuBytes: gpuNeed(set) }) } = {}) {
+// `code` is the reasonCode of each answer (the figure a llama-server refusal names), none by default.
+function fitRun(params, { verdict = () => 'incompatible', explicit = [], order = FIT_KEYS, model = { id: 'm', memory: { layers: 24 } }, profile = 'dedicated', schema = FIT_SCHEMA, normalize = (value) => value, maxSteps, reason = needs, estimate = (set) => ({ gpuBytes: gpuNeed(set) }), code = () => null } = {}) {
     const asked = [];
     const result = fitAdmission({ params, explicit, order, schema, model, profile, normalize, ...(maxSteps ? { maxSteps } : {}),
-        admitWith: (candidate) => { asked.push(candidate); return SIZED(verdict(candidate), reason(candidate), estimate(candidate)); } });
+        admitWith: (candidate) => { asked.push(candidate); return SIZED(verdict(candidate), reason(candidate), estimate(candidate), code(candidate)); } });
     return { ...result, asked };
 }
 const tuple = (set) => [set.ctxSize, set.parallel];
@@ -1178,17 +1179,18 @@ const START = Object.freeze({ ctxSize: 2048, parallel: 4, nGpuLayers: 99 });
 
 test('fitParams: the identity does not fit, and a hook with no order is no fit', () => {
     assert.equal(IDENTITY_LIMITS.fitParams({ runnerId: 'llama.cpp', profile: 'dedicated' }), null);
-    assert.deepEqual([...FIT_KEYS], ['ctxSize', 'parallel'], 'the layers are never lowered');
+    assert.deepEqual([...FIT_KEYS], ['ctxSize', 'nGpuLayers', 'parallel']);
+    assert.equal(FIT_CONTEXT_FLOOR, 8192);
 });
 
-test('fit: the steps are ctxSize, then parallel, each halved to its end before the next is touched, and the layers are left alone', () => {
+test('fit: the steps are ctxSize, then parallel, each halved to its end before the next is touched, and a refusal that names no figure leaves the layers alone', () => {
     const { asked, admission, params } = fitRun(START);
     // ctxSize 2048 -> 1024 -> 512 (the schema minimum); parallel 4 -> 2 -> 1.
     assert.deepEqual(asked.map(tuple), [[2048, 4], [1024, 4], [512, 4], [512, 2], [512, 1]]);
-    assert.ok(asked.every((set) => set.nGpuLayers === 99), 'nGpuLayers is never lowered, even when it is named in the order');
+    assert.ok(asked.every((set) => set.nGpuLayers === 99), 'nGpuLayers is lowered only for a refusal that names the GPU');
     assert.equal(admission.status, 'incompatible');
     assert.equal(params, START, 'a request that does not fit is refused as it was asked');
-    assert.match(admission.reason, /the smallest size tried was ctxSize 512, parallel 1\.$/, 'a refusal names the smallest size tried');
+    assert.match(admission.reason, /the smallest size tried was ctxSize 512, nGpuLayers 99, parallel 1\.$/, 'a refusal names the smallest size tried');
     assert.match(admission.reason, /^Needs 2048 tokens and 4 slots Fit also tried lowering ctxSize from 2048 to 512, parallel from 4 to 1, and it still does not fit;/);
     assert.equal(admission.fit, undefined, 'nothing is reported as lowered: nothing was');
     assert.equal(admission.warnings.length, 0);
@@ -1230,13 +1232,15 @@ test('fit: the number of steps is bounded, by the argument and by MAX_FIT_STEPS 
     const three = fitRun(START, { maxSteps: 3 });
     assert.equal(three.asked.length, 1 + 3);
     assert.deepEqual(tuple(three.asked.at(-1)), [512, 2], 'ctxSize 1024, 512, then one step of parallel');
-    // More halvings to the minimum than the bound allows (52 for the context and 20 for the slots): the bound ends the fit.
-    const schema = { properties: { ctxSize: { minimum: 1 }, parallel: { minimum: 1 } } };
-    const endless = fitRun({ ctxSize: 2 ** 52, parallel: 2 ** 20 }, { order: ['ctxSize', 'parallel'], schema, model: {}, profile: 'cpu' });
+    // More steps to the minimum than the bound allows (52 halvings of the context, then one step per layer of 1000): the bound ends the fit.
+    assert.equal(MAX_FIT_STEPS, 256);
+    const schema = { properties: { ctxSize: { minimum: 1 }, nGpuLayers: { minimum: 0 } } };
+    const endless = fitRun({ ctxSize: 2 ** 52, nGpuLayers: 1000 }, { order: ['nGpuLayers', 'ctxSize'], schema, model: { memory: { layers: 1000 } },
+        code: () => 'gpu_capacity', estimate: (set) => ({ gpuBytes: set.nGpuLayers }), reason: (set) => `Needs ${set.nGpuLayers} layers` });
     assert.equal(endless.asked.length, 1 + MAX_FIT_STEPS);
-    assert.equal(endless.asked.at(-1).ctxSize, 1, 'the context reached its minimum first');
-    assert.equal(endless.asked.at(-1).parallel, 2 ** 20 / 2 ** (MAX_FIT_STEPS - 52), 'and the slots were lowered for the steps that were left');
-    assert.match(endless.admission.reason, /the smallest size tried was ctxSize 1, parallel \d+\.$/);
+    assert.equal(endless.asked.at(-1).ctxSize, 2 ** 52, 'the layers come first in this order');
+    assert.equal(endless.asked.at(-1).nGpuLayers, 1000 - MAX_FIT_STEPS, 'one layer per step for every step there was');
+    assert.match(endless.admission.reason, /the smallest size tried was nGpuLayers 744, ctxSize \d+\.$/);
 });
 
 test('fit: insufficient-now is never fitted, and neither is a refusal that no size caused', () => {
@@ -1269,10 +1273,12 @@ test('fit: the order is the hook\'s, and a key it does not name is not lowered',
     const unknown = fitRun(START, { order: ['bogus', 'ctxSize'] });
     assert.ok(unknown.asked.every((set) => set.parallel === 4 && set.nGpuLayers === 99));
     const layers = fitRun(START, { order: ['nGpuLayers'] });
-    assert.equal(layers.asked.length, 1, 'the layers are not a key fit lowers, whatever the order names');
+    assert.equal(layers.asked.length, 1, 'the layers move only for a refusal that names the GPU, and this one names none');
+    const gpu = fitRun(START, { order: ['parallel'], code: () => 'gpu_capacity' });
+    assert.ok(gpu.asked.every((set) => set.nGpuLayers === 99 && set.ctxSize === 2048), 'a GPU refusal lowers only what the order names');
 });
 
-test('fit: nGpuLayers is never lowered, on any profile, with or without a layer count', () => {
+test('fit: nGpuLayers is not lowered for a refusal that names no figure, on any profile, with or without a layer count', () => {
     for (const [profile, model] of [['dedicated', { id: 'm' }], ['dedicated', { id: 'm', memory: { layers: 24 } }], ['cpu', { id: 'm' }]]) {
         const run = fitRun({ ctxSize: 512, parallel: 1, nGpuLayers: 99 }, { model, profile });
         assert.equal(run.asked.length, 1, `${profile}: nothing else could be lowered, and the layers are not`);
@@ -1301,6 +1307,110 @@ test('fit: a refusal whose need did not go down, though its wording moved, gets 
     // Control: the GPU need goes down with the sizes and the wording follows it, so the sentence is added.
     const control = fitRun(START);
     assert.match(control.admission.reason, /Fit also tried lowering/);
+});
+
+// A llama-server-like answer: the GPU need is the layers' share of the weights and of the KV cache; the RAM need is the rest.
+const LAYERED = { id: 'm', memory: { layers: 40 } };
+const layerShare = (set) => Math.min(set.nGpuLayers, 40) / 40;
+const kvOf = (set) => set.ctxSize * set.parallel * 1024;
+const layeredNeed = (set) => ({ gpuBytes: Math.round((14 * GIB + kvOf(set)) * layerShare(set)), ramBytes: Math.round((14 * GIB + kvOf(set)) * (1 - layerShare(set))) });
+const layeredReason = (set) => `GPU ${layeredNeed(set).gpuBytes} RAM ${layeredNeed(set).ramBytes}`;
+const tri = (set) => [set.ctxSize, set.nGpuLayers, set.parallel];
+
+test('fit: a GPU refusal takes a default context down to the floor, then moves the layers one at a time, and stops at the first that fits', () => {
+    const run = fitRun({ ctxSize: 32768, parallel: 1, nGpuLayers: 99 }, { model: LAYERED, reason: layeredReason, estimate: layeredNeed,
+        code: () => 'gpu_capacity', verdict: (set) => (layeredNeed(set).gpuBytes <= 7 * GIB ? 'ok' : 'incompatible') });
+    assert.deepEqual(run.asked.slice(0, 4).map(tri), [[32768, 99, 1], [16384, 99, 1], [8192, 99, 1], [8192, 39, 1]],
+        'the context halves to the floor, then the first step goes from 99 (all) to one below the model\'s 40 layers');
+    assert.ok(run.asked.every((set) => set.ctxSize >= FIT_CONTEXT_FLOOR), 'the context never went below the floor: the layers were enough');
+    assert.equal(run.admission.status, 'ok');
+    assert.deepEqual(tri(run.params), [8192, 19, 1], 'the largest layer count that fits: 19 of 40 layers of 14 GiB and the KV cache is under 7 GiB');
+    assert.deepEqual(run.admission.fit, { lowered: [{ param: 'ctxSize', from: 32768, to: 8192 }, { param: 'nGpuLayers', from: 99, to: 19 }] });
+    assert.match(run.admission.warnings.at(-1), /^Fit lowered ctxSize from 32768 to 8192, nGpuLayers from 99 to 19 so that the model fits/);
+    // A context at or under the floor is not raised and does not move before the layers.
+    const small = fitRun({ ctxSize: 4096, parallel: 1, nGpuLayers: 99 }, { model: LAYERED, reason: layeredReason, estimate: layeredNeed,
+        code: () => 'gpu_capacity', verdict: (set) => (layeredNeed(set).gpuBytes <= 7 * GIB ? 'ok' : 'incompatible') });
+    assert.ok(small.asked.every((set) => set.ctxSize === 4096));
+    assert.equal(small.params.nGpuLayers, 19);
+    // A context the caller set stays; the layers move all the same.
+    const explicit = fitRun({ ctxSize: 32768, parallel: 1, nGpuLayers: 99 }, { model: LAYERED, reason: layeredReason, estimate: layeredNeed, explicit: ['ctxSize'],
+        code: () => 'gpu_capacity', verdict: (set) => (layeredNeed(set).gpuBytes <= 7 * GIB ? 'ok' : 'incompatible') });
+    assert.deepEqual(tri(explicit.params), [32768, 19, 1]);
+    // Layers the caller set stay, and the context is not held at the floor for them: it goes on down.
+    const pinned = fitRun({ ctxSize: 32768, parallel: 1, nGpuLayers: 99 }, { model: LAYERED, explicit: ['nGpuLayers'], code: () => 'gpu_capacity' });
+    assert.ok(pinned.asked.every((set) => set.nGpuLayers === 99));
+    assert.equal(pinned.asked.at(-1).ctxSize, 512, 'with no layers to move, the context goes to the schema minimum');
+});
+
+test('fit: the layers stop at 1, never 0, and then the context goes on below the floor; a model with no layer count is sized with 48', () => {
+    const run = fitRun({ ctxSize: 16384, parallel: 2, nGpuLayers: 99 }, { model: LAYERED, code: () => 'gpu_capacity' });
+    const layersTried = run.asked.map((set) => set.nGpuLayers);
+    assert.equal(Math.min(...layersTried), 1, 'one layer stays on the GPU: at 0 the estimate counts no compute buffer and no CUDA context');
+    assert.deepEqual(run.asked.slice(1, 3).map(tri), [[8192, 99, 2], [8192, 39, 2]]);
+    assert.deepEqual(tri(run.asked.at(-1)), [512, 1, 1], 'then the context to its minimum, then the slots');
+    assert.equal(run.asked.length, 1 + 1 + 39 + 4 + 1, 'the floor, 39 layer steps (40 to 1), four halvings of the context and one of the slots');
+    const unknown = fitRun({ ctxSize: 8192, parallel: 1, nGpuLayers: 99 }, { model: { id: 'm' }, code: () => 'gpu_capacity' });
+    assert.equal(unknown.asked[1].nGpuLayers, 47, 'one below the 48 layers the estimate assumes');
+    // A model already at one layer has none to move.
+    const one = fitRun({ ctxSize: 8192, parallel: 1, nGpuLayers: 1 }, { model: LAYERED, code: () => 'gpu_capacity' });
+    assert.ok(one.asked.every((set) => set.nGpuLayers === 1));
+});
+
+test('fit: the layers move only while the refusal names the GPU; once the RAM is the refusal the context goes on below the floor', () => {
+    // 14 GiB of weights and 512 KiB of KV cache per token; the GPU holds 6 GiB, the RAM 10 GiB. At the 8192 floor 13 layers fit the GPU,
+    // and the other 27 need 12.2 GiB of RAM: the GPU refusal has turned into a RAM one, and the context then goes down until both fit.
+    const heavy = (set) => {
+        const total = 14 * GIB + set.ctxSize * set.parallel * 512 * 1024;
+        return { gpuBytes: Math.round(total * layerShare(set)), ramBytes: Math.round(total * (1 - layerShare(set))) };
+    };
+    const fitsGpu = (set) => heavy(set).gpuBytes <= 6 * GIB;
+    const fitsRam = (set) => heavy(set).ramBytes <= 10 * GIB;
+    const run = fitRun({ ctxSize: 16384, parallel: 1, nGpuLayers: 99 }, { model: LAYERED, reason: (set) => JSON.stringify(heavy(set)), estimate: heavy,
+        code: (set) => (!fitsGpu(set) ? 'gpu_capacity' : !fitsRam(set) ? 'ram_capacity' : null),
+        verdict: (set) => (fitsGpu(set) && fitsRam(set) ? 'ok' : 'incompatible') });
+    const firstRam = run.asked.findIndex((set) => fitsGpu(set) && !fitsRam(set));
+    assert.ok(firstRam > 0, 'the walk reached a RAM refusal');
+    assert.ok(run.asked.slice(firstRam + 1).every((set) => set.nGpuLayers === run.asked[firstRam].nGpuLayers), 'no layer moved after it');
+    assert.equal(run.asked[firstRam].nGpuLayers, 13);
+    assert.equal(run.admission.status, 'ok', run.admission.reason);
+    assert.deepEqual(tri(run.params), [1024, 13, 1], 'the context went below the floor, with the layers kept');
+    // A RAM refusal from the start never moves a layer.
+    const ram = fitRun({ ctxSize: 16384, parallel: 1, nGpuLayers: 99 }, { model: LAYERED, code: () => 'ram_capacity' });
+    assert.ok(ram.asked.every((set) => set.nGpuLayers === 99));
+    assert.equal(ram.asked.at(-1).ctxSize, 512, 'and the context is not held at the floor');
+});
+
+test('fit: the llama-server policy names the figure of its incompatible refusals in the reasonCode fit reads, and LM Studio\'s too', () => {
+    const model = { id: 'm', memory: { layers: 40 } };
+    const params = { ctxSize: 16384, nGpuLayers: 99, nCpuMoe: 0, flashAttn: 'auto', cacheTypeK: 'f16', cacheTypeV: 'f16', parallel: 1, ubatchSize: 512 };
+    const machine = (gpuGiB, ramGiB) => ({ gpu: { totalBytes: gpuGiB * GIB, freeBytes: gpuGiB * GIB }, memory: { totalBytes: ramGiB * GIB, availableBytes: ramGiB * GIB }, disk: {} });
+    for (const policy of [admitLlamaServer, admitLmStudio]) {
+        const gpu = policy({ model, source: { size: 14 * GIB }, params, ...machine(8, 64) });
+        assert.deepEqual([gpu.status, gpu.reasonCode], ['incompatible', 'gpu_capacity'], gpu.reason);
+        const ram = policy({ model, source: { size: 14 * GIB }, params: { ...params, nGpuLayers: 10 }, ...machine(24, 8) });
+        assert.deepEqual([ram.status, ram.reasonCode], ['incompatible', 'ram_capacity'], ram.reason);
+        const ok = policy({ model, source: { size: 2 * GIB }, params, ...machine(24, 64) });
+        assert.deepEqual([ok.status, ok.reasonCode], ['ok', undefined]);
+    }
+});
+
+test('fit: "went down" is judged by the figure the first refusal names', () => {
+    // A RAM refusal whose RAM figure the context does not move, while the GPU figure goes down with it: no "Fit also tried" sentence.
+    const ram = fitRun(START, { reason: needs, code: () => 'ram_capacity', estimate: (set) => ({ gpuBytes: gpuNeed(set), ramBytes: 40 * GIB }) });
+    assert.ok(ram.asked.length > 1, 'it did try');
+    assert.equal(ram.admission.reason, 'Needs 2048 tokens and 4 slots');
+    // A GPU refusal walked only through the layers: the GPU figure goes down and the RAM figure up; the refusal says what fit tried.
+    const pinned = { ctxSize: 16384, parallel: 1, nGpuLayers: 99 };
+    const gpu = fitRun(pinned, { model: LAYERED, reason: layeredReason, estimate: layeredNeed, explicit: ['ctxSize', 'parallel'], code: () => 'gpu_capacity' });
+    assert.ok(gpu.asked.every((set) => set.ctxSize === 16384 && set.parallel === 1));
+    assert.ok(layeredNeed(gpu.asked.at(-1)).ramBytes > layeredNeed(pinned).ramBytes, 'the RAM figure rose');
+    assert.equal(gpu.params, pinned);
+    assert.match(gpu.admission.reason, /^GPU \d+ RAM \d+ Fit also tried lowering nGpuLayers from 99 to 1, and it still does not fit; the smallest size tried was ctxSize 16384, nGpuLayers 1, parallel 1\.$/);
+    // The same walk ending in a RAM refusal is judged by the GPU figure the first refusal named, which went down.
+    const turned = fitRun(pinned, { model: LAYERED, reason: layeredReason, estimate: layeredNeed, explicit: ['ctxSize', 'parallel'],
+        code: (set) => (set.nGpuLayers > 20 ? 'gpu_capacity' : 'ram_capacity') });
+    assert.equal(turned.asked.at(-1).nGpuLayers, 20, 'the layers stopped where the RAM became the refusal');
+    assert.match(turned.admission.reason, /Fit also tried lowering nGpuLayers from 99 to 20, and it still does not fit;/);
 });
 
 test('fit: lowering parallel lowers a context the training context per slot cannot hold, unless the caller set it', () => {

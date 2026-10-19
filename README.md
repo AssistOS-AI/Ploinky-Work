@@ -17,7 +17,7 @@ Run the test suite with `npm test`.
 { "localLlm": { "caps": { "ram": "24GiB", "gpuMemory": "12GiB", "threads": 8, "maxContext": 16384, "maxParallel": 2, "mode": "fit" } } }
 ```
 
-Sizes are bytes (at least 1 MiB), binary-unit strings such as `"12GiB"`, or fractions of the machine's total (1 means 100%). `gpuMemory` applies to NVIDIA only and is refused on macOS, where `ram` covers the shared memory. A value you set in a request is refused when it exceeds a cap; `fit` lowers only default `ctxSize`, then `parallel`, never `nGpuLayers`. Caps are fixed per `pworker serve` process, so changing them means a restart, and `pworker models status` shows them.
+Sizes are bytes (at least 1 MiB), binary-unit strings such as `"12GiB"`, or fractions of the machine's total (1 means 100%). `gpuMemory` applies to NVIDIA only and is refused on macOS, where `ram` covers the shared memory. A value you set in a request is refused when it exceeds a cap; `fit` lowers what you did not set: a default `ctxSize` to 8192, then `nGpuLayers` one layer at a time while the GPU is what refuses (never below 1), then the rest of `ctxSize`, then `parallel`. Caps are fixed per `pworker serve` process, so changing them means a restart, and `pworker models status` shows them.
 
 The caps are honest limits, not containers: `threads`, `maxContext` and `maxParallel` are hard flags; `gpuMemory` only sizes admission; `ram` sizes admission and adds a guard that stops a runner after two readings above the cap, which a fast load can outrun. Nothing caps GPU compute. Proxy-started llama-servers (`upstreams.<name>.start`) and runners pworker does not offer are not capped. See [PWORKER.md](PWORKER.md) and [DS008](docs/specs/DS008-standalone-host.md).
 
