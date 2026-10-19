@@ -9,6 +9,18 @@ Install from the open source repository with `git clone https://github.com/Assis
 Run the test suite with `npm test`.
 
 
+## Hardware caps
+
+`localLlm.caps` (optional, in the user or project configuration) declares the hardware that local models may plan for: `ram`, `gpuMemory`, `threads`, `maxContext`, `maxParallel` and `mode` (`refuse` or `fit`).
+
+```json
+{ "localLlm": { "caps": { "ram": "24GiB", "gpuMemory": "12GiB", "threads": 8, "maxContext": 16384, "maxParallel": 2, "mode": "fit" } } }
+```
+
+Sizes are bytes (at least 1 MiB), binary-unit strings such as `"12GiB"`, or fractions of the machine's total (1 means 100%). `gpuMemory` applies to NVIDIA only and is refused on macOS, where `ram` covers the shared memory. A value you set in a request is refused when it exceeds a cap; `fit` lowers only default `ctxSize`, then `parallel`, never `nGpuLayers`. Caps are fixed per `pworker serve` process, so changing them means a restart, and `pworker models status` shows them.
+
+The caps are honest limits, not containers: `threads`, `maxContext` and `maxParallel` are hard flags; `gpuMemory` only sizes admission; `ram` sizes admission and adds a guard that stops a runner after two readings above the cap, which a fast load can outrun. Nothing caps GPU compute. Proxy-started llama-servers (`upstreams.<name>.start`) and runners pworker does not offer are not capped. See [PWORKER.md](PWORKER.md) and [DS008](docs/specs/DS008-standalone-host.md).
+
 ### Constant template files and compact Markdown fields
 
 Markdown scalar fields accept `### tier:small`, `### batch:true`, and `###next:repair`. Templates and code remain fenced blocks. A template may include `${{lib/prompts/conventions.txt}}`: the file is read relative to the task working directory and expanded before batch grouping and deterministic request IDs are computed. Expansion freezes the contents at enqueue. Nested includes resolve relative to their containing file. Included files must be constant (no `${variable}`), stay inside the workspace, and have no cycles. Missing files are errors. Task input and model output are never expanded as includes. Keep the dynamic task argument last to retain compatible prefix batching.

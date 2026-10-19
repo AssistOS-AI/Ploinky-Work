@@ -137,6 +137,53 @@ Example: `{ tier: 'small', template: 'Classify this text: ${input}', batch: true
 
 The engine has no container paths, vendor wording or hardware limits of its own. A host gives it the paths (`defineHost`), the wording (`defineMessages`) and the limits (`defineLimits`, hooks whose identity default limits nothing). It has no default catalog or runner-lock path, and it adds no dependency. `engines` stays `>=22.13`. A `.tar.zst` runner install needs zlib zstd support (`zlib.createZstdDecompress`, Node 22.15 or newer); where it is missing the install is refused with `zstd_unsupported` before anything is downloaded. The test suite (which uses `zstdCompressSync`) is only exercised on newer Node.
 
+## Hardware caps
+
+`localLlm.caps` in the user or project configuration declares the hardware that local models may plan for. It is optional: with no `caps` the engine behaves exactly as before. The details, including the code paths, are in [DS008](docs/specs/DS008-standalone-host.md) (Caps).
+
+```json
+{
+  "localLlm": {
+    "caps": {
+      "ram": "24GiB",
+      "gpuMemory": "12GiB",
+      "threads": 8,
+      "maxContext": 16384,
+      "maxParallel": 2,
+      "mode": "fit"
+    }
+  }
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `ram` | Host memory a model may plan for. On every profile; on macOS it also covers the GPU, because the memory is unified |
+| `gpuMemory` | GPU memory a model may plan for. NVIDIA (`dedicated` and `unified`) only; refused on macOS (`invalid_caps`), where you use `ram` |
+| `threads` | Upper bound on the `--threads` the llama-server runners start with |
+| `maxContext` | Upper bound on `ctxSize` (at least 512) |
+| `maxParallel` | Upper bound on `parallel` (`-np`) |
+| `mode` | `refuse` (the default) or `fit`; on its own it caps nothing |
+
+A size (`ram`, `gpuMemory`) is a number of bytes (a safe integer of at least 1 MiB), a string with a binary unit (`"12GiB"`, `"512MiB"`, `"1.5GiB"`), or a fraction above 0 and at most 1 of the machine's total (the first reading, then kept; 1 means 100%). A bare number above 1 is bytes. The counts are whole numbers of at least 1. A bad section is refused as `invalid_caps`, naming the key, when the engine is first used.
+
+**Refuse and fit.** A value above a count cap is handled by where it came from. A default, catalog-recommended or saved value is lowered to the cap. A value you set in the request (`--ctx`, `--parallel`, `--param threads=8`, HTTP `params`) is refused, naming `localLlm.caps.<key>`. When a model still does not fit, `refuse` refuses it and `fit` lowers only the default `ctxSize` and then `parallel`, halving each, until it fits. Fit never changes a value you set, and never lowers `nGpuLayers`: the llama.cpp estimate puts the whole KV cache on the GPU whenever any layer is there, so for a partial offload it under-counts host RAM and fit could admit a split it did not size. What a Run saves is the set before the caps and before fitting, so removing a cap restores the earlier values.
+
+**Fixed per process.** The caps are read when `pworker serve` creates its host, so changing them means restarting `pworker serve`. The cache identity of an answer from the local model includes a digest of the caps.
+
+**Seeing them.** `pworker models status`, and a refused `preview` or `run`, print `caps in force (localLlm.caps): ...; refuse mode` (or `fit mode`). `GET /v1/local-llm` carries the same figures in `limits.budget`. When fit lowered something, `preview` and `status` add `fit lowered: ctxSize 16384 -> 8192`.
+
+**What a cap really does.**
+
+| Cap | Enforced by | Strength |
+| --- | --- | --- |
+| `threads`, `maxContext`, `maxParallel` | The llama-server flags | Hard: the runner cannot exceed the flags it is started with |
+| `gpuMemory` | Admission's estimate plus the chosen flags | Sizing only: nothing stops a runner using more GPU memory once it runs |
+| `ram` | Admission's estimate (less what the runners already hold) plus the memory guard | Sizing plus a backstop: the guard stops a runner after two consecutive readings of the runners' resident memory above the cap. A load can allocate faster than the guard samples, so a burst is not stopped. On Apple Silicon the resident figure may leave out memory the GPU driver wires, so the guard may undercount there (not yet measured) |
+| GPU compute share | Nothing | Not offered |
+
+**Not covered.** llama-servers that the proxy itself starts (`upstreams.<name>.start`) are outside the caps: their memory is neither limited nor counted. Runners that pworker does not offer (Ollama, vLLM, TabbyAPI, LM Studio, the Vulkan build) are not capped because they are not available.
+
 ## Local servers started on demand
 
 An upstream with a `start` block (see the `local`, `localsuper` and `localnano` entries of `config.default.json`) is a local server that the proxy starts when a request needs it. `lib/local.mjs` runs it through the engine's runner process (`lib/local-llm/controller/runnerProcess.mjs`): the server leads its own process group, its output goes straight to its log file, and a stop signals the whole group. A request to such an upstream first checks `/health` on its port. A healthy server is used as it is, whoever started it; this is also how a server that outlived a crashed or killed proxy is picked up again by the next one. Otherwise the proxy starts the server if the GPU is free, and the request falls back down its tier chain when the server may not or cannot start.
