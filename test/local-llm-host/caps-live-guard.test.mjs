@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { scratch } from './fixtures/engine.mjs';
 import {
     CAP_LIMIT_SLACK_BYTES, GIB, MIB, availableNowBytes, gpuCapAdmitting, gpuVerdict, halvedContext, insufficientNowCause, parseRunnerArgv,
+    deploymentIdentity, deploymentUnchanged, explicitCtxExpectation, explicitCtxLaunchMatches, explicitCtxPreviewMatches, fitLoweredSteps,
     planGpuFitContext, planGpuFitLayers, planOurUseCap, planRamFit, ramAdmitMargin, ramNeedOf, settleFailedCase, within,
 } from '../live/caps-derive.mjs';
 
@@ -193,4 +194,41 @@ test('L7 ram cap: the need plus 64 MiB, never below 1.25 x the measured RSS, and
     // Nothing measured yet: the old cap, and the live check decides.
     assert.deepEqual(planOurUseCap({ need, rssBytes: null }), { cap: need + 64 * MIB, room: need + 64 * MIB, secondRefused: null });
     assert.equal(planOurUseCap({ need, rssBytes: 0 }).secondRefused, null);
+});
+
+test('L5 explicit ctx under fit: refused on cpu and metal, admitted on dedicated with layers lowered and the ctx kept', () => {
+    const model = 'qwen2.5-0.5b-instruct-q4_k_m';
+    assert.equal(explicitCtxExpectation('dedicated'), 'admitted');
+    assert.equal(explicitCtxExpectation('cpu'), 'refused');
+    assert.equal(explicitCtxExpectation('metal'), 'refused');
+    assert.deepEqual(fitLoweredSteps(`${model}: ok, fit lowered: nGpuLayers 99 -> 21`), [{ param: 'nGpuLayers', from: 99, to: 21 }]);
+    assert.deepEqual(fitLoweredSteps(`${model}: incompatible`), []);
+    const admitted = `${model}: ok, fit lowered: nGpuLayers 99 -> 21\n`;
+    assert.equal(explicitCtxPreviewMatches({ profile: 'dedicated', stdout: admitted, model }), true);
+    assert.equal(explicitCtxPreviewMatches({ profile: 'dedicated', stdout: `${model}: incompatible\nNeeds about 5 GiB`, model }), false, 'the old expectation (refused) fails on dedicated');
+    assert.equal(explicitCtxPreviewMatches({ profile: 'dedicated', stdout: `${model}: ok, fit lowered: ctxSize 8192 -> 4096`, model }), false, 'an explicit ctx is never lowered');
+    assert.equal(explicitCtxPreviewMatches({ profile: 'dedicated', stdout: `${model}: ok`, model }), false, 'no layers moved');
+    assert.equal(explicitCtxPreviewMatches({ profile: 'metal', stdout: `${model}: incompatible\nNeeds about 5 GiB`, model }), true);
+    assert.equal(explicitCtxPreviewMatches({ profile: 'cpu', stdout: admitted, model }), false, 'a pool profile must refuse');
+    assert.equal(explicitCtxPreviewMatches({ profile: 'cpu', stdout: `${model}: incompatible, fit lowered: ctxSize 8192 -> 4096`, model }), false);
+    assert.equal(explicitCtxLaunchMatches({ parsed: parseRunnerArgv('llama-server -c 8192 -ngl 21'), ctx: 8192, layers: 99 }), true);
+    assert.equal(explicitCtxLaunchMatches({ parsed: parseRunnerArgv('llama-server -c 4096 -ngl 21'), ctx: 8192, layers: 99 }), false, 'ctx changed');
+    assert.equal(explicitCtxLaunchMatches({ parsed: parseRunnerArgv('llama-server -c 8192 -ngl 99'), ctx: 8192, layers: 99 }), false, 'layers not lowered');
+    assert.equal(explicitCtxLaunchMatches({ parsed: parseRunnerArgv('llama-server -c 8192'), ctx: 8192, layers: 99 }), false, 'no -ngl');
+});
+
+test('L3 a refused run leaves the deployment as it was: the same remembered idle one, or none', () => {
+    const idle = { id: 'a1', phase: 'idle', updatedAt: '2026-10-19T10:00:00.000Z' };
+    assert.equal(deploymentIdentity({ phase: 'idle', deployment: null }), null);
+    assert.deepEqual(deploymentIdentity({ deployment: idle }), { ...idle, hasRunner: false });
+    const before = deploymentIdentity({ deployment: idle });
+    assert.equal(deploymentUnchanged(before, deploymentIdentity({ deployment: { ...idle } })), true, 'a remembered stopped deployment is not "no deployment"');
+    assert.equal(deploymentUnchanged(null, null), true);
+    assert.equal(deploymentUnchanged(null, before), false, 'a refusal created a deployment');
+    assert.equal(deploymentUnchanged(before, null), false);
+    assert.equal(deploymentUnchanged(before, deploymentIdentity({ deployment: { ...idle, id: 'b2' } })), false, 'a different deployment');
+    assert.equal(deploymentUnchanged(before, deploymentIdentity({ deployment: { ...idle, updatedAt: '2026-10-19T10:00:01.000Z' } })), false, 'the timestamp moved');
+    assert.equal(deploymentUnchanged(before, deploymentIdentity({ deployment: { ...idle, phase: 'starting' } })), false);
+    const running = deploymentIdentity({ deployment: { ...idle, runner: { pid: 7 } } });
+    assert.equal(deploymentUnchanged(running, running), false, 'a deployment with a runner is not the idle one');
 });

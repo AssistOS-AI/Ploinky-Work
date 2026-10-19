@@ -22,7 +22,7 @@
 //                       (CLI and HTTP 400 invalid_params), and a refused replace leaves the running runner alone
 //   L3  ram too small   a ram cap below the need: preview and run are refused as incompatible, no launch record, no runner
 //   L4  invalid caps    ram 0, gpuMemory "lots", an unknown key (and gpuMemory on macOS): status says invalid_caps, HTTP 503, serve stays up
-//   L5  fit context     mode fit lowers a default ctx that does not fit; the run launches with it; an explicit ctx is refused
+//   L5  fit context     mode fit lowers a default ctx that does not fit; the run launches with it; an explicit ctx is refused on cpu and metal, kept with nGpuLayers lowered on dedicated
 //   L6  fit layers      dedicated only: fit lowers nGpuLayers; the estimate's RAM grows as layers drop
 //   L7  ourUse          while a model runs under a tight ram cap, a preview's available memory is lower by about the runner's RSS
 //   L8  gpuMemory share dedicated only: below the GPU need refused, above admitted, and nvidia-smi shows the runner within the cap + 10 %
@@ -52,7 +52,7 @@ import { defineCapLimits, parseCaps } from '../../lib/local-llm-host/caps.mjs';
 import { createRunnerMemoryReader } from '../../lib/local-llm-host/runnerMemory.mjs';
 import { detectGpu } from './gpu-detect.mjs';
 import {
-    FIT_CONTEXT_FLOOR, MIB, availableNowBytes, halvedContext, gpuCapAdmitting, insufficientNowCause, parseRunnerArgv, planGpuFitContext, planGpuFitLayers,
+    FIT_CONTEXT_FLOOR, MIB, deploymentIdentity, deploymentUnchanged, explicitCtxExpectation, explicitCtxLaunchMatches, explicitCtxPreviewMatches, availableNowBytes, halvedContext, gpuCapAdmitting, insufficientNowCause, parseRunnerArgv, planGpuFitContext, planGpuFitLayers,
     planOurUseCap, planRamFit, ramAdmitMargin, ramNeedOf, settleFailedCase, within,
 } from './caps-derive.mjs';
 
@@ -765,6 +765,8 @@ async function caseL3() {
     const cap = Math.max(MIB, Math.floor(B.needDefault / 2));
     await session('l3', ['L3'], { ram: cap }, async () => {
         await runCase('L3', `ram too small: ram ${bytes(cap)} against a need of ${bytes(B.needDefault)}`, async () => {
+            // One home serves every case, so an earlier case's stopped deployment is remembered: the refusal must leave it exactly as it was.
+            const deploymentBefore = deploymentIdentity((await http('GET', '/v1/local-llm/status')).json);
             const preview = await previewHttp(undefined);
             const admission = admissionOf(preview);
             check('HTTP preview status is incompatible (not merely refused)', preview.status === 200 && admission?.status === 'incompatible', `HTTP ${preview.status}; status ${admission?.status}; reason: ${admission?.reason}`);
@@ -777,7 +779,8 @@ async function caseL3() {
             await sleep(500);
             check('no launch record was created and no runner started', readLaunchRecords().length === 0 && runnersOfThisRun().length === 0 && socketsLeft().length === 0, `launch records ${readLaunchRecords().length}; processes ${runnersOfThisRun().length}; sockets ${socketsLeft().length}`);
             const text = await statusText();
-            check('models status shows no deployment', /^phase idle/m.test(text), text);
+            const deploymentAfter = deploymentIdentity((await http('GET', '/v1/local-llm/status')).json);
+            check('the refused run created or changed no deployment (same id and timestamp, still idle, no runner)', deploymentUnchanged(deploymentBefore, deploymentAfter), `before ${JSON.stringify(deploymentBefore)}; after ${JSON.stringify(deploymentAfter)}; status: ${text}`);
         });
     });
 }
@@ -831,12 +834,21 @@ async function caseL5() {
             check(`preview shows fit lowered ctxSize ${plan.from} -> ${plan.to} (not incompatible; insufficient-now only when it is the machine's state now)`, (admission?.status === 'ok' || (admission?.status === 'insufficient-now' && !capShort)) && lowered.length === 1 && lowered[0].param === 'ctxSize' && lowered[0].from === plan.from && lowered[0].to === plan.to, `status ${admission?.status}; fit ${JSON.stringify(admission?.fit)}; reason: ${admission?.reason}${capShort ? `; ${capShort}` : ''}`);
             const cli = await previewCli({}, false);
             check(`CLI preview prints "fit lowered: ctxSize ${plan.from} -> ${plan.to}"`, cli.stdout.includes(`fit lowered: ctxSize ${plan.from} -> ${plan.to}`), cli.stdout);
-            // an explicit ctx is never lowered
+            // an explicit ctx is never lowered: the pool profiles refuse it; the dedicated profile keeps it and moves layers to the CPU instead (DS007, DS008)
+            const admitted = explicitCtxExpectation(B.profile) === 'admitted';
             const explicit = await previewCli({ ctx: plan.from }, false);
-            check(`explicit --ctx ${plan.from} is refused by preview as incompatible`, new RegExp(`^${MODEL.replace(/[.]/g, '\\.')}: incompatible`, 'm').test(explicit.stdout) && !/fit lowered/.test(explicit.stdout), explicit.stdout);
-            const explicitRun = await pw(['models', 'run', MODEL, '--runner', RUNNER, '--detach', '--ctx', String(plan.from)]);
-            check(`explicit run --ctx ${plan.from} is refused (an admission refusal, not a lowered launch)`, explicitRun.code !== 0 && /Needs about/.test(said(explicitRun)), `exit ${explicitRun.code}: ${said(explicitRun)}`);
-            check('the refusal started nothing', readLaunchRecords().length === 0 && runnersOfThisRun().length === 0, `launch records ${readLaunchRecords().length}`);
+            check(admitted ? `explicit --ctx ${plan.from} is admitted by preview with fit lowering nGpuLayers, not ctxSize` : `explicit --ctx ${plan.from} is refused by preview as incompatible`, explicitCtxPreviewMatches({ profile: B.profile, stdout: explicit.stdout, model: MODEL }), explicit.stdout);
+            if (admitted) {
+                const explicitModel = await startModel(s, { ctx: plan.from });
+                check(`the explicit run launches with ctx ${plan.from} and fewer GPU layers than the model's ${B.layers}`, explicitCtxLaunchMatches({ parsed: explicitModel.parsed, ctx: plan.from, layers: B.layers }), `argv: ${ev(explicitModel.argv, 1200)}`);
+                await stopModel(s);
+            } else {
+                const explicitRun = await pw(['models', 'run', MODEL, '--runner', RUNNER, '--detach', '--ctx', String(plan.from)]);
+                check(`explicit run --ctx ${plan.from} is refused (an admission refusal, not a lowered launch)`, explicitRun.code !== 0 && /Needs about/.test(said(explicitRun)), `exit ${explicitRun.code}: ${said(explicitRun)}`);
+                // the command has returned, so admission is final; a short settle lets a wrongly accepted run write its launch record
+                await sleep(1000);
+                check('the refusal started nothing', readLaunchRecords().length === 0 && runnersOfThisRun().length === 0, `launch records ${readLaunchRecords().length}`);
+            }
             const model = await startModel(s);
             check(`the run launches with the fitted ctx: argv ctx is ${plan.to}`, model.parsed.ctx === plan.to, `argv: ${ev(model.argv, 1200)}`);
             const text = await statusText();

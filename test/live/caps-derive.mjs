@@ -86,6 +86,50 @@ export function planGpuFitLayers({ layers, gpuAtLayers }) {
 }
 
 /**
+ * L5's explicit `--ctx A` under `mode: "fit"`: the pool profiles (cpu, metal) refuse it, because fit never lowers an explicit value and
+ * ctxSize is all they can lower; the dedicated profile keeps the explicit ctx and moves layers to the CPU instead (DS007, DS008).
+ */
+export const explicitCtxExpectation = (profile) => (profile === 'dedicated' ? 'admitted' : 'refused');
+
+/** The `param from -> to` steps a preview prints after "fit lowered:" (empty when it prints none). */
+export function fitLoweredSteps(stdout) {
+    const line = /fit lowered: ([^\n]*)/.exec(String(stdout ?? ''))?.[1] ?? '';
+    return [...line.matchAll(/(\w+) (\d+) -> (\d+)/g)].map((match) => ({ param: match[1], from: Number(match[2]), to: Number(match[3]) }));
+}
+
+/**
+ * Whether the preview of an explicit ctx (`stdout`, the CLI's text for `model`) says what `explicitCtxExpectation` expects: refused as
+ * incompatible with no fit (pool profiles), or admitted (`ok`) with fit lowering `nGpuLayers` and never `ctxSize` (dedicated).
+ */
+export function explicitCtxPreviewMatches({ profile, stdout, model }) {
+    const text = String(stdout ?? '');
+    const head = new RegExp(`^${String(model).replace(/[.]/g, '\\.')}: (\\S+?)[,\\s]`, 'm').exec(text)?.[1] ?? null;
+    const steps = fitLoweredSteps(text);
+    if (explicitCtxExpectation(profile) === 'refused') return head === 'incompatible' && steps.length === 0;
+    const layers = steps.find((step) => step.param === 'nGpuLayers');
+    return head === 'ok' && Boolean(layers) && layers.to < layers.from && !steps.some((step) => step.param === 'ctxSize');
+}
+
+/** Whether a run admitted with an explicit ctx launched with it and with fewer GPU layers than the model has (`parsed` is parseRunnerArgv's). */
+export const explicitCtxLaunchMatches = ({ parsed, ctx, layers }) => parsed?.ctx === ctx && Number.isFinite(parsed?.layers) && Number.isFinite(layers) && parsed.layers < layers;
+
+/** What identifies a deployment in a status answer (`{ deployment }`), or null when there is none. */
+export const deploymentIdentity = (status) => {
+    const deployment = status?.deployment;
+    if (!deployment) return null;
+    return { id: deployment.id ?? null, phase: deployment.phase ?? null, updatedAt: deployment.updatedAt ?? null, hasRunner: Boolean(deployment.runner) };
+};
+
+/**
+ * Whether a refused run left the deployment as it was: no deployment before and none after, or the same one (id and timestamp), in the
+ * phase it had, and still without a runner. A refusal must neither create a deployment nor change the remembered one.
+ */
+export function deploymentUnchanged(before, after) {
+    if (!before || !after) return !before && !after;
+    return before.id === after.id && before.updatedAt === after.updatedAt && before.phase === after.phase && before.hasRunner === after.hasRunner && after.hasRunner === false && after.phase === 'idle';
+}
+
+/**
  * Bytes from the figure of a refusal for now: "3.35 GiB is available now" (RAM), "3.35 GiB is free now" or "Only 3.35 GiB of GPU memory is
  * free" (GPU), in GiB or MiB. Null when the reason has none (a disk shortage, for example).
  */
