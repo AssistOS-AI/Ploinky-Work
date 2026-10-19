@@ -1,6 +1,6 @@
 import { describe, it, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { admit } from '../../lib/local-llm/controller/admission.mjs';
+import { admit, computeBufferBytes, estimateLlamaCpp } from '../../lib/local-llm/controller/admission.mjs';
 import { cpuFloorBytes, cpuHostReserveBytes } from '../../lib/local-llm/controller/profiles.mjs';
 import { ParamError, validateParams } from '../../lib/local-llm/runners/params.mjs';
 import { offeredIn, runnerSummaries, runnerSummary } from '../../lib/local-llm/runners/index.mjs';
@@ -770,5 +770,57 @@ describe('llama.cpp (CPU build)', () => {
         assert.equal(typeof llamaCppRunner.admitUnified, 'function');
         assert.equal(typeof llamaCppRunner.admitCpu, 'function');
         assert.equal('admitUnified' in ikLlamaCppRunner || 'admitCpu' in ikLlamaCppRunner, false);
+    });
+});
+
+describe('llama.cpp estimate: the GPU and RAM split by the offloaded layers', () => {
+    // A dense model whose figures divide exactly: 32 GiB of weights over 32 layers, 32 KiB of f16 KV cache per token.
+    const DENSE = Object.freeze({ id: 'dense', memory: Object.freeze({ layers: 32, kvBytesPerToken: 32 * 1024 }) });
+    const SOURCE = Object.freeze({ size: 32 * GIB });
+    const PARAMS = Object.freeze({ ctxSize: 4096, nCpuMoe: 0, flashAttn: 'on', ubatchSize: 512, cacheTypeK: 'f16', cacheTypeV: 'f16' });
+    const KV = 128 * MIB;
+    const RUNNER = 768 * MIB;
+    const GPU_FIXED = computeBufferBytes(PARAMS) + 200 * MIB;
+    const estimate = (nGpuLayers, model = DENSE, source = SOURCE, params = PARAMS) => estimateLlamaCpp({ model, source, params: { ...params, nGpuLayers } });
+
+    it('keeps the whole KV cache in RAM when no layer is offloaded', () => {
+        const none = estimate(0);
+        assert.equal(none.kvBytes, KV);
+        assert.equal(none.gpuBytes, 0);
+        assert.equal(none.ramBytes, 32 * GIB + KV + RUNNER, 'the weights, the KV cache and the runner');
+    });
+
+    it('splits the KV cache by the same layer fraction as the weights for a partial offload', () => {
+        const quarter = estimate(8);
+        assert.equal(quarter.gpuWeightsBytes, 8 * GIB);
+        assert.equal(quarter.gpuBytes, Math.round(8 * GIB + KV / 4 + GPU_FIXED), 'a quarter of the KV cache, the compute buffer and the CUDA context');
+        assert.equal(quarter.ramBytes, 24 * GIB + (KV * 3) / 4 + RUNNER, 'the CPU layers keep their three quarters of the KV cache in RAM');
+    });
+
+    it('puts the whole KV cache on the GPU at a full offload, and more layers than the model has change nothing', () => {
+        const full = estimate(32);
+        assert.equal(full.gpuBytes, Math.round(32 * GIB + KV + GPU_FIXED));
+        assert.equal(full.ramBytes, RUNNER);
+        assert.deepEqual(estimate(99), full);
+    });
+
+    it('charges every byte of the KV cache once, to the GPU or to the RAM', () => {
+        for (const nGpuLayers of [0, 1, 8, 16, 31, 32, 99]) {
+            const { gpuBytes, ramBytes, gpuWeightsBytes, cpuWeightsBytes } = estimate(nGpuLayers);
+            const gpuKv = gpuBytes === 0 ? 0 : gpuBytes - gpuWeightsBytes - Math.round(GPU_FIXED);
+            assert.ok(Math.abs(gpuKv + (ramBytes - cpuWeightsBytes - RUNNER) - KV) <= 1, `nGpuLayers ${nGpuLayers}`);
+        }
+    });
+
+    it('keeps the experts of the offloaded layers past the first nCpuMoe on the GPU', () => {
+        // --n-gpu-layers offloads the last layers and --n-cpu-moe pins the experts of the first ones (llama.cpp b11159); the estimate
+        // takes nGpuLayers as repeating layers, though llama.cpp counts the output layer among them.
+        const moe = { id: 'moe', architecture: 'moe', memory: { layers: 24, nonExpertBytes: 2 * GIB, expertBytesPerLayer: 400 * MIB, kvBytesPerToken: 32 * 1024 } };
+        const source = { size: 2 * GIB + 24 * 400 * MIB };
+        const at = (nGpuLayers) => estimate(nGpuLayers, moe, source, { ...PARAMS, nCpuMoe: 17 }).gpuWeightsBytes;
+        assert.equal(at(24), 2 * GIB + 7 * 400 * MIB, 'all layers: the experts of layers 17 to 23');
+        assert.equal(at(12), 1 * GIB + 7 * 400 * MIB, '12 of the last layers, whose experts from layer 17 on are on the GPU');
+        assert.equal(at(6), Math.round(2 * GIB * 0.25) + 6 * 400 * MIB, 'the last 6 layers, all past the CPU MoE layers');
+        assert.equal(at(0), 0);
     });
 });
