@@ -28,6 +28,7 @@
   "scripts": {
     "start": "node bin/pworker.mjs",
     "serve": "node bin/pworker.mjs serve",
+    "test:live:caps": "node test/live/caps-live.mjs",
     "test": "node --import ./test/home.mjs --test test/*.test.mjs test/local-llm/*.test.mjs test/local-llm-host/*.test.mjs"
   },
   "dependencies": {}

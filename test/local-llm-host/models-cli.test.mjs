@@ -183,6 +183,60 @@ test('the binary: models stop NAME still posts to /v1/local/NAME/stop, models st
     assert.ok(requests.includes('POST /v1/local/localnano/start'), requests.join(', '));
 });
 
+// PWORKER_AUTOSTART=0 (lib/client.mjs): no caller starts a proxy. A verb that needs one and finds none says so and exits 1, and starts
+// nothing. This test can never start a proxy, whatever the binary does: `startProxy` opens logs/pworker.log in the home for append before
+// it spawns `serve`, and here that path is a folder, so a start fails there with EISDIR, before any spawn (as a second layer PWORKER_PORT
+// is held by a listener of this test, so a proxy started by other means would find its port taken and exit 4). The refusal is therefore
+// known by its message, and the control (a verb without the setting) by reaching `startProxy` and failing on that folder.
+test('the binary: with PWORKER_AUTOSTART=0 an engine verb that finds no proxy exits 1, says why and starts nothing; hf-token needs none', async (t) => {
+    const home = scratch(t);
+    const proxyLog = path.join(home, 'logs', 'pworker.log');
+    fs.mkdirSync(proxyLog, { recursive: true });
+    const holder = net.createServer((socket) => socket.destroy());
+    await new Promise((resolve) => holder.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => holder.close(resolve)));
+    const env = { PWORKER_AUTOSTART: '0', PWORKER_PORT: String(holder.address().port) };
+    const verbs = [['catalog'], ['runners'], ['status', '--json'], ['preview', MODEL], ['run', MODEL, '--detach'], ['stop'], ['delete-weights', MODEL]];
+    for (const verb of verbs) {
+        const result = await bin(home, ['models', ...verb], { env });
+        assert.equal(result.code, 1, `${verb[0]}: ${result.stdout}${result.stderr}`);
+        assert.match(result.stderr, /no proxy is running for .*PWORKER_AUTOSTART=0 forbids starting one\. Start it with: pworker start/, verb[0]);
+        assert.doesNotMatch(result.stderr, /EISDIR/, `${verb[0]} did not try to start a proxy`);
+        assert.equal(result.stdout, '', `${verb[0]} printed nothing on stdout`);
+        assert.equal(fs.existsSync(path.join(home, 'server.json')), false, `${verb[0]} left no record of a proxy`);
+    }
+    // The control: without the setting the same verb does try to start one, and fails on the folder that stands for its log.
+    const control = await bin(home, ['models', 'status', '--json'], { env: { PWORKER_AUTOSTART: '1', PWORKER_PORT: env.PWORKER_PORT } });
+    assert.notEqual(control.code, 0);
+    assert.match(control.stderr, /EISDIR/, 'without the setting a proxy start is attempted');
+    assert.doesNotMatch(control.stderr, /PWORKER_AUTOSTART=0/);
+    // hf-token never needs the proxy: it is not refused.
+    const token = await bin(fs.mkdtempSync(path.join(home, 'tok-')), ['models', 'hf-token'], { env, input: 'hf_SyntheticTokenAutostart0123456789abcd\n' });
+    assert.equal(token.code, 0, token.stderr);
+});
+
+test('the binary: with PWORKER_AUTOSTART=0 an engine verb uses the proxy that runs, as it does without the setting', async (t) => {
+    const proxy = await startProxy(t);
+    const home = scratch(t);
+    fs.writeFileSync(path.join(home, 'server.json'), `${JSON.stringify({ pid: process.pid, host: '127.0.0.1', port: Number(new URL(proxy.base).port) })}\n`);
+    const result = await bin(home, ['models', 'status', '--json'], { env: { PWORKER_AUTOSTART: '0' } });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).phase, 'idle');
+    assert.equal(fs.existsSync(path.join(home, 'logs', 'pworker.log')), false, 'nothing was started for it');
+    // A server named by PWORKER_URL is the client's to reach, with no record of it in the home: it is used when it answers, and says so when it does not.
+    const elsewhere = scratch(t);
+    // As in the test above: a start would fail on this folder (EISDIR) before any spawn, so a regressed gate cannot start a real detached serve here.
+    fs.mkdirSync(path.join(elsewhere, 'logs', 'pworker.log'), { recursive: true });
+    const named = await bin(elsewhere, ['models', 'status', '--json'], { env: { PWORKER_AUTOSTART: '0', PWORKER_URL: proxy.base } });
+    assert.equal(named.code, 0, named.stderr);
+    assert.equal(JSON.parse(named.stdout).phase, 'idle');
+    const dead = await bin(elsewhere, ['models', 'status', '--json'], { env: { PWORKER_AUTOSTART: '0', PWORKER_URL: 'http://127.0.0.1:1' } });
+    assert.notEqual(dead.code, 0);
+    assert.match(dead.stderr, /not reachable/);
+    assert.deepEqual(fs.readdirSync(path.join(elsewhere, 'logs', 'pworker.log')), [], 'nothing was started for it: the folder that guards the log is still an empty folder');
+    assert.equal(fs.existsSync(path.join(elsewhere, 'server.json')), false);
+});
+
 test('models run and preview without --runner send no runnerId at all (never the string "undefined")', async () => {
     const seen = [];
     const client = { engine: { run: async (body) => { seen.push(['run', body]); return { accepted: true, deployment: { phase: 'ready', modelId: body.modelId } }; }, preview: async (body) => { seen.push(['preview', body]); return { preview: {} }; }, overview: async () => ({ runners: [] }), status: async () => ({ deployment: { phase: 'ready', modelId: 'm' } }) } };

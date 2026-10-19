@@ -474,9 +474,19 @@ async function main() {
   if (command === 'stop') { const message = await stopMessage(); console.log(message); if (message.includes('still running')) process.exitCode = 1; return; }
   if (command === 'stats' && !args.includes('--proxy')) { printStats(); return; }
   // The engine verbs of `models` (catalog, run, status, ...). `hf-token` only writes a file and never needs the proxy; the others start it
-  // when none runs. `models start|stop NAME` is not an engine verb: it goes on to the local servers below.
+  // when none runs, unless PWORKER_AUTOSTART=0 (as for the client, lib/client.mjs): then they use the proxy that runs, or say there is none
+  // and exit 1 without starting one (with PWORKER_URL set the client says so itself when that server does not answer). `models start|stop NAME` is not an engine verb: it goes on to the local servers below.
   if (isEngineCommand(args)) {
-    if (args[1] !== 'hf-token') await startProxy();
+    if (args[1] !== 'hf-token') {
+      if (process.env.PWORKER_AUTOSTART !== '0') await startProxy();
+      // The gate asks whether a proxy runs for THIS home, from the home's server record (`proxyPid`), exactly as `startProxy` decides whether
+      // to spawn one; it does not look at PWORKER_PORT, so a listener on that port is not a proxy of this home.
+      else if (!process.env.PWORKER_URL && !(await runningPid())) {
+        process.stderr.write(`pworker: no proxy is running for ${home}, and PWORKER_AUTOSTART=0 forbids starting one. Start it with: pworker start\n`);
+        process.exitCode = 1;
+        return;
+      }
+    }
     const abort = new AbortController();
     process.once('SIGINT', () => abort.abort());
     // The token file is read by the engine's host in the server's home (serverHome), which a configured dataDir or taskHome can move off PWORKER_HOME.

@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 
+import net from 'node:net';
 import { PassThrough } from 'node:stream';
 
 import { createPworkerClient } from '../../lib/client.mjs';
@@ -18,7 +19,7 @@ import { loadSeedCatalog } from '../../lib/local-llm/controller/catalog.mjs';
 import { LocalLlmError, defineLimits, IDENTITY_LIMITS } from '../../lib/local-llm/index.mjs';
 import { capsDigest, defineCapLimits, parseCaps } from '../../lib/local-llm-host/caps.mjs';
 import { createLocalLlmGate } from '../../lib/local-llm-host/gate.mjs';
-import { admit } from '../../lib/local-llm/controller/admission.mjs';
+import { GPU_MARGIN_BYTES, RAM_MARGIN_BYTES, admit } from '../../lib/local-llm/controller/admission.mjs';
 import { cpuDefaultThreads, defaultThreads, performanceCoreCount, physicalCoreCount } from '../../lib/local-llm/controller/hardware.mjs';
 import { darwinPlatform } from '../../lib/local-llm/darwinPlatform.mjs';
 import {
@@ -36,7 +37,31 @@ import { GIB, MODEL, fakeAdapter, freePort, scratch } from './fixtures/engine.mj
 import { request, startHost, startProxy } from './fixtures/proxy.mjs';
 import { recordingKill, removeProc, runnerArgv, writeProc, writeStatus } from './fixtures/proc.mjs';
 
+const MIB = 1024 ** 2;
 const amount = (bytes) => (bytes >= GIB ? `${(bytes / GIB).toFixed(2)} GiB` : `${Math.round(bytes / (1024 * 1024))} MiB`);
+
+// ---------------------------------------------------------------- a host that fakes macOS
+
+// A host built with `platformName: 'darwin'` runs the darwin-only checks of the product against the machine the test runs on, and two of
+// them depend on that machine: the safe-path walk of the home (`checkHomePath`) refuses a parent that its group can write and that is not
+// sticky, which the ancestors of a temporary directory are on some Linux machines, and the owner bind probes the wildcard address
+// 0.0.0.0:<port> after it holds 127.0.0.1:<port>, which macOS grants and Linux refuses (`owner_port_taken`). So every faked-darwin host in
+// this file gets the two seams test/local-llm-host/darwin-host.test.mjs gives its own: `homeCheckRoot`, the trusted directory the walk of
+// the home starts from (the home's parent, which the test made: what is below it is checked as in production), and a `netImpl` that
+// answers a bind of the wildcard address as free and leaves everything else to the real `net`. The real wildcard probe is tested on a
+// fake `net` in ownership-darwin.test.mjs and on a real kernel by the probe script on a Mac. `procs` is an empty process table for a host
+// that has nothing to read from it: the reaper of a fresh home then never asks the machine's own `ps`.
+const wildcardFreeNet = {
+    ...net,
+    createServer(...args) {
+        const server = net.createServer(...args);
+        const listen = server.listen.bind(server);
+        server.listen = (options, callback) => (options?.host === '0.0.0.0' ? (setImmediate(callback), server) : listen(options, callback));
+        return server;
+    },
+};
+const NO_PROCS = Object.freeze({ listPids: () => [], readStat: () => null, readCmdline: () => null });
+const darwinSeams = (home) => ({ netImpl: wildcardFreeNet, homeCheckRoot: path.dirname(home) });
 
 // ---------------------------------------------------------------- the fake machines
 
@@ -184,16 +209,18 @@ test('defineCapLimits binds the memory pool, the memory view, the GPU share and 
     // dedicated: the share keeps every field of the GPU, including the device total, and caps the total and the free figure.
     const gpu = { ...DEDICATED_MACHINE.gpu, deviceTotalBytes: 24 * GIB, freeBytes: 20 * GIB };
     const share = limits.admit({ stage: 'gpu', selected: 'dedicated', gpu, snapshot: DEDICATED_MACHINE, profile: 'dedicated' });
-    assert.deepEqual(share, { share: { gpu: { ...gpu, totalBytes: 4 * GIB, freeBytes: 4 * GIB } } });
+    assert.deepEqual(share, { share: { gpu: { ...gpu, totalBytes: 4 * GIB, freeBytes: 4 * GIB + GPU_MARGIN_BYTES } } }, 'the free figure is the cap plus the policy\'s margin');
     const small = { ...gpu, totalBytes: 3 * GIB, freeBytes: 1 * GIB };
     assert.deepEqual(limits.admit({ stage: 'gpu', selected: 'dedicated', gpu: small, snapshot: DEDICATED_MACHINE }).share.gpu, small, 'a GPU under the cap is as it was');
+    const snug = { ...gpu, totalBytes: 24 * GIB, freeBytes: 4 * GIB + 100 * MIB };
+    assert.equal(limits.admit({ stage: 'gpu', selected: 'dedicated', gpu: snug, snapshot: DEDICATED_MACHINE }).share.gpu.freeBytes, snug.freeBytes, 'what the GPU really has free bounds the margin');
     assert.equal(limits.admit({ stage: 'gpu', selected: 'unified', gpu, snapshot: UNIFIED_MACHINE }), null, 'unified is capped through the memory view');
     for (const stage of ['before-policy', 'vulkan']) assert.equal(limits.admit({ stage, selected: 'dedicated', gpu }), null, stage);
     assert.equal(defineCapLimits(parseCaps({ ram: '8GiB' })).admit({ stage: 'gpu', selected: 'dedicated', gpu }), null, 'no gpuMemory cap, no share');
 
     // The memory view: ram on every GPU profile, and on a unified GPU the smaller of ram and gpuMemory.
     const physical = { reserveTotalBytes: 64 * GIB, reserveAvailableBytes: 60 * GIB };
-    assert.deepEqual(limits.effective({ snapshot: DEDICATED_MACHINE }).memory, { totalBytes: 8 * GIB, availableBytes: 8 * GIB, ...physical }, 'the physical figures stay beside the capped view');
+    assert.deepEqual(limits.effective({ snapshot: DEDICATED_MACHINE }).memory, { totalBytes: 8 * GIB, availableBytes: 8 * GIB + RAM_MARGIN_BYTES, ...physical }, 'the physical figures stay beside the capped view; a dedicated GPU\'s policy keeps a margin, which the cap does not eat');
     assert.deepEqual(limits.effective({ snapshot: UNIFIED_MACHINE }).memory, { totalBytes: 4 * GIB, availableBytes: 4 * GIB, ...physical });
     assert.deepEqual(defineCapLimits(parseCaps({ gpuMemory: '4GiB' })).effective({ snapshot: DEDICATED_MACHINE }).memory, MEMORY, 'gpuMemory leaves a dedicated GPU\'s host memory alone');
     const metal = { ...UNIFIED_MACHINE, gpu: { available: true, backend: 'metal', name: 'Apple M1', memoryModel: 'unified', deviceCapBytes: 12 * GIB } };
@@ -348,11 +375,92 @@ test('V3: gpuMemory 8GiB on a unified GPU refuses the 10 GiB model through the m
 });
 
 test('V3: ram caps the host memory of a dedicated GPU too', async (t) => {
-    const host = await capsHost(t, { caps: { ram: '1GiB' }, profile: 'dedicated', machine: DEDICATED_MACHINE });
+    const host = await capsHost(t, { caps: { ram: '512MiB' }, profile: 'dedicated', machine: DEDICATED_MACHINE });
     const refused = await previewOf(host, 'dedicated', 'six');
-    assert.equal(refused.status, 'insufficient-now', refused.reason);
-    assert.match(refused.reason, /of RAM; 1\.0+ GiB is available now/, 'the RAM figure is the capped one');
+    assert.equal(refused.status, 'incompatible', refused.reason);
+    assert.match(refused.reason, /of RAM; this machine has 0\.5 GiB/, 'the RAM figure is the capped one');
     assert.equal((await previewOf(await capsHost(t, { profile: 'dedicated', machine: DEDICATED_MACHINE }), 'dedicated', 'six')).status, 'ok', 'and the same model fits with no cap');
+});
+
+// A cap bounds what a model may plan for: the margins the dedicated llama.cpp policy keeps free (256 MiB of GPU memory, 1 GiB of RAM) and
+// the memory the machine really has free stay real. So a need that fits the cap and the physical free memory less the margin is admitted
+// (it used to be refused as `insufficient-now`, for good, in the band between the cap less the margin and 0.97 of the cap), a need over the
+// cap is `incompatible`, and a need that fits the cap but not the free memory is still `insufficient-now`. The needs are read from an
+// uncapped preview of the same machine, and the caps are derived from them, so no figure of the estimate is written down here.
+const withGpu = (patch) => ({ ...DEDICATED_MACHINE, gpu: { ...DEDICATED_MACHINE.gpu, ...patch } });
+const withMemory = (patch) => ({ ...DEDICATED_MACHINE, memory: { ...MEMORY, ...patch } });
+async function needOf(t, modelId, machine = DEDICATED_MACHINE) {
+    const plain = await previewOf(await capsHost(t, { profile: 'dedicated', machine }), 'dedicated', modelId);
+    assert.equal(plain.status, 'ok', plain.reason);
+    return plain.estimate;
+}
+async function verdictUnder(t, caps, machine, modelId) {
+    return previewOf(await capsHost(t, { caps, profile: 'dedicated', machine }), 'dedicated', modelId);
+}
+
+test('V3 margin band: a gpuMemory cap that holds the need is admitted, though the need is within the 256 MiB margin of the cap', async (t) => {
+    const { gpuBytes } = await needOf(t, 'small');
+    const cap = gpuBytes + 128 * MIB;
+    // The need is in the band the old rule refused: above the cap less the margin, at most 0.97 of the cap.
+    assert.ok(gpuBytes > cap - GPU_MARGIN_BYTES && gpuBytes <= cap * 0.97, `${gpuBytes} against a cap of ${cap}`);
+    const admitted = await verdictUnder(t, { gpuMemory: cap }, DEDICATED_MACHINE, 'small');
+    assert.equal(admitted.status, 'ok', admitted.reason);
+    // Fit never acts on `insufficient-now`, so a refusal there would have been permanent: the same cap in fit mode is `ok` too, with nothing lowered.
+    const fit = await verdictUnder(t, { gpuMemory: cap, mode: 'fit' }, DEDICATED_MACHINE, 'small');
+    assert.equal(fit.status, 'ok', fit.reason);
+    assert.equal(fit.fit, undefined);
+    // A need of exactly 0.97 of the cap is the edge of what the policy calls compatible.
+    assert.equal((await verdictUnder(t, { gpuMemory: Math.floor(gpuBytes / 0.97) + 1 }, DEDICATED_MACHINE, 'small')).status, 'ok');
+});
+
+test('V3 margin band: a need over the cap is incompatible, in the span between 0.97 of the cap and the cap too', async (t) => {
+    const { gpuBytes } = await needOf(t, 'small');
+    for (const cap of [gpuBytes - 128 * MIB, Math.ceil(gpuBytes / 0.985)]) {
+        const refused = await verdictUnder(t, { gpuMemory: cap }, DEDICATED_MACHINE, 'small');
+        assert.ok(gpuBytes > cap * 0.97, `${gpuBytes} against a cap of ${cap}`);
+        assert.equal(refused.status, 'incompatible', `cap ${cap}: ${refused.reason}`);
+        assert.equal(refused.reasonCode, 'gpu_capacity');
+    }
+});
+
+test('V3 margin band: a need that fits the gpuMemory cap but not the free GPU memory less the margin is still insufficient-now, and enough free memory admits it', async (t) => {
+    const { gpuBytes } = await needOf(t, 'small');
+    const cap = Math.ceil(gpuBytes * 1.2);
+    const tight = await verdictUnder(t, { gpuMemory: cap }, withGpu({ freeBytes: gpuBytes + GPU_MARGIN_BYTES - 1, usedBytes: 24 * GIB - gpuBytes - GPU_MARGIN_BYTES + 1 }), 'small');
+    assert.equal(tight.status, 'insufficient-now', tight.reason);
+    assert.ok(!tight.reasonCode, 'a refusal for now carries no code for fit to read');
+    const roomy = await verdictUnder(t, { gpuMemory: cap }, withGpu({ freeBytes: gpuBytes + GPU_MARGIN_BYTES + 1, usedBytes: 24 * GIB - gpuBytes - GPU_MARGIN_BYTES - 1 }), 'small');
+    assert.equal(roomy.status, 'ok', roomy.reason);
+    // The same machines with no cap say the same: the cap changes nothing the margin did not already say.
+    const plainTight = await previewOf(await capsHost(t, { profile: 'dedicated', machine: withGpu({ freeBytes: gpuBytes + GPU_MARGIN_BYTES - 1 }) }), 'dedicated', 'small');
+    assert.equal(plainTight.status, 'insufficient-now', plainTight.reason);
+});
+
+test('V3 margin band: a ram cap that holds the need is admitted within the 1 GiB margin, an over-cap need is incompatible, and a need beyond the free memory less the margin is insufficient-now', async (t) => {
+    const { ramBytes } = await needOf(t, 'six');
+    const cap = ramBytes + 256 * MIB;
+    assert.ok(ramBytes > cap - RAM_MARGIN_BYTES, 'the need is in the band the old rule refused');
+    const admitted = await verdictUnder(t, { ram: cap }, DEDICATED_MACHINE, 'six');
+    assert.equal(admitted.status, 'ok', admitted.reason);
+    const over = await verdictUnder(t, { ram: ramBytes - 128 * MIB }, DEDICATED_MACHINE, 'six');
+    assert.equal(over.status, 'incompatible', over.reason);
+    assert.equal(over.reasonCode, 'ram_capacity');
+    // It fits a roomy cap, but the machine has less than the need and the margin available: refused for now, as with no cap.
+    const scarce = withMemory({ availableBytes: ramBytes + RAM_MARGIN_BYTES - 1 });
+    const capped = await verdictUnder(t, { ram: 32 * GIB }, scarce, 'six');
+    assert.equal(capped.status, 'insufficient-now', capped.reason);
+    const plain = await previewOf(await capsHost(t, { profile: 'dedicated', machine: scarce }), 'dedicated', 'six');
+    assert.equal(plain.status, 'insufficient-now', plain.reason);
+    assert.equal((await verdictUnder(t, { ram: 32 * GIB }, withMemory({ availableBytes: ramBytes + RAM_MARGIN_BYTES + 1 }), 'six')).status, 'ok');
+});
+
+test('V3 margin band: with a cap above the machine (or none) the admission is the one the machine alone gives, byte for byte', async (t) => {
+    const plain = await previewOf(await capsHost(t, { profile: 'dedicated', machine: DEDICATED_MACHINE }), 'dedicated', 'six');
+    const roomy = await verdictUnder(t, { gpuMemory: '64GiB', ram: '256GiB' }, DEDICATED_MACHINE, 'six');
+    assert.deepEqual(roomy, plain);
+    const limits = defineCapLimits(parseCaps({ gpuMemory: '64GiB', ram: '256GiB' }));
+    assert.deepEqual(limits.admit({ stage: 'gpu', selected: 'dedicated', gpu: DEDICATED_MACHINE.gpu, snapshot: DEDICATED_MACHINE }).share.gpu, DEDICATED_MACHINE.gpu);
+    assert.deepEqual(limits.effective({ snapshot: DEDICATED_MACHINE }).memory, { ...MEMORY, reserveTotalBytes: MEMORY.totalBytes, reserveAvailableBytes: MEMORY.availableBytes });
 });
 
 test('V5: the same dedicated and unified machines with no caps admit the 10 GiB model and have no budget', async (t) => {
@@ -427,7 +535,7 @@ async function launchOf(t, { caps, profile, params, modelId = 'small', home = sc
     };
     const config = caps === undefined ? {} : { localLlm: { caps } };
     const host = createLocalLlmHost({
-        config, home, env: { PATH: '/usr/bin:/bin', HOME: '/home/test', LANG: 'C.UTF-8' }, platformName: metal ? 'darwin' : 'linux', ...(metal ? { arch: 'arm64', darwinExec: MAC_EXEC } : {}),
+        config, home, env: { PATH: '/usr/bin:/bin', HOME: '/home/test', LANG: 'C.UTF-8' }, platformName: metal ? 'darwin' : 'linux', ...(metal ? { arch: 'arm64', darwinExec: MAC_EXEC, procs: NO_PROCS, ...darwinSeams(home) } : {}),
         procDir, ownerPort: await freePort(), which: () => '/usr/bin/nvidia-smi', controllerOptions,
     });
     t.after(() => host.drain().catch(() => {}));
@@ -1120,7 +1228,7 @@ test('V4 macOS: the host wires the ps seam into the ram guard, so a Metal runner
     let recorder = null;
     const host = createLocalLlmHost({
         config: { localLlm: { caps: { ram: '8GiB' } } }, home, env: { PATH: '/usr/bin:/bin', HOME: '/home/test', LANG: 'C.UTF-8' }, platformName: 'darwin', arch: 'arm64',
-        darwinExec: exec, ownerPort: await freePort(), killImpl: recordingKill(),
+        darwinExec: exec, ownerPort: await freePort(), killImpl: recordingKill(), ...darwinSeams(home),
         controllerOptions: {
             profile: 'metal', snapshot: async () => structuredClone(MAC_MACHINE), seedCatalog: SEED, fileExists: () => true,
             installer: { installable: () => true, lock: null, describe: async () => ({ installed: true, runnable: true, version: 'v1' }),
