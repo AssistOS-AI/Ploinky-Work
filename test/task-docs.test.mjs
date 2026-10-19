@@ -16,7 +16,7 @@ test('documented task declarations are valid strict JSON phase maps',()=>{
     const blocks=[...source.matchAll(/```json\n([\s\S]*?)```|<pre><code>(\{[\s\S]*?)<\/code><\/pre>/g)];
     for(const block of blocks){
       const task=JSON.parse(block[1]??block[2]);
-      if(name==='PWORKER.md' && Object.hasOwn(task,'providers'))continue; // Provider configuration, not a task example.
+      if(name==='PWORKER.md' && (Object.hasOwn(task,'providers')||Object.hasOwn(task,'localLlm')))continue; // Configuration, not a task example.
       validateTask(task);count++;
     }
   }
